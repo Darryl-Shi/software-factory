@@ -63,7 +63,7 @@ async function doctor() {
 	const { Factory } = await import("./core/core.ts");
 	const { createModels, DEFAULT_CONFIG, factoryHome } = await import("./main.ts");
 	const { SandboxManager } = await import("@anthropic-ai/sandbox-runtime");
-	const { expandHome } = await import("./core/settings.ts");
+	const { assertNoLegacySections, expandHome } = await import("./core/settings.ts");
 	const { GitHub } = await import("./github/github.ts");
 	const { GhApiHost, resolveSecret } = await import("./github/host.ts");
 	const { Sandbox } = await import("./sandbox/sandbox.ts");
@@ -80,6 +80,13 @@ async function doctor() {
 	const eff = existsSync(configPath) ? f.config.effective({ global: true }) : f.config.effective({ global: true }, { version: 1 });
 	const line = (ok: boolean | "warn", s: string) => console.log(`${ok === true ? "ok  " : ok === "warn" ? "warn" : "FAIL"}  ${s}`);
 	line(true, `config ${configPath}${existsSync(configPath) ? "" : " (missing: defaults)"}`);
+	if (existsSync(configPath)) {
+		try {
+			assertNoLegacySections(configPath);
+		} catch (e) {
+			line(false, e instanceof Error ? e.message : String(e));
+		}
+	}
 	for (const role of ["architect", "builder", "helper", "reviewer"]) {
 		const ref = String(eff.roles[role].model);
 		const [p, ...rest] = ref.split("/");

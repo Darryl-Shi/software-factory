@@ -167,18 +167,24 @@ export function coreSchema(): Record<string, SettingField> {
 export const GLOBAL_ONLY = ["storage", "version", "web"];
 export const PROJECT_ONLY = ["repo"];
 
-/** Refuse a config file that still has the removed top-level `stages` or `workers` sections (no migrator). */
+/**
+ * Refuse a config file that still has the removed `stages` or `workers` sections, at the top level or in a project's
+ * overrides (no migrator; left in place they would be ignored, e.g. a project's CI mode or GitHub identity).
+ */
 export function assertNoLegacySections(configPath: string): void {
 	if (!existsSync(configPath)) return;
 	const doc = YAML.parseDocument(readFileSync(configPath, "utf8"));
 	if (doc.errors.length > 0) return; // the config store reports parse errors
 	const raw = doc.toJS();
 	if (!isObj(raw)) return;
-	const found = ["stages", "workers"].filter((k) => k in raw);
+	const LEGACY = ["stages", "workers"];
+	const projects = Object.entries(isObj(raw.projects) ? raw.projects : {}).filter(([, p]) => isObj(p) && LEGACY.some((k) => k in p));
+	const found = LEGACY.filter((k) => k in raw || projects.some(([, p]) => k in p));
 	if (found.length === 0) return;
 	throw new FactoryError(
 		"invalid",
-		`config uses removed sections (${found.join(", ")}); move stages.repo.{identity,visibility} → github.*, stages.repo.workdir and stages.environment.root → workdir, stages.delivery.ci.* → ci.*, stages.environment.sandbox.* → sandbox.*, stages.environment.setupScripts → sandbox.setupScripts, stages.interface.{host,port} → web.*, workers.web-search.* → webSearch.*`,
+		`config uses removed sections (${found.join(", ")}); move stages.repo.{identity,visibility} → github.*, stages.repo.workdir and stages.environment.root → workdir, stages.delivery.ci.* → ci.*, stages.environment.sandbox.* → sandbox.*, stages.environment.setupScripts → sandbox.setupScripts, stages.interface.{host,port} → web.*, workers.web-search.* → webSearch.*` +
+			(projects.length ? `; found in projects: ${projects.map(([name]) => name).join(", ")}` : ""),
 	);
 }
 

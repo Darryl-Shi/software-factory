@@ -140,6 +140,17 @@ describe("settings layering", () => {
 
 	test("a config with the removed stages/workers sections refuses to start", async () => {
 		await expect(makeFactory({ config: "version: 1\nstages:\n  delivery: { ci: { mode: off } }\n" })).rejects.toThrow(/removed sections \(stages\).*ci\.\*/);
+		await expect(makeFactory({ config: "version: 1\nworkers:\n  web-search: { mode: fast }\n" })).rejects.toThrow(/removed sections \(workers\); move .*webSearch\.\*/);
+		await expect(makeFactory({ config: "version: 1\nstages:\n  repo: { visibility: public }\nworkers:\n  web-search: { mode: fast }\n" })).rejects.toThrow(
+			/removed sections \(stages, workers\); move /,
+		);
+	});
+
+	test("removed stages/workers sections inside a project's overrides also refuse to start", async () => {
+		const project = "version: 1\nprojects:\n  pay:\n    repo: acme/payments\n    stages:\n      delivery: { ci: { mode: required } }\n";
+		await expect(makeFactory({ config: project })).rejects.toThrow(/removed sections \(stages\); move .*ci\.\*.*projects: pay/);
+		const both = "version: 1\nworkers:\n  web-search: { mode: fast }\nprojects:\n  a: { repo: me/a }\n  b:\n    repo: me/b\n    stages:\n      repo: { identity: { kind: bot } }\n";
+		await expect(makeFactory({ config: both })).rejects.toThrow(/removed sections \(stages, workers\); move .*projects: b$/);
 	});
 
 	test("roles have fixed tool sets", async () => {
