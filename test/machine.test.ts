@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import type { FactoryEvent, RunView } from "../src/core/types.ts";
-import { git } from "../src/extensions/git.ts";
+import { git } from "../src/github/git.ts";
 import { inState, makeFactory, type TestEnv, until } from "./helpers.ts";
 
 let t: TestEnv | undefined;

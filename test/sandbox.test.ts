@@ -6,8 +6,8 @@ import { join } from "node:path";
 import { BACKGROUND_CONTEXT as c } from "@earendil-works/chord/context";
 import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
 import { beforeAll, describe, expect, test } from "vitest";
-import { git } from "../src/extensions/git.ts";
-import { localWorktree } from "../src/extensions/local-worktree/index.ts";
+import { git } from "../src/github/git.ts";
+import { localWorktree } from "../src/sandbox/sandbox.ts";
 import type { Workspace } from "../src/core/types.ts";
 
 const available = process.platform === "linux" && SandboxManager.checkDependencies().errors.length === 0;

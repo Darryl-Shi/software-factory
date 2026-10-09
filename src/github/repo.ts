@@ -3,9 +3,9 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { expandHome } from "../../core/settings.ts";
-import type { Diff, PrRef, RepoExtension, SettingField, StageCallOptions, Workspace } from "../../core/types.ts";
-import { git, gitOut } from "../git.ts";
+import { expandHome } from "../core/settings.ts";
+import type { Diff, PrRef, RepoExtension, SettingField, StageCallOptions, Workspace } from "../core/types.ts";
+import { git, gitOut } from "./git.ts";
 import { GhApiHost, type GitHubHost, type Identity } from "./host.ts";
 
 export const identitySchema: SettingField = {

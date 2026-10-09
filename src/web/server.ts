@@ -9,7 +9,7 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { dirname, join } from "node:path";
-import { CORE_OPS, type FactoryCore, type FactoryError, type InterfaceExtension } from "../../core/types.ts";
+import { CORE_OPS, type FactoryCore, type FactoryError, type InterfaceExtension } from "../core/types.ts";
 
 export const DEFAULT_WEB_PORT = 7317;
 const COOKIE = "factory_web";

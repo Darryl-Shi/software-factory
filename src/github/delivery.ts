@@ -2,9 +2,9 @@
 // for an existing repo. Writes advisory findings into the PR description or docs/delivery-notes.md. Owns `ci` (§6).
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { parseDuration } from "../../core/settings.ts";
-import type { CiStatus, Delivery, DeliveryContext, DeliveryExtension, Finding, StageCallOptions, Workspace } from "../../core/types.ts";
-import { git, gitOut } from "../git.ts";
+import { parseDuration } from "../core/settings.ts";
+import type { CiStatus, Delivery, DeliveryContext, DeliveryExtension, Finding, StageCallOptions, Workspace } from "../core/types.ts";
+import { git, gitOut } from "./git.ts";
 import type { GitHubHost } from "./host.ts";
 import { identityOf } from "./repo.ts";
 

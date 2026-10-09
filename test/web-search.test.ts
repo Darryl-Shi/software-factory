@@ -2,7 +2,7 @@
 // failures, and a live run where the architect searches with the run's pinned `workers.web-search` settings.
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import { parallelSearch, webSearchSettings } from "../src/extensions/workers/web-search.ts";
+import { parallelSearch, webSearchSettings } from "../src/agents/web-search.ts";
 import { inState, makeFactory, type TestEnv, until } from "./helpers.ts";
 
 let t: TestEnv | undefined;

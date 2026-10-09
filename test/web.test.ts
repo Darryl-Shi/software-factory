@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { Script } from "node:vm";
 import { afterEach, describe, expect, test } from "vitest";
 import type { FactoryEvent } from "../src/core/types.ts";
-import { loadToken, webInterface } from "../src/extensions/web/server.ts";
+import { loadToken, webInterface } from "../src/web/server.ts";
 import { inState, makeFactory, type TestEnv, until } from "./helpers.ts";
 
 let t: TestEnv | undefined;
@@ -18,7 +18,7 @@ afterEach(async () => {
 	t = undefined;
 });
 
-const UI = join(import.meta.dirname, "../src/extensions/web/ui");
+const UI = join(import.meta.dirname, "../src/web/ui");
 
 async function serve(opts: { port?: number } = {}) {
 	t ??= await makeFactory();

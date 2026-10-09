@@ -11,9 +11,9 @@ import type { Context } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { type ExecutionEnv, ExecutionError, FileError, type Result, type ShellExecOptions, type ShellExecResult } from "@earendil-works/pi-durable/env";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
-import { expandHome } from "../../core/settings.ts";
-import type { EnvironmentExtension, Role, SettingField, StageCallOptions, Workspace } from "../../core/types.ts";
-import { gitOut } from "../git.ts";
+import { expandHome } from "../core/settings.ts";
+import type { EnvironmentExtension, Role, SettingField, StageCallOptions, Workspace } from "../core/types.ts";
+import { gitOut } from "../github/git.ts";
 
 export const DEFAULT_DENY_READ = ["~/.factory", "~/.ssh", "~/.config/gh"];
 export const CREDENTIAL_ENV_VARS = ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "FACTORY_GIT_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "AWS_SECRET_ACCESS_KEY"];

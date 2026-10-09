@@ -7,8 +7,8 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
-import { expandHome, resolveSecret } from "../../core/settings.ts";
-import { baseEnv, git, run } from "../git.ts";
+import { expandHome, resolveSecret } from "../core/settings.ts";
+import { baseEnv, git, run } from "./git.ts";
 
 export interface PrInfo {
 	number: number;
@@ -52,7 +52,7 @@ export interface GitHubHost {
 }
 
 // ------------------------------------------------------------------ secrets (references only, resolved at use)
-export { resolveSecret } from "../../core/settings.ts";
+export { resolveSecret } from "../core/settings.ts";
 
 // ------------------------------------------------------------------ real GitHub over `gh api`
 export class GhApiHost implements GitHubHost {

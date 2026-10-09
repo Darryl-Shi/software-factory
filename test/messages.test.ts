@@ -3,7 +3,7 @@
 import { afterEach, describe, expect, test } from "vitest";
 import { messageTarget } from "../src/core/messages.ts";
 import type { FactoryCore, FactoryEvent, RunView } from "../src/core/types.ts";
-import { git } from "../src/extensions/git.ts";
+import { git } from "../src/github/git.ts";
 import { inState, makeFactory, type TestEnv, until } from "./helpers.ts";
 
 let t: TestEnv | undefined;

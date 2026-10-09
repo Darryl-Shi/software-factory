@@ -10,7 +10,7 @@ import { createWriteStream, existsSync, mkdirSync, mkdtempSync, readFileSync, st
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
-import { LocalGitHubHost } from "../src/extensions/github/host.ts";
+import { LocalGitHubHost } from "../src/github/host.ts";
 import type { RunView } from "../src/core/types.ts";
 
 const pexec = promisify(execFile);

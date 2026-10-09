@@ -4,11 +4,11 @@ import { join } from "node:path";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { Factory } from "../src/core/core.ts";
 import type { RunView } from "../src/core/types.ts";
-import { githubDelivery } from "../src/extensions/github/delivery.ts";
-import { LocalGitHubHost } from "../src/extensions/github/host.ts";
-import { githubRepo } from "../src/extensions/github/repo.ts";
-import { localWorktree } from "../src/extensions/local-worktree/index.ts";
-import { DEFAULT_WORKER_EXTENSIONS, DEFAULT_WORKER_SETTINGS } from "../src/extensions/workers/index.ts";
+import { DEFAULT_WORKER_EXTENSIONS, DEFAULT_WORKER_SETTINGS } from "../src/agents/tools.ts";
+import { githubDelivery } from "../src/github/delivery.ts";
+import { LocalGitHubHost } from "../src/github/host.ts";
+import { githubRepo } from "../src/github/repo.ts";
+import { localWorktree } from "../src/sandbox/sandbox.ts";
 import { call, calls, humanText, type Script, say, scriptedProvider } from "../src/testing/scripted.ts";
 
 export type ReviewPlan = "pass" | "fail" | "invalid-then-pass" | "pass-advisory";

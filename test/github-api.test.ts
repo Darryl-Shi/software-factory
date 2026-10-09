@@ -7,7 +7,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { GhApiHost } from "../src/extensions/github/host.ts";
+import { GhApiHost } from "../src/github/host.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "fake-gh-"));
 const routes: Record<string, { status: number; body?: unknown }> = {};

@@ -5,9 +5,9 @@
 // `roles.<role>.extensions` for roles that must not search.
 import { Type } from "@earendil-works/pi-ai";
 import { defineExtension, defineTool, section } from "@earendil-works/pi-durable";
-import { resolveSecret } from "../../core/settings.ts";
-import type { SettingField } from "../../core/types.ts";
-import { workerSettings } from "../../core/worker-settings.ts";
+import { resolveSecret } from "../core/settings.ts";
+import type { SettingField } from "../core/types.ts";
+import { workerSettings } from "../core/worker-settings.ts";
 
 export const WEB_SEARCH_MODES = ["turbo", "fast", "basic", "advanced"] as const;
 export const DEFAULT_ENDPOINT = "https://api.parallel.ai/v1/search";

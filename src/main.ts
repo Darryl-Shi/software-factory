@@ -8,13 +8,12 @@ import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import { Factory } from "./core/core.ts";
 import { expandHome } from "./core/settings.ts";
 import type { FactoryExtension } from "./core/types.ts";
-import { cliInterface } from "./extensions/cli/server.ts";
-import { githubDelivery } from "./extensions/github/delivery.ts";
-import { GhApiHost, type GitHubHost, LocalGitHubHost } from "./extensions/github/host.ts";
-import { githubRepo } from "./extensions/github/repo.ts";
-import { localWorktree } from "./extensions/local-worktree/index.ts";
-import { webInterface } from "./extensions/web/server.ts";
-import { DEFAULT_WORKER_EXTENSIONS, DEFAULT_WORKER_SETTINGS } from "./extensions/workers/index.ts";
+import { DEFAULT_WORKER_EXTENSIONS, DEFAULT_WORKER_SETTINGS } from "./agents/tools.ts";
+import { githubDelivery } from "./github/delivery.ts";
+import { GhApiHost, type GitHubHost, LocalGitHubHost } from "./github/host.ts";
+import { githubRepo } from "./github/repo.ts";
+import { localWorktree } from "./sandbox/sandbox.ts";
+import { webInterface } from "./web/server.ts";
 
 export interface ProcessOptions {
 	configPath?: string;
@@ -22,7 +21,6 @@ export interface ProcessOptions {
 	fakeGithub?: string;
 	/** Register the scripted dry-run agents as provider "scripted" (no credentials needed). */
 	scripted?: boolean;
-	socket?: string;
 	/** Port of the web interface (overrides stages.interface.port; 0 picks a free port). */
 	webPort?: number;
 	ciPollMs?: number;
@@ -62,7 +60,6 @@ export async function startFactoryProcess(opts: ProcessOptions = {}) {
 			githubRepo(host),
 			githubDelivery(host),
 			localWorktree({ stateDir: join(factoryHome(configPath), "environments") }),
-			cliInterface(opts.socket ? { socket: opts.socket } : {}),
 			webInterface({ tokenFile: join(factoryHome(configPath), "web-token"), ...(opts.webPort !== undefined ? { port: opts.webPort } : {}), log }),
 			...(opts.extraExtensions ?? []),
 		],
