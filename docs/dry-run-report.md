@@ -1,6 +1,6 @@
-# Dry run of spec §8 — 2026-10-09T09:24:38.576Z
+# Dry run of spec §8 — 2026-10-09T09:32:17.310Z
 
-Directory: /tmp/sf-dr1. Scripted agents (no model credentials), sandbox ON, fake GitHub with local CI runner, SQLite storage, driven through the `factory` CLI.
+Directory: /tmp/sf-dr2. Scripted agents (no model credentials), sandbox ON, fake GitHub with local CI runner, SQLite storage, driven through the `factory` CLI.
 
 **50/50 checks passed.**
 
