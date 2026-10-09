@@ -68,7 +68,7 @@ export function scripts(control: Control): Record<string, Script> {
 		builder: async (ctx) => {
 			if (ctx.turn === 0) {
 				control.builderInputs.push(ctx.input);
-				if (control.builderHang) await new Promise((r) => setTimeout(r, 60_000));
+				while (control.builderHang) await new Promise((r) => setTimeout(r, 50));
 				if (!control.builderNoProgress) return call("write", { path: `round-${ctx.inputs.length}.txt`, content: `round ${ctx.inputs.length}\n` });
 			}
 			const ids = [...ctx.inputs.at(-1)!.matchAll(/\[(F\d+)\] \([a-z]+, BLOCKING/g)].map((m) => m[1]!);

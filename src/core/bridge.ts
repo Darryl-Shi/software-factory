@@ -81,9 +81,10 @@ function bridgeTool<P extends Parameters<typeof defineTool>[0]["parameters"]>(
 const FindingSchema = Type.Object({
 	severity: Type.String({ description: "critical | major | minor | nit" }),
 	blocking: Type.Boolean({ description: "Only blocking findings fail a round" }),
-	specRef: Type.String({ description: "The spec clause this finding rests on (e.g. an acceptance behaviour)" }),
+	// specRef and evidence are required; the factory's own validator enforces that with an actionable message.
+	specRef: Type.Optional(Type.String({ description: "REQUIRED: the spec clause this finding rests on (e.g. an acceptance behaviour)" })),
 	description: Type.String(),
-	evidence: Type.String({ description: "What you observed yourself: the exact command and its output, or a screenshot path" }),
+	evidence: Type.Optional(Type.String({ description: "REQUIRED: what you observed yourself: the exact command and its output, or a screenshot path" })),
 	source: Type.Optional(Type.String({ description: 'Always "reviewer" (default)' })),
 });
 

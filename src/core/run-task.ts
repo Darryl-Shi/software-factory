@@ -92,13 +92,13 @@ export function createRunTask(svc: CoreServices) {
 
 	function newAsk(d: RunDocState, question: Question): PendingAsk {
 		d.counters.askSeq += 1;
-		const ask: PendingAsk = { id: `${d.id}-ask${d.counters.askSeq}`, question, createdAt: svc.now() };
+		const ask: PendingAsk = { id: `${d.id}-ask${d.counters.askSeq}`, question: JSON.parse(JSON.stringify(question)), createdAt: svc.now() };
 		d.pendingAsk = ask;
 		return ask;
 	}
 
 	function notice(d: RunDocState, n: Omit<Notice, "at">) {
-		d.notices.push({ at: svc.now(), ...n } as Notice);
+		d.notices.push(JSON.parse(JSON.stringify({ at: svc.now(), ...n })) as Notice);
 	}
 
 	function assignIds(d: RunDocState, findings: Finding[]): Finding[] {
