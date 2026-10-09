@@ -2,34 +2,36 @@
 
 All configuration lives in a single YAML file: `~/.factory/config.yaml` by default, or `--config` / `$FACTORY_CONFIG`.
 `factory serve` creates the file with just `version: 1` if it doesn't exist. Settings read and write this file
-directly; there is no second store.
+directly; there is no second store. The factory's other files (`factory.pid`, `factory.log`, `web-token`, `web-url`)
+live next to it.
 
 ## Layers
 
 A setting's value comes from three layers, each overriding the one before:
 
-1. **Schema default**, from the core schema or the owning extension's schema.
+1. **Schema default**, from the core schema (`coreSchema()` in `src/core/settings.ts`).
 2. **Global value**, from the top level of the file.
 3. **Project value**, from `projects.<name>`, the project's overrides.
 
 How layers combine:
 - Objects merge key by key. Lists and scalars replace the value as a whole.
-- `storage` and `version` are global only.
-- A project's `repo` binding (`owner/name`) is set with `factory project create`, or `factory run --repo`.
+- `storage`, `version` and `web` are global only.
+- A project's `repo` binding (`owner/name`) is set when the project is created: **Create** in the web UI, with a new
+  project.
 
-To inspect and change settings:
-- `factory settings get [<path>] [--project p]` shows each value and its source: `default`, `global` or `project`.
-- `factory settings set <path> <value> [--project p]` takes values in YAML syntax, e.g. `'[spec, delivery]'`.
-- `factory settings unset <path> --project p` removes the project override, so the project inherits again.
-- `factory settings` with no subcommand opens an interactive menu (Policy · Roles · Stages · Workers), built from `settingsSchema()`.
-- The web UI's **Settings** view is the same thing as a form: pick Global or a project, and each field shows its source and a Reset/Inherit button.
+To inspect and change settings, open the web UI's **Settings** view (`factory web` prints the link):
+- Pick Global or a project on the left.
+- Each field shows its value and its source: `default`, `global` or `project`.
+- **Reset** removes a global value, so the default applies again. **Inherit** removes a project override, so the
+  project inherits again.
 
 **Validate on save.** Every change is validated before it is written:
-- against the schema (types, enums and min/max);
-- by the owning extension's `validate`;
+- against the schema (types, enums, min/max, and no unknown keys);
 - by the core's rules:
   - models must be known to pi-ai;
-  - worker extensions and stage `use` values must be installed;
+  - a GitHub `app` identity needs `appId`, `installationId` and `privateKeyRef`;
+  - `sandbox.extraWrite` must not make home or `/` writable, or overlap a denied path;
+  - `ci.noChecksTimeout` must be a duration and `ci.fixRounds` a whole number;
   - no gate may appear twice.
 
 This check runs against the *effective* config of every affected scope: a global change is checked for every project.
@@ -37,61 +39,62 @@ If any check fails, the change is rejected and the file is left unchanged.
 
 **Pinning.** Each run pins its effective config when it starts, so a settings change applies only to new runs.
 
-## Core settings
+## Settings
 
 | Path | Default | Meaning |
 |---|---|---|
-| `roles.architect` | `anthropic/claude-opus-5-5`, `high`, `[coding-readonly, web-search]` | Discussion and spec |
-| `roles.builder` | `anthropic/claude-opus-5-5`, `high`, `[coding, subagent, test-runner, web-search]` | The single writer |
-| `roles.helper` | `anthropic/claude-sonnet-5-5`, `medium`, `[coding-readonly, web-search]` | Helpers the builder spawns; read-only |
-| `roles.reviewer` | `openai/gpt-6-sol`, `high`, `[coding-readonly, test-runner, browser, web-search]` | Whole-product review |
+| `roles.architect` | `anthropic/claude-opus-5-5`, `high` | Discussion and spec |
+| `roles.builder` | `anthropic/claude-opus-5-5`, `high` | The single writer |
+| `roles.helper` | `anthropic/claude-sonnet-5-5`, `medium` | Helpers the builder spawns; read-only |
+| `roles.reviewer` | `openai/gpt-6-sol`, `high` | Whole-product review |
 | `policy.approvals` | `[spec]` | Approval gates, any of `spec`, `delivery`, `merge` |
 | `policy.reviewRoundCap` | `3` (1–20) | Review rounds before escalation |
 | `policy.escalateOnNoProgress` | `true` | Escalate when a fix round leaves the diff unchanged |
-| `policy.messages` | `[architect, builder, reviewer]` | Roles a human can message while a run is going (`factory message`, the web UI's chat box). Drop `reviewer` for a review no human can sway |
+| `policy.messages` | `[architect, builder, reviewer]` | Roles a human can message while a run is going (the web UI's chat box). Drop `reviewer` for a review no human can sway |
+| `workdir` | `~/factory/work` | Clones, per-run worktrees and the roles' scratch dirs |
+| `github.identity` | `{ kind: pat, tokenRef: env:GH_TOKEN }` | How the factory authenticates to GitHub (see below) |
+| `github.visibility` | `private` | Visibility of the repos the factory creates |
+| `ci.mode` | `if-present` | `off` / `if-present` / `required` (see below) |
+| `ci.fixRounds` | `2` (0–3) | CI fix rounds before escalation |
+| `ci.checks` | `[]` | Names of the checks that count; empty means all |
+| `ci.noChecksTimeout` | `2m` | No checks by then means the repo has no CI |
+| `sandbox.*` | see below | The sandbox every role's commands run in |
+| `web.host` | `127.0.0.1` | Address of the web UI; global only. Keep it on localhost; reach it from elsewhere through an SSH tunnel |
+| `web.port` | `7317` (0–65535) | Port of the web UI; global only. `0` picks a free one. If the port is taken, `serve` fails |
+| `webSearch.mode` | `fast` | Parallel search mode: `turbo`, `fast` (about 1 s), `basic` or `advanced` (about 3 s, highest quality) |
+| `webSearch.maxResults` | `10` (1–40) | Results per search |
+| `webSearch.maxCharsTotal` | unset (1000–200000) | Optional cap on the excerpt characters of one search |
+| `webSearch.apiKey` | `env:PARALLEL_API_KEY` | Reference to the Parallel API key (`env:` or `file:`, never the key) |
+| `webSearch.endpoint` | `https://api.parallel.ai/v1/search` | Search endpoint |
 | `storage.kind` / `storage.path` | `sqlite` / `~/.factory/factory.sqlite` | Harness storage (`sqlite` or `jsonl`); global only |
 
-Each role has three fields:
+Each role has two fields:
 - `model`: `provider/modelId`, as known to pi-ai's `createModels()`.
 - `thinking`: one of `off`, `low`, `medium`, `high`.
-- `extensions`: the role's worker extensions.
 
-The role's prompt section (`role-<role>`) is always added. The defaults put the reviewer on a different model family
-from the builder on purpose.
+The defaults put the reviewer on a different model family from the builder on purpose.
+
+Each role's tools are fixed, not settings. The role's prompt (`role-<role>`) always comes first:
+
+| Role | Tools |
+|---|---|
+| architect | `coding-readonly`, `web-search` |
+| builder | `coding`, `subagent`, `test-runner`, `web-search` |
+| helper | `coding-readonly`, `web-search` |
+| reviewer | `coding-readonly`, `test-runner`, `browser`, `web-search` |
 
 Model credentials are not settings. pi-ai reads them from the environment, e.g. `ANTHROPIC_API_KEY` and
 `OPENAI_API_KEY`.
 
-## Stage settings (extension-owned)
+### Web UI
 
-`stages.<kind>.use` selects the extension for that stage. Every other key under `stages.<kind>` belongs to that
-extension's schema. The table shows the values for the extensions that ship with v1.
+`web.host` and `web.port` apply when the factory starts; change them, then `factory stop` and `factory serve`.
+`factory serve --port` overrides the port for one start. If the port is taken, `serve` exits 1 with the port in the
+message; the factory never runs without its web UI.
 
-| Path | Default | Owner |
-|---|---|---|
-| `stages.intake.use` | `none` | core (v1 ships no intake extension) |
-| `stages.interface.use` | every installed interface (`[cli, web]`) | core |
-| `stages.interface.socket` | `~/.factory/factory.sock` | `cli` |
-| `stages.interface.host` | `127.0.0.1` | `web`: address of the web UI. Keep it on localhost; reach it from elsewhere through an SSH tunnel |
-| `stages.interface.port` | `7317` (0–65535) | `web`: port of the web UI; `0` picks a free one. If the port is taken, the factory runs without the web UI and says so |
-| `stages.repo.use` | `github` | core |
-| `stages.repo.identity` | `{ kind: pat, tokenRef: env:GH_TOKEN }` | `github` (see below) |
-| `stages.repo.visibility` | `private` | `github`: visibility of the repos it creates |
-| `stages.repo.workdir` | `~/factory/work` | `github`: clones and per-run worktrees |
-| `stages.delivery.use` | `github-delivery` | core |
-| `stages.delivery.newRepo` / `existingRepo` | `push-main` / `pull-request` | `github-delivery` (the only values) |
-| `stages.delivery.ci.mode` | `if-present` | `github-delivery`: `off` / `if-present` / `required` |
-| `stages.delivery.ci.fixRounds` | `2` (0–3) | `github-delivery`: CI fix rounds before escalation |
-| `stages.delivery.ci.checks` | `[]` | `github-delivery`: names of the checks that count; empty means all |
-| `stages.delivery.ci.noChecksTimeout` | `2m` | `github-delivery`: no checks by then means the repo has no CI |
-| `stages.environment.use` | `local-worktree` | core |
-| `stages.environment.root` | `~/factory/work` | `local-worktree`: scratch dirs and environment records |
-| `stages.environment.setupScripts` | `[scripts/setup.sh, setup.sh, bin/setup]` | `local-worktree`: the first one that exists runs at provision |
-| `stages.environment.sandbox.*` | see below | `local-worktree` |
-
-Interface settings apply when the factory starts; `factory serve` prints the web UI's link, and `factory web` prints
-it again. The link carries an access token kept in `~/.factory/web-token` (mode 0600, next to the config file); the
-first visit swaps it for a session cookie. Delete the file and restart to issue a new token.
+`factory serve` prints the web UI's link, and `factory web` prints it again. The link carries an access token kept in
+`web-token` next to the config file (mode 0600); the first visit swaps it for a session cookie. Delete the file and
+restart to issue a new token.
 
 ### CI modes
 
@@ -103,9 +106,12 @@ first visit swaps it for a session cookie. Delete the file and restart to issue 
 
 When CI is red, the failure goes back to the builder. After `fixRounds` failed rounds, the run escalates.
 
+Delivery itself is not a setting: a new repo is always pushed to `main`, and an existing repo always gets a pull
+request.
+
 ### Sandbox
 
-All of these live under `stages.environment.sandbox`.
+All of these live under `sandbox`.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -114,11 +120,12 @@ All of these live under `stages.environment.sandbox`.
 | `deniedDomains` | `[]` | Always denied; overrides allows. |
 | `denyRead` | `[~/.factory, ~/.ssh, ~/.config/gh]` | Paths hidden from every role. |
 | `extraWrite` | `[]` | Extra writable paths for the builder. Rejected if it would make home or `/` writable, or overlap a denied path. |
-| `unixSockets` | `auto` | Linux only: `block`, `allow`, or `auto`, which relaxes the setting if the host forbids nested user namespaces (DEVIATIONS.md §9). |
+| `unixSockets` | `auto` | Linux only: `block`, `allow`, or `auto`, which relaxes the setting if the host forbids nested user namespaces (DEVIATIONS.md §7). |
+| `setupScripts` | `[scripts/setup.sh, setup.sh, bin/setup]` | The first one that exists in the worktree runs when the builder's environment is provisioned (sandboxed, with the builder's rights). |
 
 ### GitHub identity
 
-`stages.repo.identity` sets how the factory authenticates to GitHub. The delivery extension uses the same identity.
+`github.identity` sets how the factory authenticates to GitHub, for opening repos, delivery, CI and merges.
 - `kind: pat` or `kind: bot` takes a `tokenRef`.
 - `kind: app` takes `appId`, `installationId` and `privateKeyRef`.
 
@@ -138,23 +145,29 @@ A token needs enough access to create private repos and push. With a fine-graine
 
 With a classic PAT, grant `repo`, plus `workflow` if workflows will be pushed.
 
-## Worker settings (extension-owned)
-
-`workers.<name>` holds the settings of worker extension `<name>`. They layer, validate and pin per run like every
-other setting; the core hands a run's pinned values to the extension's tools.
-
-| Path | Default | Meaning |
-|---|---|---|
-| `workers.web-search.mode` | `fast` | Parallel search mode: `turbo`, `fast` (about 1 s), `basic` or `advanced` (about 3 s, highest quality) |
-| `workers.web-search.maxResults` | `10` (1–40) | Results per search |
-| `workers.web-search.maxCharsTotal` | unset (1000–200000) | Optional cap on the excerpt characters of one search |
-| `workers.web-search.apiKey` | `env:PARALLEL_API_KEY` | Reference to the Parallel API key (`env:` or `file:`, never the key) |
-| `workers.web-search.endpoint` | `https://api.parallel.ai/v1/search` | Search endpoint |
+### Web search
 
 Without a key, `web_search` returns an error that tells the agent to carry on without searching; nothing else
 breaks. The tool runs in the factory process, so the key never reaches the sandbox and `api.parallel.ai` needs no
-`allowedDomains` entry. Queries leave the machine and are kept in transcripts; to turn searching off for a role,
-remove `web-search` from `roles.<role>.extensions`.
+`allowedDomains` entry. Queries leave the machine and are kept in transcripts. Every role has the tool; to turn
+searching off, leave the key unset.
+
+## Old config files
+
+The `stages` and `workers` sections are gone, and so are `roles.<role>.extensions`, every `stages.*.use`,
+`stages.interface.socket` and `stages.delivery.newRepo`/`existingRepo`. There is no migrator. If the config file still
+has a `stages` or `workers` section, at the top level or under `projects.<name>`, `factory serve` exits 1 with:
+
+```
+error: config uses removed sections (stages, workers); move stages.repo.{identity,visibility} → github.*, stages.repo.workdir and stages.environment.root → workdir, stages.delivery.ci.* → ci.*, stages.environment.sandbox.* → sandbox.*, stages.environment.setupScripts → sandbox.setupScripts, stages.interface.{host,port} → web.*, workers.web-search.* → webSearch.*; found in projects: todo
+```
+
+The list names the sections it found, and the last part appears only when a project has them. `factory doctor`
+prints the same message as a `FAIL` line. Any other unknown key fails validation on save as before.
+
+**Finish or cancel in-flight runs before upgrading.** Runs started before this change are not migrated: their pinned
+config still has the old paths. If such a run resumes, it doesn't see its old values and falls back to the default CI
+mode, GitHub identity and workdir.
 
 ## Example
 
@@ -163,18 +176,14 @@ version: 1
 roles:
   reviewer: { model: openai/gpt-6-sol, thinking: high }
 policy: { approvals: [spec, delivery], reviewRoundCap: 3 }
-workers:
-  web-search: { mode: fast, apiKey: env:PARALLEL_API_KEY }
-stages:
-  repo:
-    identity: { kind: pat, tokenRef: env:GH_TOKEN }
-  delivery:
-    ci: { mode: if-present, fixRounds: 2 }
-  environment:
-    sandbox: { allowedDomains: [registry.npmjs.org] }
+github:
+  identity: { kind: pat, tokenRef: env:GH_TOKEN }
+ci: { mode: if-present, fixRounds: 2 }
+sandbox: { allowedDomains: [registry.npmjs.org] }
+webSearch: { mode: fast, apiKey: env:PARALLEL_API_KEY }
 projects:
   todo:
     repo: me/todo
     policy: { approvals: [spec, delivery, merge] }
-    stages: { delivery: { ci: { mode: required } } }
+    ci: { mode: required }
 ```

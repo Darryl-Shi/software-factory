@@ -1,5 +1,7 @@
 # Software Factory on Pi Durable: Design Spec
 
+> **Superseded in part** by [the fixed architecture cleanup](superpowers/specs/2026-10-09-fixed-architecture-cleanup-design.md): no extension layer, web UI only, fixed tool sets, new setting paths.
+
 Status: draft v0.1. Items marked **[decided]** are settled and not open for discussion here. Items marked **[default, changeable]** are what we adopt unless someone finds a reason to change them.
 
 Pi Durable terms used below: a **Harness** is one storage backend plus the machinery that runs agents on it. A **Conversation** is a transcript that runs with an **Agent** (model, extensions, tools, cwd). A **Task** is a durable state machine that saves a checkpoint at every step. A **Document** is typed JSON committed atomically alongside the transcript. An **Extension** bundles tools, sections, hooks, wraps and tasks, and is installed in a **Registry**. **ExecutionEnv** is where tools run. Pi Durable is marked experimental and its API can change between releases, so we pin a version.
@@ -7,6 +9,8 @@ Pi Durable terms used below: a **Harness** is one storage backend plus the machi
 ---
 
 ## 1. Goals / Non-goals
+
+> Superseded: the "everything that varies via extensions" goal and the interfaces-as-extensions non-goal. The factory is a fixed solution: the web UI is its only interface, and GitHub and a local sandbox are its backend ([cleanup spec](superpowers/specs/2026-10-09-fixed-architecture-cleanup-design.md)).
 
 **Goals**
 - Take a software request to a delivered repo or PR without supervision. The same flow handles a new project (zero to MVP) and an incremental change to an existing repo; there is no mode split. **[decided]**
@@ -76,6 +80,8 @@ These services come straight from Pi and Pi Durable and the factory does not wra
 
 ### 3.2 Factory extensions (layer 2): the pipeline
 
+> Superseded: there are no factory extensions, stage selection or intake. The core calls a `GitHub` class and a `Sandbox` class directly, and the web server is its interface ([cleanup spec §1](superpowers/specs/2026-10-09-fixed-architecture-cleanup-design.md#1-architecture-and-layout)).
+
 ```ts
 type RunId = string;
 interface Request { id: string; source: string; title: string; body: string;
@@ -118,6 +124,9 @@ type CiStatus = { state: "none" | "pending" | "green" | "red"; failures?: string
 ```
 
 ### 3.3 Worker extensions (layer 3): the agent's environment
+
+> Superseded: there is no `EnvironmentExtension` and no worker-extension selection. `Sandbox` provides the environment, each role has a fixed tool set, and the web-search settings are `webSearch.*`, carried in a `factory.runConfig` Document ([cleanup spec](superpowers/specs/2026-10-09-fixed-architecture-cleanup-design.md)).
+
 **[default, changeable]:** worker extensions **are Pi Durable extensions** (`defineExtension`: tools, sections, hooks, wraps). We do not invent a factory-specific contract. The core selects them for each role Conversation with `configure({ extensions, tools, cwd })`.
 
 ```ts
@@ -169,6 +178,9 @@ Interfaces create the record with `createProject(name, repo)` (the same call whe
 *Example interface, not part of the core:* a CLI extension might expose these as `factory project create todo --repo me/todo` and `factory run todo "add due dates"`, plus a shorthand that calls both for a project's first run.
 
 ### 3.6 Core operations and events (the interface surface)
+
+> Superseded: the interface parts. There are no interface extensions, no CLI client and no Unix socket. The web server is the one transport, and the operations and events below are what it calls ([cleanup spec](superpowers/specs/2026-10-09-fixed-architecture-cleanup-design.md)).
+
 The core's whole surface for humans is a set of transport-neutral operations plus a stream of events. Interface extensions (§3.2) call the operations and render the events; nothing else reaches the core from outside. The core knows nothing about any specific interface, so a CLI, a web UI, an HTTP API or a chat bridge is each just an interface extension over the same surface, and several can run at once.
 
 ```ts
@@ -259,6 +271,8 @@ Invariants:
 
 ## 5. Config schema example
 
+> Superseded: there are no `stages`, `workers` or `roles.<role>.extensions`. See the cleanup spec's [§2](superpowers/specs/2026-10-09-fixed-architecture-cleanup-design.md#2-settings-and-data-flow) and [configuration.md](configuration.md) for the current paths.
+
 Config is plain data, versioned in a repo or at `~/.factory/`. It maps roles to models and stages to extensions, and it sets policy. **[decided]**
 
 ```yaml
@@ -305,6 +319,8 @@ projects:                                # project records (§3.5): repo binding
 ---
 
 ## 6. Settings **[default, changeable]**
+
+> Superseded: the setting paths, extension-owned schemas (`Configurable`) and the `factory settings` CLI. The schema is the core's alone, and the web UI's Settings view is the editor. See the cleanup spec's [§2](superpowers/specs/2026-10-09-fixed-architecture-cleanup-design.md#2-settings-and-data-flow) and [configuration.md](configuration.md).
 
 Settings are a view over the config file (§5), not a second store. Config stays plain data; the core reads, validates and writes it through the settings operations (`settingsSchema`, `getSettings`, `setSetting`, `unsetSetting`, §3.6), each taking a scope: global or one project. Interfaces render these operations, for example as a menu.
 

@@ -1,6 +1,6 @@
-// The factory process: the one process that owns the storage and the core (spec §3.6 "Transport belongs to the
-// extension"). It wires the platform services (pi-ai models, storage) into the core through dependency injection,
-// installs the factory extensions, and starts the web server.
+// The factory process: the one process that owns the storage and the core. It creates the pi-ai models, a GitHub on
+// a GhApiHost (or a LocalGitHubHost with --fake-github) and a Sandbox, hands them to the Factory, which opens the
+// storage, and then starts the web server, the factory's interface. A busy web port stops it before any run resumes.
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { dirname, join } from "node:path";
