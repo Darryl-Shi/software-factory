@@ -132,8 +132,9 @@ factory doctor [--config p]
 - `sandbox.test.ts`, `github-api.test.ts`, `web-search.test.ts`, `machine.test.ts`, `messages.test.ts`,
   `findings.test.ts`, `durability.test.ts`: import and path changes only.
 - **Dry run** (`scripts/dry-run.ts`): drives `factory serve --fake-github --scripted` (daemonized) through the web
-  HTTP API (`POST /api/op/<op>` with the access token, events over SSE) instead of the socket CLI. Same §8 checks
-  minus those that tested the CLI itself; it stops the factory with `factory stop`. `docs/dry-run-report.md` is
+  HTTP API (`POST /api/op/<op>` with the access token, events over SSE) instead of the socket CLI. Same §8 checks;
+  checks that only exercised CLI commands (e.g. the settings menu) are dropped and the report lists which. It stops
+  the factory with `factory stop`. `docs/dry-run-report.md` is
   regenerated.
 - Done means `npm test`, `npm run typecheck` and `npm run dry-run` all pass.
 
@@ -149,7 +150,9 @@ pid file, or a legacy `stages`/`workers` config all stop `serve` with a non-zero
 - Rewrite `README.md`: the web UI as the interface, daemon commands, quickstart, layout; no CLI command list.
 - Rewrite `docs/configuration.md` for the new paths; no stage or worker ownership.
 - Update `docs/architecture.md`: direct modules instead of core-vs-extensions.
-- `docs/design-spec.md`: mark the "everything varies via extensions" goal and §3.2, §3.3, §3.6 (extension contracts,
-  interfaces as extensions) as superseded by this spec, with a link; no full rewrite.
+- `docs/design-spec.md`: add a note at the top and at each affected place that this spec supersedes it there, with a
+  link; no full rewrite. Affected: the "everything varies via extensions" goal and the interfaces-as-extensions
+  non-goal (§1), §3.2 and §3.3 (extension contracts, worker-extension selection), the interface parts of §3.6, and
+  the setting paths in §5 and §6.
 - `DEVIATIONS.md`: drop entries about extension contracts and the CLI; add one entry stating the pluggable layer
   was removed on purpose.

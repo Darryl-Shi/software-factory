@@ -73,7 +73,7 @@ test("a busy port is an error, not a silent no-UI start", async () => {
 	blocker.close();
 });
 ```
-`test/settings.test.ts`: add `[{ project: "p" }, "web.port", 8000, /global only/]` and `[G, "web.port", 70000, /above the maximum 65535/]` to the `bad` table, and add `web` to the expected top-level schema keys.
+`test/settings.test.ts`: add `[{ project: "p" }, "web.port", 8000, /global only/]` and `[G, "web.port", 70000, /above the maximum 65535/]` to the `bad` table, and change the expected top-level schema keys to `["version", "roles", "policy", "web", "storage", "stages", "workers"]` (insert `web` after `policy` in `coreSchema()`); the expected `stages` keys become `["repo", "delivery", "environment"]`.
 
 - [ ] **Step 2:** Run `npx vitest run test/web.test.ts test/settings.test.ts`. Expected: FAIL (`startWebServer` is not exported; `web.port` is an unknown setting).
 - [ ] **Step 3:** Implement:
@@ -112,6 +112,7 @@ test("a busy port is an error, not a silent no-UI start", async () => {
 
 `test/settings.test.ts`:
 - Replace the `teleport` row with `[G, "roles.builder.extensions", ["coding"], /unknown setting/]`.
+- Expected top-level schema keys become `["version", "roles", "policy", "web", "webSearch", "storage", "stages"]`.
 - Add a test, `"roles have fixed tool sets"`. It asserts `Object.keys((t.factory.settingsSchema().roles as any).fields.builder.fields)` equals `["model", "thinking"]`, and that `ROLE_TOOLS.reviewer.map((e) => e.name)` equals `["role-reviewer", "coding-readonly", "test-runner", "browser", "web-search"]`.
 
 `test/web-search.test.ts`:
@@ -160,7 +161,7 @@ This removes the rest of the extension layer.
 - Produces in `settings.ts`: `coreSchema()` is the complete schema (top-level keys in this order: `version, workdir, roles, policy, github, ci, sandbox, web, webSearch, storage`). `ci.noChecksTimeout` is validated as a duration and `ci.fixRounds` as a whole number, inside `coreRules`.
 - Produces `assertNoLegacySections(configPath: string): void` in `settings.ts`. If the file has top-level `stages` or `workers`, it throws `FactoryError("invalid", …)` with this exact message:
   `config uses removed sections (stages, workers); move stages.repo.{identity,visibility} → github.*, stages.repo.workdir and stages.environment.root → workdir, stages.delivery.ci.* → ci.*, stages.environment.sandbox.* → sandbox.*, stages.environment.setupScripts → sandbox.setupScripts, stages.interface.{host,port} → web.*, workers.web-search.* → webSearch.*`
-  The message names only the sections actually present. `Factory.start()` calls it first.
+  The parenthesis lists only the sections actually present (`stages`, `workers` or both); the move list is always complete. `Factory.start()` calls it first.
 
 - [ ] **Step 1: Write the failing tests**
 
