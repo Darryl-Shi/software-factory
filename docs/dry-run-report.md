@@ -1,6 +1,6 @@
-# Dry run of spec §8 — 2026-10-09T16:40:16.156Z
+# Dry run of spec §8 — 2026-10-09T16:46:46.620Z
 
-Directory: /home/dshi/tmp-sf/dr6. Scripted agents (no model credentials), sandbox OFF (DRYRUN_SANDBOX=0), fake GitHub with local CI runner, SQLite storage, a daemonized `factory serve` driven through the web HTTP API (`POST /api/op/<op>`, `GET /api/events`).
+Directory: /home/dshi/tmp-sf/dr6b. Scripted agents (no model credentials), sandbox OFF (DRYRUN_SANDBOX=0), fake GitHub with local CI runner, SQLite storage, a daemonized `factory serve` driven through the web HTTP API (`POST /api/op/<op>`, `GET /api/events`).
 
 Dropped CLI-only checks: none. The terminal attach view check is replaced by the SSE event stream check.
 
@@ -27,7 +27,7 @@ Dropped CLI-only checks: none. The terminal attach view check is replaced by the
 - ✅ if-present on a repo without CI: finished and noted that there was no CI
 - ✅ cost per role per round recorded in the run Document
 - ✅ helper Conversation spawned by the builder is visible in the transcript view
-- ✅ the SSE event stream reported run.state → DELIVERED
+- ✅ the SSE event stream reported run.state → DELIVERED and builder and reviewer activity (conversation.updated)
 
 ## §8.4 invalid setting is rejected and the config file is unchanged
 - ✅ setSetting ci.fixRounds 5 is rejected

@@ -94,15 +94,32 @@ async function kill9(): Promise<number> {
 	const pid = livePid(CONFIG);
 	if (pid === undefined) throw new Error("no live factory to kill");
 	process.kill(pid, "SIGKILL");
+	const deadline = Date.now() + 10_000;
 	for (;;) {
 		try {
 			process.kill(pid, 0);
 		} catch {
 			return pid;
 		}
+		if (Date.now() > deadline) throw new Error(`factory (pid ${pid}) still alive 10s after SIGKILL`);
 		await sleep(50);
 	}
 }
+
+// The daemon runs in its own session, so Ctrl-C doesn't reach it and a signal exit skips main's `finally`: stop it here.
+let interrupted = false;
+for (const sig of ["SIGINT", "SIGTERM"] as const)
+	process.once(sig, async () => {
+		interrupted = true;
+		say(`\n${sig}: stopping the factory`);
+		await factory("stop", "--config", CONFIG).catch((e) => {
+			say(`factory stop failed (${e.stderr ?? e.message}); sending SIGKILL`);
+			const pid = livePid(CONFIG);
+			if (pid !== undefined) process.kill(pid, "SIGKILL");
+		});
+		log.end();
+		process.exit(sig === "SIGINT" ? 130 : 143);
+	});
 
 /** Calls a core operation over the web API; `ok: false` throws its error. */
 async function api<T = any>(op: string, ...args: unknown[]): Promise<T> {
@@ -282,7 +299,12 @@ async function main() {
 	check("cost per role per round recorded in the run Document", ["architect", "builder", "reviewer"].every((r) => v1.cost.some((c) => c.role === r)) && v1.cost.filter((c) => c.role === "reviewer").map((c) => c.round).join() === "1,2", JSON.stringify(v1.cost.map((c) => [c.role, c.round])));
 	check("helper Conversation spawned by the builder is visible in the transcript view", trB.helpers.length === 1);
 	const states1 = stream1.got.flatMap((e) => (e.type === "run.state" ? [e.to] : []));
-	check("the SSE event stream reported run.state → DELIVERED", deliveredEvent(), `run.state events: ${states1.join(" > ") || "(none)"}`);
+	const active1 = new Set(stream1.got.flatMap((e) => (e.type === "conversation.updated" && e.run === run1 ? [e.role] : [])));
+	check(
+		"the SSE event stream reported run.state → DELIVERED and builder and reviewer activity (conversation.updated)",
+		deliveredEvent() && active1.has("builder") && active1.has("reviewer"),
+		`run.state events: ${states1.join(" > ") || "(none)"}; conversation.updated roles: ${[...active1].join(", ") || "(none)"}`,
+	);
 
 	// ---------------------------------------------------------------- §8.4 settings checks (invalid value)
 	section("§8.4 invalid setting is rejected and the config file is unchanged");
@@ -425,9 +447,10 @@ async function main() {
 
 main()
 	.catch((e) => {
-		check(`trial aborted: ${e.message}`, false, e.stack);
+		if (!interrupted) check(`trial aborted: ${e.message}`, false, e.stack);
 	})
 	.finally(async () => {
+		if (interrupted) return; // the signal handler stops the factory and exits
 		await factory("stop", "--config", CONFIG).catch((e) => say(`factory stop failed: ${e.stderr ?? e.message}`));
 		const failed = checks.filter((c) => !c.ok);
 		const md = [
