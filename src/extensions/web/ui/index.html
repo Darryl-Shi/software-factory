@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>Factory Board</title>
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<div class="app" id="app">
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1 14V7l4 2.5V7l4 2.5V4l2-2h2l2 2v10z"/></svg></span>Factory</div>
+    <nav class="nav" aria-label="Views">
+      <button type="button" data-view="board" aria-current="page">Board</button>
+      <button type="button" data-view="settings">Settings</button>
+    </nav>
+    <div class="top-spacer"></div>
+    <label class="search"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6.5 1a5.5 5.5 0 0 1 4.38 8.83l3.65 3.64-1.06 1.06-3.64-3.65A5.5 5.5 0 1 1 6.5 1zm0 1.5a4 4 0 1 0 0 8 4 4 0 0 0 0-8z"/></svg><input id="q" type="search" placeholder="Search tickets" aria-label="Search tickets"></label>
+    <button type="button" class="btn primary" id="create-btn"><span aria-hidden="true">+</span> Create</button>
+  </header>
+
+  <main class="view" id="view-board">
+    <div class="board-wrap">
+      <div class="board-head">
+        <h1 class="board-title" id="board-title">Pipeline</h1>
+        <select class="proj" id="proj-filter" aria-label="Project"></select>
+        <div class="chips" role="group" aria-label="Quick filters">
+          <button type="button" class="chip turnchip" id="f-turn" aria-pressed="false">Needs me <span class="n" id="n-turn">0</span></button>
+          <button type="button" class="chip" id="f-active" aria-pressed="false">Active <span class="n" id="n-active">0</span></button>
+          <button type="button" class="chip" id="f-closed" aria-pressed="false">Show closed <span class="n" id="n-closed">0</span></button>
+        </div>
+      </div>
+      <div class="board" id="board" aria-label="Pipeline board"></div>
+    </div>
+  </main>
+
+  <main class="view" id="view-settings" hidden>
+    <div class="settings">
+      <nav class="set-nav" id="set-nav" aria-label="Settings scope"></nav>
+      <section class="set-main" id="set-main"></section>
+    </div>
+  </main>
+  <div class="conn" id="conn" hidden role="status"></div>
+</div>
+<div class="rv-backdrop" id="rv-backdrop" hidden></div>
+<div class="runview" id="runview" hidden role="dialog" aria-modal="true" aria-labelledby="rv-title">
+  <header class="rv-top">
+    <div class="rv-id">
+      <button type="button" class="icon-btn drawer-btn threads" id="rv-threads-btn" aria-label="Show conversations"><svg viewBox="0 0 16 16"><path d="M2 3h12v1.5H2zm0 4.25h12v1.5H2zM2 11.5h12V13H2z"/></svg></button>
+      <span class="rv-key" id="rv-key"></span>
+      <h2 class="rv-title" id="rv-title"></h2>
+      <span id="rv-state"></span>
+    </div>
+    <div class="rv-progress" id="rv-progress" aria-label="Pipeline progress"></div>
+    <div class="rv-actions">
+      <span class="rv-cost" id="rv-cost" title="Cost so far"></span>
+      <button type="button" class="icon-btn" id="rv-details-btn" aria-label="Ticket details" aria-pressed="false" title="Ticket details"><svg viewBox="0 0 16 16"><path d="M2 2.5h12a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1zm.5 1.5v8h7V4zm8.5 0v8h2.5V4z"/></svg></button>
+      <button type="button" class="rv-close" id="rv-close" aria-label="Close ticket" title="Close (Esc)"><svg viewBox="0 0 16 16"><path d="M13.53 3.53 5.56 11.5H10V13H3V6h1.5v4.44l7.97-7.97z"/></svg></button>
+    </div>
+  </header>
+  <div class="rv-body" id="rv-body">
+    <nav class="rv-threads" id="rv-threads" aria-label="Conversations"></nav>
+    <section class="rv-center">
+      <div class="conv-head" id="conv-head"></div>
+      <div class="tx-wrap"><div class="transcript" id="transcript"><div class="tx" id="tx"></div></div><div class="dock" id="dock" hidden></div></div>
+      <div class="composer" id="composer-wrap"><div id="composer"></div></div>
+    </section>
+    <aside class="rv-details" id="rv-details" aria-label="Ticket details"><div class="rv-details-inner" id="rv-details-inner"></div></aside>
+  </div>
+</div>
+
+<div id="modal-root"></div>
+<div class="toasts" id="toasts" aria-live="polite"></div>
+</body>
+</html>

@@ -16,6 +16,9 @@ import {
 	UsageDoc,
 } from "@earendil-works/pi-durable";
 import { createBashTool, createEditTool, createReadTool, createWriteTool } from "@earendil-works/pi-durable/tools";
+import { WebSearch, webSearchSettings } from "./web-search.ts";
+
+export { WebSearch, webSearchSettings } from "./web-search.ts";
 
 export const Coding = defineExtension({ name: "coding", tools: [createReadTool(), createWriteTool(), createEditTool(), createBashTool()] });
 export const CodingReadonly = defineExtension({
@@ -139,7 +142,8 @@ export const RoleArchitect = defineExtension({
 - Ask ONE question at a time with ask_human, grounded in the request and the repo (read AGENTS.md, docs/spec.md and the code first if a repo exists). Stop asking as soon as the architecture is settled; prefer few questions.
 - Then call submit_spec with a single markdown spec: the only contract for the build and the review. Describe what the product does and its key technical decisions; no implementation plan, no work split.
 - The spec MUST end with a section "## Acceptance behaviours": short, observable, product-level scenarios a reviewer can check by running the product.
-- For incremental changes, write the spec of the change in the context of the existing product (the builder updates docs/spec.md).`,
+- For incremental changes, write the spec of the change in the context of the existing product (the builder updates docs/spec.md).
+- The human may send you messages at any time, marked "[Message from the human ...]" with a note on where the run is. Follow that note.`,
 		),
 	],
 });
@@ -157,7 +161,8 @@ export const RoleBuilder = defineExtension({
 - Write tests. Never delete or weaken tests to make them pass.
 - If the project requires CI, ship a CI workflow (.github/workflows/ci.yml) that runs the tests.
 - When findings arrive, fix what you agree with and answer every blocking finding in report_done (fixed, or wontfix with a reason).
-- You cannot ask the human anything mid-build; decide and note your decisions in PROGRESS.md. Finish with report_done.`,
+- You cannot ask the human anything mid-build; decide and note your decisions in PROGRESS.md. Finish with report_done.
+- The human may send you messages, marked "[Message from the human ...]" with a note on where the run is. Take them into account and follow that note; they don't replace the spec.`,
 		),
 	],
 });
@@ -173,6 +178,7 @@ export const RoleReviewer = defineExtension({
 - Flag tests that were deleted or weakened in the diff.
 - Every finding must cite the spec clause it rests on (specRef) and evidence you observed: the exact command and its output.
 - Only blocking findings fail a round: verdict "fail" if and only if at least one finding is blocking. Use advisory (blocking: false) for nice-to-haves.
+- The human may send you messages, marked "[Message from the human ...]". Check what they point at, but your verdict still rests on the spec and on evidence you observe.
 - Finish with submit_review.`,
 		),
 	],
@@ -183,4 +189,7 @@ export const RoleHelper = defineExtension({
 	sections: [section("role", () => "You are a helper of the builder: read, search, analyse and run commands; never modify files. Answer with a condensed summary (under ~1500 tokens).")],
 });
 
-export const DEFAULT_WORKER_EXTENSIONS: Extension[] = [Coding, CodingReadonly, Subagent, TestRunner, Browser, RoleArchitect, RoleBuilder, RoleReviewer, RoleHelper];
+export const DEFAULT_WORKER_EXTENSIONS: Extension[] = [Coding, CodingReadonly, Subagent, TestRunner, Browser, WebSearch, RoleArchitect, RoleBuilder, RoleReviewer, RoleHelper];
+
+/** Settings schemas of the default worker extensions (`workers.<name>`), for `CoreOptions.workerSettings`. */
+export const DEFAULT_WORKER_SETTINGS = { "web-search": webSearchSettings };

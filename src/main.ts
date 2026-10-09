@@ -13,7 +13,8 @@ import { githubDelivery } from "./extensions/github/delivery.ts";
 import { GhApiHost, type GitHubHost, LocalGitHubHost } from "./extensions/github/host.ts";
 import { githubRepo } from "./extensions/github/repo.ts";
 import { localWorktree } from "./extensions/local-worktree/index.ts";
-import { DEFAULT_WORKER_EXTENSIONS } from "./extensions/workers/index.ts";
+import { webInterface } from "./extensions/web/server.ts";
+import { DEFAULT_WORKER_EXTENSIONS, DEFAULT_WORKER_SETTINGS } from "./extensions/workers/index.ts";
 
 export interface ProcessOptions {
 	configPath?: string;
@@ -22,6 +23,8 @@ export interface ProcessOptions {
 	/** Register the scripted dry-run agents as provider "scripted" (no credentials needed). */
 	scripted?: boolean;
 	socket?: string;
+	/** Port of the web interface (overrides stages.interface.port; 0 picks a free port). */
+	webPort?: number;
 	ciPollMs?: number;
 	log?: (m: string) => void;
 	extraExtensions?: FactoryExtension[];
@@ -50,6 +53,7 @@ export async function startFactoryProcess(opts: ProcessOptions = {}) {
 		mkdirSync(dirname(configPath), { recursive: true });
 		writeFileSync(configPath, "version: 1\n");
 	}
+	const log = opts.log ?? ((m: string) => console.error(`[factory] ${m}`));
 	const host: GitHubHost = opts.fakeGithub ? new LocalGitHubHost(expandHome(opts.fakeGithub)) : new GhApiHost();
 	const factory = new Factory({
 		configPath,
@@ -59,11 +63,13 @@ export async function startFactoryProcess(opts: ProcessOptions = {}) {
 			githubDelivery(host),
 			localWorktree({ stateDir: join(factoryHome(configPath), "environments") }),
 			cliInterface(opts.socket ? { socket: opts.socket } : {}),
+			webInterface({ tokenFile: join(factoryHome(configPath), "web-token"), ...(opts.webPort !== undefined ? { port: opts.webPort } : {}), log }),
 			...(opts.extraExtensions ?? []),
 		],
 		workerExtensions: DEFAULT_WORKER_EXTENSIONS,
+		workerSettings: DEFAULT_WORKER_SETTINGS,
 		...(opts.ciPollMs ? { ciPollMs: opts.ciPollMs } : {}),
-		log: opts.log ?? ((m) => console.error(`[factory] ${m}`)),
+		log,
 	});
 	await factory.start();
 	await factory.startInterfaces();

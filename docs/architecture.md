@@ -6,7 +6,7 @@ design the code implements, and [`../DEVIATIONS.md`](../DEVIATIONS.md) lists eve
 ## Core vs extensions
 
 ```
-           interfaces (cli)            intake (none in v1)
+        interfaces (cli, web)          intake (none in v1)
                  │  operations ▲ events       │ requests ▲ writeBack
                  ▼             │              ▼          │
         ┌──────────────── FactoryCore (src/core) ────────────────┐
@@ -24,6 +24,10 @@ design the code implements, and [`../DEVIATIONS.md`](../DEVIATIONS.md) lists eve
   findings log, cost records and pinned config.
 - `bridge.ts` holds the tools agents use to hand results to the core: `ask_human`, `submit_spec`, `report_done` and
   `submit_review`. `findings.ts` validates what agents submit through them.
+- `messages.ts` decides who a human message goes to and when (`message`), and builds what the agent sees.
+  `usage.ts` turns Conversation usage into cost records without counting a turn twice.
+- `worker-settings.ts` is the `factory.workers` Document that carries a run's pinned `workers.<name>` settings to
+  worker extensions' tools.
 - `settings.ts` is the layered config store. `core.ts` (`Factory`) wires all of this together and implements
   `FactoryCore`.
 
@@ -33,6 +37,7 @@ optionally a settings schema (see [extensions.md](extensions.md)). The ones v1 i
 | Stage | Extension | File |
 |---|---|---|
 | interface | `cli` | `src/extensions/cli/server.ts` (client: `client.ts`, `src/cli.ts`) |
+| interface | `web` | `src/extensions/web/server.ts` (UI: `src/extensions/web/ui/`) |
 | intake | none | runs start through `startRun` |
 | repo | `github` | `src/extensions/github/repo.ts` |
 | delivery | `github-delivery` | `src/extensions/github/delivery.ts` |
@@ -53,6 +58,7 @@ tools:
 | `subagent` | helpers as owned Conversations |
 | `test-runner` | `run_tests` |
 | `browser` | `http_request`: an HTTP client over curl, not a real browser |
+| `web-search` | `web_search`: Parallel's Search API in `fast` mode, run in the factory process |
 | `role-*` | each role's prompt sections |
 
 Which worker extensions a role gets comes from the settings (`roles.<role>.extensions`).
@@ -134,6 +140,14 @@ Any non-terminal state ──cancel──► CANCELLED;  errors → FAILED;  ret
   - `getRun` returns a `RunView`.
   - `getConversation` returns a read-only transcript, including the builder's helpers.
 - **Answers to the pending ask:** `answer`, `approve`, `reject`, `submitHumanFindings`, `resolveEscalation`.
+- **Messages:** `message(run, text)` sends a message to the agent the run is with: the architect through the spec
+  gate, the current reviewer while reviewing, otherwise the builder. It never moves the run.
+  - The core steers it into the Conversation's inbox. A working agent sees it after its current tool round; an idle
+    one answers in a turn of its own, whose cost is recorded with `trigger: "message"`.
+  - If the role hasn't started, or the core is about to submit its next input, the message is held and delivered
+    right after that input.
+  - At the spec gate the architect may revise the spec (`submit_spec`), which replaces the version waiting for
+    approval. If the builder changes files after the review, delivery first sends the run back through review.
 - **Settings:** `settingsSchema`, `getSettings`, `setSetting`, `unsetSetting`.
 - **Events:** `subscribe(filter, on)`. A filter can select a project or a run. Event types:
   - `run.state`: a state transition.
@@ -141,11 +155,16 @@ Any non-terminal state ──cancel──► CANCELLED;  errors → FAILED;  ret
   - `run.askResolved`: carries `by`, the interface that answered.
   - `run.notice`: progress and the final result.
   - `conversation.updated`: a role transcript changed.
+  - `run.message`: a message was sent, and again once it was handed to a Conversation.
   - `settings.changed`
 
-Interfaces receive a handle from `Factory.as(name)`, so the answers they give are attributed to them. The `cli`
-interface maps these operations onto JSON lines over a Unix socket (mode 0600). The operations it allows are listed in
-`CORE_OPS` in `src/extensions/cli/server.ts`.
+Interfaces receive a handle from `Factory.as(name)`, so the answers and messages they send are attributed to them.
+The operations a transport may call are listed in `CORE_OPS` (`src/core/types.ts`).
+- The `cli` interface maps them onto JSON lines over a Unix socket (mode 0600).
+- The `web` interface maps them onto HTTP on localhost: `POST /api/op/<op>` with `{ args }`, and `subscribe` as
+  server-sent events at `/api/events`. It also serves the UI: a board whose columns are pipeline stages, and a
+  full-screen run view with the run's conversations, a chat box addressed by `message`, and approvals in a card that
+  floats over the transcript. The UI only calls these operations; it has no state of its own beyond a cache.
 
 ## Security boundaries
 
@@ -158,3 +177,9 @@ interface maps these operations onto JSON lines over a Unix socket (mode 0600). 
   - Network access goes through an allowlist.
   - Commands start from an empty environment, so no credential env vars reach them.
 - See DEVIATIONS.md §9 for the Ubuntu ≥ 24.04 Unix-socket relaxation.
+- **The web UI is local and token-protected.** It binds to `127.0.0.1`, rejects foreign `Host` headers (DNS
+  rebinding) and foreign `Origin`s, requires `application/json` on operations, and needs the access token from
+  `~/.factory/web-token` (mode 0600). The link's token becomes an HttpOnly, SameSite=Strict cookie. A strict CSP
+  allows only same-origin scripts.
+- **`web_search` runs outside the sandbox, in the factory process.** Its API key stays there. Query text does
+  leave the machine, so the tool's section tells agents not to put secrets or private code in queries.

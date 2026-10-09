@@ -7,7 +7,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
-import { expandHome } from "../../core/settings.ts";
+import { expandHome, resolveSecret } from "../../core/settings.ts";
 import { baseEnv, git, run } from "../git.ts";
 
 export interface PrInfo {
@@ -52,15 +52,7 @@ export interface GitHubHost {
 }
 
 // ------------------------------------------------------------------ secrets (references only, resolved at use)
-export function resolveSecret(ref: string | undefined): string | undefined {
-	if (!ref) return undefined;
-	if (ref.startsWith("env:")) return process.env[ref.slice(4)];
-	if (ref.startsWith("file:")) {
-		const p = expandHome(ref.slice(5));
-		return existsSync(p) ? readFileSync(p, "utf8").trim() : undefined;
-	}
-	return undefined; // store: references need a secret-store integration (not in v1)
-}
+export { resolveSecret } from "../../core/settings.ts";
 
 // ------------------------------------------------------------------ real GitHub over `gh api`
 export class GhApiHost implements GitHubHost {

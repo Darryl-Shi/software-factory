@@ -5,28 +5,9 @@ import { chmodSync, existsSync, mkdirSync, rmSync } from "node:fs";
 import { createServer, type Socket } from "node:net";
 import { dirname } from "node:path";
 import { expandHome } from "../../core/settings.ts";
-import type { FactoryCore, InterfaceExtension } from "../../core/types.ts";
+import { CORE_OPS, type FactoryCore, type InterfaceExtension } from "../../core/types.ts";
 
-export const CORE_OPS = [
-	"createProject",
-	"getProject",
-	"listProjects",
-	"startRun",
-	"getRun",
-	"listRuns",
-	"getConversation",
-	"cancelRun",
-	"retryRun",
-	"answer",
-	"approve",
-	"reject",
-	"submitHumanFindings",
-	"resolveEscalation",
-	"settingsSchema",
-	"getSettings",
-	"setSetting",
-	"unsetSetting",
-] as const;
+export { CORE_OPS } from "../../core/types.ts";
 
 export const DEFAULT_SOCKET = "~/.factory/factory.sock";
 

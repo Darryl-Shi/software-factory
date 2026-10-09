@@ -10,7 +10,7 @@ Pi Durable terms used below: a **Harness** is one storage backend plus the machi
 
 **Goals**
 - Take a software request to a delivered repo or PR without supervision. The same flow handles a new project (zero to MVP) and an incremental change to an existing repo; there is no mode split. **[decided]**
-- Involve the human only for approvals and for the architecture discussion. Approval gates are set per project; the default gates the spec only. **[decided]**
+- Involve the human only for approvals and for the architecture discussion. Approval gates are set per project; the default gates the spec only. **[decided]** The human may also message the agent a run is with (§3.6); the run never waits for a message, and a message never moves the run.
 - Make every run durable: a crash or restart resumes from the last committed step, using Pi Durable's guarantees.
 - Stay general-purpose. Everything that varies (models, extensions, policy) lives in config, which is data. **[decided]**
 
@@ -18,8 +18,8 @@ Pi Durable terms used below: a **Harness** is one storage backend plus the machi
 - Product or market discovery. The discussion covers architecture only. **[decided]**
 - Implementation plans or splitting the work upfront. The builder decides how to break up the work. **[decided]**
 - Business-specific concepts such as customers, billing or tickets-as-products.
-- Telegram or assistant chat as the factory's interface. Every interface is an extension over the core's operations (§3.6); a bridge to either would be one more such extension. v1 ships one interface, a terminal CLI with attach. **[decided]**
-- Multi-tenant hosting, web UI and parallel runs on one repo (not in v1).
+- Telegram or assistant chat as the factory's interface. Every interface is an extension over the core's operations (§3.6); a bridge to either would be one more such extension. v1 ships two interfaces, a terminal CLI with attach and a local web UI (a ticket board with a full-screen run view); both are extensions. **[decided]**
+- Multi-tenant hosting and parallel runs on one repo (not in v1). The web UI is single-user and local: it listens on localhost behind an access token.
 
 ---
 
@@ -131,6 +131,10 @@ type ToolsExtension    = Extension;  // e.g. CodingTools (read/write/edit/bash),
 type ProvidersExtension = Extension; // e.g. language toolchains, MCP servers, docs lookup, exposed as tools/sections
 ```
 
+**Worker settings:** a worker extension may declare settings (a `SettingField` schema, like `Configurable`). They live under `workers.<name>`, layer and validate like every other setting (§6), and are pinned per run. The core writes the run's pinned values into each role Conversation (and the builder's helpers) as a `factory.workers` Document, and the extension's tools read the values for the Conversation they run in. This is the core's whole contract with worker extensions beyond Pi Durable's own.
+
+**Default worker extensions:** `coding`, `coding-readonly`, `subagent`, `test-runner`, `browser` and `web-search`. `web-search` adds one tool, `web_search({ objective, queries[1..5] })`, backed by Parallel's Search API in `fast` mode (one request; Parallel runs the queries in parallel and returns ranked results with excerpts). Its settings are `workers.web-search.{mode, maxResults, maxCharsTotal, apiKey, endpoint}`, with the key held as a reference (default `env:PARALLEL_API_KEY`). The tool runs in the factory process, like `subagent`, not through `env.exec`: the key never enters the sandbox and the API host needs no `allowedDomains` entry. Query text leaves the machine and is kept in the transcript; a role that must not search drops `web-search` from `roles.<role>.extensions`.
+
 **Bootable environment:** `provision` runs the repo's setup script, if one exists, so every role starts on a working checkout. Environments do not impose tight CPU or RAM limits; tight limits measurably change outcomes.
 
 **Default environment sandbox [decided]:** the default environment extension, `local-worktree`, runs every command it executes inside Anthropic's sandbox runtime (`@anthropic-ai/sandbox-runtime`, the runtime behind Claude Code's sandboxed bash; Apache-2.0, beta research preview, so we pin it like Pi Durable). It is a setting of that extension (`environment.sandbox`), not a core concept; the core and the bridge do not know about it.
@@ -148,6 +152,8 @@ The core installs one small extension, `factory.bridge`, into each role Conversa
 | architect | `ask_human(question)`: one question, blocks until answered · `submit_spec(markdown)` |
 | builder | `report_done(summary, responses[])`: `responses` answers each finding (fixed, or won't fix + reason); the builder does not ask the human anything mid-build |
 | reviewer | `submit_review({ verdict: "pass" \| "fail", findings[] })`; each finding is `{ severity, blocking, specRef, description, evidence, source? }` (`source` defaults to `"reviewer"`); `fail` requires at least one blocking finding, and every reviewer finding must have `evidence`; the tool rejects a submission that breaks either rule |
+
+At the spec gate the architect may also call `submit_spec` while it answers a human message (§3.6): the revised spec replaces the version waiting for approval, and the run asks for approval again. That is the only bridge call a message can lead to.
 
 A human's rejection comment at the delivery or merge gate reaches the builder in the same finding shape, with `source: "human"` and `blocking: true`; `specRef` and `evidence` are optional for these findings. The builder answers it in `report_done` like any other finding.
 
@@ -188,6 +194,8 @@ interface FactoryCore {
   submitHumanFindings(run: RunId, gate: "delivery" | "merge", findings: HumanFinding[]): Promise<void>;  // structured reject: each is blocking, source: human
   resolveEscalation(run: RunId, ask: AskId,
                     choice: { accept: true } | { moreRounds: number } | { abort: true }): Promise<void>;
+  // a message to the agent the run is with; never moves the run (rules below)
+  message(run: RunId, text: string): Promise<{ message: string; to: Role; conversationId?: string }>;
   // settings (§6)
   settingsSchema(): Record<string, SettingField>;          // the core's schemas + every installed extension's
   getSettings(scope: Scope): Promise<EffectiveSettings>;  // each value with its source: default | global | project
@@ -204,11 +212,17 @@ type FactoryEvent =
   | { type: "run.askResolved"; run: RunId; ask: AskId; by: string }          // by = the interface that answered
   | { type: "run.notice"; run: RunId; notice: Notice }                       // progress and final result (url, advisory findings)
   | { type: "conversation.updated"; run: RunId; conversationId: string; role: Role }
+  | { type: "run.message"; run: RunId; message: { id: string; to: Role; conversationId?: string } }  // sent, then handed to a Conversation
   | { type: "settings.changed"; scope: Scope; path: string };
 ```
 - **Pending asks are core state.** The core persists each Question in the run Document and publishes it as `run.ask`; it survives restarts and `getRun` returns it, so an interface that connects later still sees it. Any interface may answer; the first valid answer resolves the ask, and later answers are rejected.
+- **Messages reach the agent the run is with.** The architect from `RECEIVED` through the spec gate, the current reviewer while `REVIEWING`, the builder otherwise (including the delivery and merge gates and escalations). A message is refused (`conflict`) on a terminal run, while a discussion question is pending (that takes `answer`), or when the role is not in `policy.messages`. `RunView.messages` records each message with its sender (`by`) and, once handed over, its Conversation.
+  - *Delivery:* the message goes into the Conversation's inbox as a steer (Pi Durable's `whenBusy: "steer"`): a working agent sees it after its current tool round and carries on; an idle agent answers it in a turn of its own. A role that hasn't started yet, or that the core is about to drive, gets the message right after the core's own input instead. The agent sees a header naming the sender and a note on where the run is (e.g. "you are building; you still finish with report_done").
+  - *It never moves the run:* only bridge calls the core is waiting on and the human's answers move it. The one case where a message can change an artifact is the spec gate: the architect may revise the spec with `submit_spec` (§3.4), which closes the pending ask (`run.askResolved` with `by: "architect"`) and asks for approval of the new version.
+  - *No unreviewed delivery:* if the builder changes files after the review (for example after a message at the delivery gate), the core sees a different diff when it starts delivering and sends the run back through review (and the delivery gate, if set) first.
+  - *Cost:* turns a message starts while the agent is idle are recorded as cost records with `trigger: "message"`, in the role's current round.
 - **Intake uses the same entry point.** For each Request an intake extension delivers, the core calls `startRun` itself. Results reach intakes through `writeBack` and interfaces through events.
-- **Transport belongs to the extension.** One process owns the storage and the core. An interface that runs elsewhere (a terminal client, a web server, a chat bridge) brings its own transport to that process; the core defines none.
+- **Transport belongs to the extension.** One process owns the storage and the core. An interface that runs elsewhere (a terminal client, a web server, a chat bridge) brings its own transport to that process; the core defines none. The `cli` extension uses a Unix socket; the `web` extension serves HTTP on localhost (`POST /api/op/<op>` for operations, server-sent events for `subscribe`) behind an access token.
 
 *Example interface, not part of the core:* a CLI extension might map `createProject` to `factory project create`, `startRun` to `factory run`, `getRun`/`subscribe`/`getConversation` and the answer operations to `factory attach <run>`, `cancelRun`/`retryRun` to `factory cancel`/`factory retry`, and the settings operations to `factory settings`.
 
@@ -224,11 +238,11 @@ The core is a Pi Durable **Task** that checkpoints at every transition, plus a `
 | `PREPARING` | `repo.open` on the project's repo binding (clone, or a local workspace if the repo doesn't exist yet), `environment.provision` (runs the repo's setup script), `intake.writeBack(started)` | ok → `DISCUSSING` · error → `FAILED` |
 | `DISCUSSING` | open architect Conversation (role model) with request + repo context | `ask_human` → pending ask (discussion), `answer` resubmitted (stay) · `submit_spec` → `SPEC_READY` |
 | `SPEC_READY` | store spec artifact (and commit it to the workspace as `docs/spec.md`) | gate `spec` on → `AWAITING_APPROVAL(spec)` · off → `BUILDING` |
-| `AWAITING_APPROVAL(g)` | pending ask (approval g) | `approve` → next stage (spec → `BUILDING`, delivery → `DELIVERING`, merge → `repo.merge` → `DELIVERED`) · `reject(feedback)` → `DISCUSSING` (spec) / `BUILDING` with the comment as a blocking finding, `source: human` (delivery, merge; adds no review or CI round; `submitHumanFindings` is the same with structured findings) |
+| `AWAITING_APPROVAL(g)` | pending ask (approval g) | `approve` → next stage (spec → `BUILDING`, delivery → `DELIVERING`, merge → `repo.merge` → `DELIVERED`) · `reject(feedback)` → `DISCUSSING` (spec) / `BUILDING` with the comment as a blocking finding, `source: human` (delivery, merge; adds no review or CI round; `submitHumanFindings` is the same with structured findings) · spec only: the architect revises the spec with `submit_spec` after a human message (§3.6) → `SPEC_READY` with the new version, which closes this ask |
 | `BUILDING` | round 1: open builder Conversation with spec · round n>1: **submit findings (review findings, CI failure, or a human rejection comment) to the same Conversation** | `report_done` → `REVIEWING` · round n>1 with empty diff since the previous round → `ESCALATED` |
 | `REVIEWING` | open fresh reviewer Conversation with spec + workspace + `repo.diff(base)`; from round 2, also its prior findings + the builder's responses, and any human findings from a gate rejection | pass (no blocking findings; advisory ones stored for delivery) → gate `delivery` ? `AWAITING_APPROVAL(delivery)` : `DELIVERING` · fail & round < `reviewRoundCap` → `round++`, `BUILDING` · fail & round = `reviewRoundCap` → `ESCALATED` · a review that follows a CI fix counts toward `ci.fixRounds`, not `reviewRoundCap`: fail & CI fixes < `ci.fixRounds` → `BUILDING` · fail & CI fixes = `ci.fixRounds` → `ESCALATED` |
 | `ESCALATED` | pending ask (escalation), resolved by `resolveEscalation` | accept → `DELIVERING`, except when escalated from `AWAITING_CI`: then gate `merge` on for a PR delivery ? `AWAITING_APPROVAL(merge)` : `DELIVERED` · more rounds(N) → the cap that was hit `+=N`, `BUILDING` · abort → `CANCELLED` |
-| `DELIVERING` | if `ws.newRepo`: `repo.create` then `delivery.deliver` as `push-main`; else `delivery.deliver` as a PR (advisory findings go into the PR description / delivery note) | ok & `ci.mode` ≠ `off` → `AWAITING_CI` · ok & `ci.mode` = `off` → gate `merge` on for a PR delivery ? `AWAITING_APPROVAL(merge)` : `DELIVERED` · error → `FAILED` |
+| `DELIVERING` | first, if the workspace diff differs from the one the last review saw (the builder acted on a message after the review): → `REVIEWING` with a fresh reviewer, adding no round · otherwise, if `ws.newRepo`: `repo.create` then `delivery.deliver` as `push-main`; else `delivery.deliver` as a PR (advisory findings go into the PR description / delivery note) | ok & `ci.mode` ≠ `off` → `AWAITING_CI` · ok & `ci.mode` = `off` → gate `merge` on for a PR delivery ? `AWAITING_APPROVAL(merge)` : `DELIVERED` · error → `FAILED` |
 | `AWAITING_CI` | wait for CI on the delivered commit SHA: the PR head, or for `push-main` the pushed commit on the default branch (`delivery.checks`, limited to `ci.checks` if set) | no checks within `ci.noChecksTimeout` & `if-present` → same as CI green, noting no CI · no checks within `ci.noChecksTimeout` & `required` → `ESCALATED` (reason: no CI checks) · CI green → gate `merge` on for the project and a PR delivery ? `AWAITING_APPROVAL(merge)` : `DELIVERED` · CI red & fixes < `ci.fixRounds` → `BUILDING` with CI failure (the review after the fix counts toward `ci.fixRounds`, not `reviewRoundCap`) · CI red at cap → `ESCALATED` · error → `FAILED` |
 | `DELIVERED` | `intake.writeBack(done, url)`, `run.notice` event, `environment.dispose`; without an approved merge the PR stays open (no auto-merge) | terminal |
 | `FAILED` / `CANCELLED` | `writeBack`, `run.notice` event, dispose (workspace kept for inspection) | terminal; `retryRun(run)` → state at failure |
@@ -256,7 +270,7 @@ roles:                                   # role → model (+ worker extensions)
   reviewer:  { model: openai/gpt-6-sol,    thinking: high,     extensions: [coding-readonly, test-runner, browser] }
 stages:                                  # stage → factory extension (+ its settings)
   intake:    { use: none }                                 # external request sources (GitHub issues, webhooks); none in v1, runs start via startRun (§3.6)
-  interface: { use: [cli] }                                # one or more interface extensions (§3.6); cli is the v1 example
+  interface: { use: [cli, web] }                           # one or more interface extensions (§3.6); default: all installed
   repo:      { use: github, identity: { kind: app, appId: 123, installationId: 456 }, visibility: private }
   delivery:
     use: github-delivery
@@ -309,11 +323,12 @@ Every value is shown with its effective value and where it comes from: `default`
 **Layering:** every setting resolves in the same layers: schema default → global (top level of the config file) → project (`projects.<name>`). Any setting can be overridden per project with the same path: policy (including approval gates), role models, thinking and extensions, the sandbox, and every stage extension's settings, including CI. A project value overrides the global one, and a value the project leaves unset inherits it. Objects merge key by key; scalars and lists replace as a whole (a project's `approvals` replaces the global list). `storage` is global only, because one process owns it.
 
 **What can be configured**
-- **Policy** (core): approval gates (default `[spec]`), `reviewRoundCap` (default 3), `escalateOnNoProgress` (default on).
+- **Policy** (core): approval gates (default `[spec]`), `reviewRoundCap` (default 3), `escalateOnNoProgress` (default on), `messages` (the roles a human can message while a run is going, §3.6; default architect, builder and reviewer; drop the reviewer for a review no human can sway).
 - **CI** (owned by the delivery extension, `stages.delivery.ci`): `mode` (`off` / `if-present` / `required`, default `if-present`; see §2), `fixRounds` (default 2, allowed range 0–3, enforced by validate-on-save), `checks` (optional list of check names that count; default all) and `noChecksTimeout` (default 2 minutes; if no checks appear by then, the repo is treated as having no CI).
-- **Roles** (core): for each of architect, builder, helper and reviewer: `model` (from the providers `createModels()` knows), `thinking` (`off` / `low` / `medium` / `high`) and `extensions` (from the installed worker extensions).
+- **Roles** (core): for each of architect, builder, helper and reviewer: `model` (from the providers `createModels()` knows), `thinking` (`off` / `low` / `medium` / `high`) and `extensions` (from the installed worker extensions; every role gets `web-search` by default).
+- **Workers** (owned by each worker extension, `workers.<name>`, §3.3): e.g. `workers.web-search.mode` (`turbo` / `fast` / `basic` / `advanced`, default `fast`) and its API key reference.
 - **Sandbox** (owned by the default environment extension, `stages.environment.sandbox`): `allowedDomains`, `deniedDomains`, `extraWrite`, `denyRead`. Write access is fixed by role (§3.3) and is not a setting: the architect and reviewer never get write access to the worktree, and the builder stays the single writer.
-- **Stage extensions** (intake, interface, repo, delivery, environment): which extension each stage uses, plus that extension's own settings, e.g. the GitHub identity under `stages.repo`. Secrets are stored as references (env var name or secret-store key), never as values.
+- **Stage extensions** (intake, interface, repo, delivery, environment): which extension each stage uses, plus that extension's own settings, e.g. the GitHub identity under `stages.repo`. `stages.interface.use` defaults to every installed interface, so the CLI and the web UI run side by side; the web UI's address is `stages.interface.host` (default `127.0.0.1`) and `port` (default 7317). Secrets are stored as references (env var name or secret-store key), never as values.
 
 **Architecture**
 ```ts
@@ -333,7 +348,7 @@ interface Configurable {                        // implemented by any factory ex
 - **Validate on save:** a change is checked against the schema, the extension's `validate`, and the core's rules (for example, the §3.3 write limits), applied to the resulting effective config of each affected project. An invalid change is rejected and the file is left unchanged.
 - A change applies to **new runs only**. A running run stays pinned to the effective config it started with (§4).
 
-**Not configurable:** cost caps (rejected earlier; cost is recorded, not capped), per-role write access (fixed by role, §3.3), and any setting that lets the builder escalate or ask the human mid-build.
+**Not configurable:** cost caps (rejected earlier; cost is recorded, not capped), per-role write access (fixed by role, §3.3), and any setting that lets the builder escalate or ask the human mid-build. (Messages go from the human to the agent only; the builder still cannot ask the human anything.)
 
 ---
 
@@ -341,17 +356,18 @@ interface Configurable {                        // implemented by any factory ex
 
 **In**
 - Core state machine on Pi Durable with SQLite storage; resume after a crash.
-- Core operations and events (§3.6): projects (`createProject`, §3.5), runs (`startRun`, `getRun`, `listRuns`, `cancelRun`, `retryRun`), answers at asks and gates (`answer`, `approve`, `reject`, `submitHumanFindings`, `resolveEscalation`), settings, and `subscribe`.
+- Core operations and events (§3.6): projects (`createProject`, §3.5), runs (`startRun`, `getRun`, `listRuns`, `cancelRun`, `retryRun`), answers at asks and gates (`answer`, `approve`, `reject`, `submitHumanFindings`, `resolveEscalation`), messages to the running agent (`message`), settings, and `subscribe`.
 - Intake: none. Runs start through `startRun` from an interface.
-- Interface `cli` (one example interface extension; the only one in v1): terminal commands over the core operations, e.g. `factory project create <name> --repo owner/name`, `factory run <name> "<request>"` (with a shorthand that also creates the project) and `factory attach <run>`. Attach renders `getRun` (the run Document's `viewState()`) and the active role Conversation through `getConversation` (including the builder's helpers, found through tool `details`), follows events, and answers pending asks and approvals. One process owns the storage; the CLI client connects to that process.
+- Interface `web` (installed and on by default): a local web UI. A ticket board whose columns are the pipeline stages, where each run moves on its own as the core transitions it, and a full-screen run view for any run at any time: the run's conversations (architect, builder with its helpers, reviewers, a timeline), the transcript with every tool call shown the same plain way, a chat box addressed to the agent the run is with (`message`), and approvals and escalations in a card that floats over the conversation. Ticket details, findings by round, cost by role and settings forms generated from `settingsSchema()` complete it. Static files, no build step.
+- Interface `cli` (one example interface extension): terminal commands over the core operations, e.g. `factory project create <name> --repo owner/name`, `factory run <name> "<request>"` (with a shorthand that also creates the project) and `factory attach <run>`. Attach renders `getRun` (the run Document's `viewState()`) and the active role Conversation through `getConversation` (including the builder's helpers, found through tool `details`), follows events, and answers pending asks and approvals. One process owns the storage; the CLI client connects to that process.
 - Repo `github`: `open` (clone, or a local workspace before the repo exists), `create` (private repo, at the first delivery), `diff`, `merge`. The identity is configurable (PAT, bot or App).
 - Delivery `github-delivery`: push to `main` for a new repo, open a PR from a branch for an existing repo.
-- Environment `local-worktree` (one git worktree per run, commands wrapped in the sandbox runtime). Tools: `CodingTools` and Pi's subagent pattern.
+- Environment `local-worktree` (one git worktree per run, commands wrapped in the sandbox runtime). Tools: `CodingTools`, Pi's subagent pattern and `web-search` (§3.3).
 - Policy: approval gates, round cap. CI setting: `off` / `if-present` / `required`, fix rounds, checks that count, no-checks timeout.
 - Settings: the settings operations (layered global + project overrides), with views generated from the core's and extensions' schemas; the `cli` extension exposes them as `factory settings` (interactive menu, `get`/`set`/`unset`, `--project`).
 
 **Out (later)**
-- Other intakes (GitHub issues, webhooks) and other interfaces (web, chat bridges).
+- Other intakes (GitHub issues, webhooks) and other interfaces (chat bridges, a hosted multi-user web UI).
 - Container or microVM environments.
 - Concurrent runs on the same repo.
 - Learning from past runs.

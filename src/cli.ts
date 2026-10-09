@@ -25,6 +25,7 @@ const HELP = `factory — software factory on Pi Durable
 
   factory serve [--config ~/.factory/config.yaml] [--socket path] [--fake-github dir] [--scripted]
   factory doctor [--config path]
+  factory web [--config path]                    print the web UI link (with its access token)
 
   factory project create <name> --repo owner/name
   factory project list
@@ -34,6 +35,7 @@ const HELP = `factory — software factory on Pi Durable
   factory attach <run> [--no-input]
   factory transcript <run> [architect|builder|reviewer|<conversationId>]
   factory answer <run> "<text>"                 answer the pending discussion question
+  factory message <run> "<text>"                message the agent the run is with (architect, builder or reviewer)
   factory approve <run> <spec|delivery|merge>
   factory reject <run> <gate> "<feedback>"
   factory findings <run> <delivery|merge> '<json list of {severity, description, specRef?, evidence?}>'
@@ -68,6 +70,15 @@ async function main() {
 		return;
 	}
 	if (cmd === "doctor") return doctor();
+	if (cmd === "web") {
+		const { existsSync, readFileSync: read } = await import("node:fs");
+		const { dirname, join } = await import("node:path");
+		const { expandHome } = await import("./core/settings.ts");
+		const { DEFAULT_CONFIG } = await import("./main.ts");
+		const file = join(dirname(expandHome(typeof flags.config === "string" ? flags.config : (process.env.FACTORY_CONFIG ?? DEFAULT_CONFIG))), "web-url");
+		if (!existsSync(file)) throw new Error("the web UI isn't running: start `factory serve` (stages.interface.use must include web)");
+		return print(read(file, "utf8").trim());
+	}
 
 	const client = await Client.connect(typeof flags.socket === "string" ? flags.socket : undefined);
 	try {
@@ -129,6 +140,10 @@ async function main() {
 				if (v.pendingAsk?.question.kind !== "discussion") throw new Error("no discussion question is pending");
 				await client.call("answer", v.id, v.pendingAsk.id, need(pos.slice(2).join(" "), "text"));
 				return print("answered");
+			}
+			case "message": {
+				const r = await client.call<{ message: string; to: string; conversationId?: string }>("message", need(pos[1], "run"), need(pos.slice(2).join(" "), "text"));
+				return print(json ? r : r.conversationId ? `sent to the ${r.to}` : `queued for the ${r.to}; delivered when it starts its next turn`);
 			}
 			case "approve":
 				await client.call("approve", need(pos[1], "run"), need(pos[2], "gate"));
@@ -198,12 +213,12 @@ async function doctor() {
 	const { GhApiHost, resolveSecret } = await import("./extensions/github/host.ts");
 	const { localWorktree } = await import("./extensions/local-worktree/index.ts");
 	const { cliInterface } = await import("./extensions/cli/server.ts");
-	const { DEFAULT_WORKER_EXTENSIONS } = await import("./extensions/workers/index.ts");
+	const { DEFAULT_WORKER_EXTENSIONS, DEFAULT_WORKER_SETTINGS } = await import("./extensions/workers/index.ts");
 	const { existsSync } = await import("node:fs");
 	const configPath = expandHome(typeof flags.config === "string" ? flags.config : (process.env.FACTORY_CONFIG ?? DEFAULT_CONFIG));
 	const models = await createModels(!!flags.scripted);
 	const host = new GhApiHost();
-	const f = new Factory({ configPath, models, extensions: [githubRepo(host), githubDelivery(host), localWorktree(), cliInterface()], workerExtensions: DEFAULT_WORKER_EXTENSIONS });
+	const f = new Factory({ configPath, models, extensions: [githubRepo(host), githubDelivery(host), localWorktree(), cliInterface()], workerExtensions: DEFAULT_WORKER_EXTENSIONS, workerSettings: DEFAULT_WORKER_SETTINGS });
 	const eff = existsSync(configPath) ? f.config.effective({ global: true }) : f.config.effective({ global: true }, { version: 1 });
 	const line = (ok: boolean | "warn", s: string) => console.log(`${ok === true ? "ok  " : ok === "warn" ? "warn" : "FAIL"}  ${s}`);
 	line(true, `config ${configPath}${existsSync(configPath) ? "" : " (missing: defaults)"}`);

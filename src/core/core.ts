@@ -16,13 +16,18 @@ import {
 	Harness,
 	MemoryStorage,
 	type Registry,
+	type Submission,
+	UsageDoc,
 } from "@earendil-works/pi-durable";
 import { createEditTool, createWriteTool } from "@earendil-works/pi-durable/tools";
 import { Bridge, BridgeDoc, bridgeToolsNotFor, EnvDoc } from "./bridge.ts";
 import { humanFindings } from "./findings.ts";
+import { DEFAULT_MESSAGE_ROLES, holdMessage, messageContent, messageTarget, parseMessage } from "./messages.ts";
 import { RunDoc, type RunDocState, RunIndex, toView } from "./run-doc.ts";
 import { createRunTask } from "./run-task.ts";
 import { ConfigStore, coreSchema, expandHome, hashConfig, isObj, type Obj } from "./settings.ts";
+import { addCost, sumUsage, type UsageSum } from "./usage.ts";
+import { WorkerSettingsDoc } from "./worker-settings.ts";
 import {
 	type AskId,
 	type AskResponse,
@@ -35,6 +40,7 @@ import {
 	type FactoryExtension,
 	type Gate,
 	type HumanFinding,
+	type HumanMessage,
 	type IntakeExtension,
 	type InterfaceExtension,
 	type Project,
@@ -64,6 +70,8 @@ export interface CoreOptions {
 	extensions: FactoryExtension[];
 	/** Worker extensions (Pi Durable extensions) agents may select by name. */
 	workerExtensions: Extension[];
+	/** Settings schemas of worker extensions, by extension name: they appear under `workers.<name>` and are pinned per run. */
+	workerSettings?: Record<string, { schema: Record<string, SettingField>; description?: string; validate?(value: unknown): string[] }>;
 	/** Storage override (tests): "memory", or a sqlite path. Default: the config's `storage`. */
 	storage?: "memory" | { sqlite: string } | { jsonl: string };
 	now?: () => number;
@@ -150,6 +158,9 @@ export class Factory implements FactoryCore {
 					e.runId = parent.runId;
 					e.role = "helper";
 					if (helperEnv) e.envId = helperEnv.envId;
+					const w = await tx.doc(WorkerSettingsDoc, rec.id);
+					w.runId = parent.runId;
+					w.settings = JSON.parse(JSON.stringify(run.pinned.config.workers ?? {}));
 				},
 				onReport: (e) => this.log(`harness report: ${e instanceof Error ? e.stack : String(e)}`),
 			},
@@ -287,11 +298,19 @@ export class Factory implements FactoryCore {
 		const hist = v.history.slice(prev?.history.length ?? 0);
 		for (const h of hist) this.emit({ type: "run.state", run: v.id, project: v.project, from: h.from, to: h.to, round: h.round }, v);
 		const prevAsk = prev?.pendingAsk;
-		if (prevAsk && !prevAsk.response && (v.pendingAsk?.id !== prevAsk.id || v.pendingAsk.response))
-			this.emit({ type: "run.askResolved", run: v.id, ask: prevAsk.id, by: v.pendingAsk?.id === prevAsk.id ? v.pendingAsk.response!.by : "core" }, v);
+		if (prevAsk && !prevAsk.response && (v.pendingAsk?.id !== prevAsk.id || v.pendingAsk.response)) {
+			const by = v.pendingAsk?.id === prevAsk.id ? v.pendingAsk.response!.by : v.closedAsk?.id === prevAsk.id ? v.closedAsk.by : "core";
+			this.emit({ type: "run.askResolved", run: v.id, ask: prevAsk.id, by }, v);
+		}
 		if (v.pendingAsk && !v.pendingAsk.response && v.pendingAsk.id !== prevAsk?.id)
 			this.emit({ type: "run.ask", run: v.id, ask: v.pendingAsk.id, question: v.pendingAsk.question }, v);
 		for (const n of v.notices.slice(prev?.notices.length ?? 0)) this.emit({ type: "run.notice", run: v.id, notice: n }, v);
+		const before = new Map((prev?.messages ?? []).map((m) => [m.id, m]));
+		for (const m of v.messages ?? []) {
+			const was = before.get(m.id);
+			if (!was || (was.conversationId === undefined && m.conversationId !== undefined))
+				this.emit({ type: "run.message", run: v.id, message: { id: m.id, to: m.to, ...(m.conversationId !== undefined ? { conversationId: m.conversationId } : {}) } }, v);
+		}
 	}
 
 	private touchConversation(id: string) {
@@ -443,7 +462,14 @@ export class Factory implements FactoryCore {
 		for (const e of entries) {
 			const m = e.model?.[0] as any;
 			if (!m) continue;
-			if (m.role === "user") items.push({ entryId: e.id, kind: e.kind, role: "user", text: typeof m.content === "string" ? m.content : m.content.map((p: any) => p.text ?? "").join("") });
+			if (m.role === "user") {
+				const human = parseMessage(m.content);
+				items.push(
+					human
+						? { entryId: e.id, kind: e.kind, role: "user", author: "human", by: human.by, msgId: human.msgId, text: human.text }
+						: { entryId: e.id, kind: e.kind, role: "user", author: "factory", text: typeof m.content === "string" ? m.content : m.content.map((p: any) => p.text ?? "").join("") },
+				);
+			}
 			else if (m.role === "assistant") {
 				items.push({
 					entryId: e.id,
@@ -466,14 +492,19 @@ export class Factory implements FactoryCore {
 		// running tools' details (helpers spawned by an in-flight call)
 		const view = await conv.viewState(this.ctx);
 		const live = (view.value as any)?.docs?.["pi.live"];
+		const inbox = ((view.value as any)?.docs?.["pi.inbox"]?.items ?? []) as { mode: string; content?: unknown }[];
 		view.dispose?.();
+		const queued = inbox.flatMap((it) => {
+			const human = it.mode !== "write" ? parseMessage(it.content) : undefined;
+			return human ? [{ msgId: human.msgId, by: human.by, text: human.text }] : [];
+		});
 		for (const slot of Object.values((live?.tools ?? {}) as Record<string, any>)) {
 			const child = slot?.details?.conversationId;
 			if (typeof child === "string") helpers.add(child);
 		}
 		const busy = !!live && (live.generation !== undefined || Object.keys(live.tools ?? {}).length > 0);
 		const role = this.convIndex.get(conversationId)?.role;
-		return { conversationId, ...(role ? { role } : {}), items, helpers: [...helpers], busy };
+		return { conversationId, ...(role ? { role } : {}), items, helpers: [...helpers], busy, queued };
 	}
 
 	async cancelRun(run: RunId, reason?: string): Promise<void> {
@@ -503,6 +534,7 @@ export class Factory implements FactoryCore {
 			if (f.pendingAsk) doc.pendingAsk = f.pendingAsk;
 			delete doc.failure;
 			delete doc.cancelReason;
+			delete doc.driving;
 			doc.counters.attempt = (doc.counters.attempt ?? 0) + 1;
 			doc.notices.push({ at: this.now(), level: "info", text: `Retried by ${by}; resuming at ${to}` });
 			const taskId = await tx.createTask(this.runTask, { runId: run, start: to }, { ownership: { kind: "conversation" }, background: true });
@@ -571,6 +603,67 @@ export class Factory implements FactoryCore {
 		});
 	}
 
+	// ------------------------------------------------------------------ messages to the agent the run is with
+	async message(run: RunId, text: string): Promise<{ message: string; to: Role; conversationId?: string }> {
+		const by = this.by;
+		if (typeof text !== "string" || !text.trim()) throw new FactoryError("invalid", "a message needs text");
+		await this.doc(run); // not_found
+		let msg!: HumanMessage;
+		await this.root.commit(async (tx) => {
+			const d = (await tx.doc(RunDoc, run, null as never)) as unknown as RunDocState;
+			if (!d?.id) throw new FactoryError("not_found", `run ${run} does not exist`);
+			if (TERMINAL_STATES.includes(d.state)) throw new FactoryError("conflict", `run ${run} is ${d.state}; start a new run for follow-up work`);
+			if (d.pendingAsk && !d.pendingAsk.response && d.pendingAsk.question.kind === "discussion")
+				throw new FactoryError("conflict", "the architect is waiting for an answer to its question; send it with answer");
+			const target = messageTarget(d);
+			const allowed = (d.pinned.config.policy?.messages ?? DEFAULT_MESSAGE_ROLES) as Role[];
+			if (!allowed.includes(target.role)) throw new FactoryError("conflict", `messages to the ${target.role} are turned off for this run (policy.messages)`);
+			d.counters.msgSeq = (d.counters.msgSeq ?? 0) + 1;
+			msg = { id: `${d.id}-msg${d.counters.msgSeq}`, text: text.trim(), by, to: target.role, at: this.now() };
+			// (assign, then push through the document: a push onto the assigned array itself would not be recorded)
+			if (!d.messages) d.messages = [];
+			d.messages.push(msg);
+			d.updatedAt = this.now();
+		}, this.ctx);
+		// Re-read after the commit: if the core started the role's turn meanwhile, deliver now (request ids make a
+		// second delivery by the run task a no-op).
+		const d = await this.doc(run);
+		const target = messageTarget(d);
+		if (target.role === msg.to && target.conversationId !== undefined && !holdMessage(d, target)) await this.deliver(d, msg, target.conversationId);
+		const now = (await this.doc(run)).messages?.find((m) => m.id === msg.id);
+		return { message: msg.id, to: msg.to, ...(now?.conversationId !== undefined ? { conversationId: String(now.conversationId) } : {}) };
+	}
+
+	private async deliver(d: RunDocState, msg: HumanMessage, conversationId: string) {
+		const id = (/^\d+$/.test(String(conversationId)) ? Number(conversationId) : conversationId) as never;
+		const conv = await this.harness.conversation(id, this.ctx);
+		if (!conv) return;
+		const view = await conv.viewState(this.ctx);
+		const live = (view.value as any)?.docs?.["pi.live"];
+		view.dispose?.();
+		const idle = !live || (live.generation === undefined && Object.keys(live.tools ?? {}).length === 0 && !live.run);
+		const before = sumUsage((await this.harness.snapshot(UsageDoc, id, this.ctx)) as any);
+		const started = this.now();
+		const sub = await conv.submit({ type: "input", content: messageContent(d, msg), requestId: msg.id, whenBusy: "steer" }, this.ctx);
+		await this.root.commit(async (tx) => {
+			const doc = (await tx.doc(RunDoc, d.id, null as never)) as unknown as RunDocState;
+			const m = doc.messages?.find((x) => x.id === msg.id);
+			if (m && m.conversationId === undefined) m.conversationId = String(conversationId);
+		}, this.ctx);
+		// An idle agent answers in a turn of its own; the core records that turn's usage when it ends.
+		if (idle) void this.recordMessageTurn(d.id, msg.to, conversationId, sub, before, started).catch((e) => this.log(`message turn usage: ${e}`));
+	}
+
+	private async recordMessageTurn(run: RunId, role: Role, conversationId: string, sub: Submission, before: UsageSum, started: number) {
+		await sub.wait(this.ctx);
+		const id = (/^\d+$/.test(String(conversationId)) ? Number(conversationId) : conversationId) as never;
+		const after = sumUsage((await this.harness.snapshot(UsageDoc, id, this.ctx)) as any);
+		await this.root.commit(async (tx) => {
+			const doc = (await tx.doc(RunDoc, run, null as never)) as unknown as RunDocState;
+			if (doc?.id) addCost(doc, role, conversationId, before, after, this.now() - started, { trigger: "message" });
+		}, this.ctx);
+	}
+
 	// ------------------------------------------------------------------ settings
 	settingsSchema(): Record<string, SettingField> {
 		const schema = coreSchema();
@@ -591,7 +684,7 @@ export class Factory implements FactoryCore {
 				type: "object",
 				description: "How humans reach the factory",
 				fields: {
-					use: { type: "list", of: { type: "enum", values: names("interface"), description: "interface" }, default: names("interface").slice(0, 1), description: "Interface extensions" },
+					use: { type: "list", of: { type: "enum", values: names("interface"), description: "interface" }, default: names("interface"), description: "Interface extensions" },
 					...fieldsOf(stage("interface")),
 				},
 			},
@@ -603,7 +696,20 @@ export class Factory implements FactoryCore {
 				fields: { use: { type: "enum", values: names(kind), default: names(kind)[0] ?? "", description: `${kind} extension` }, ...fieldsOf(stage(kind)) } as Record<string, SettingField>,
 			};
 		}
-		return { ...schema, stages: { type: "object", description: "Stage → factory extension + its settings", fields: stages } };
+		const workers = Object.entries(this.opts.workerSettings ?? {}).filter(([name]) => this.opts.workerExtensions.some((e) => e.name === name));
+		return {
+			...schema,
+			stages: { type: "object", description: "Stage → factory extension + its settings", fields: stages },
+			...(workers.length
+				? {
+						workers: {
+							type: "object",
+							description: "Worker extension settings (pinned per run)",
+							fields: Object.fromEntries(workers.map(([name, w]) => [name, { type: "object", description: w.description ?? `${name} worker extension`, fields: w.schema } as SettingField])),
+						},
+					}
+				: {}),
+		};
 	}
 
 	private coreRules(eff: Obj, _scope: Scope): string[] {
@@ -628,6 +734,8 @@ export class Factory implements FactoryCore {
 				else if (ext.settings?.validate) problems.push(...ext.settings.validate(st).map((p) => `stages.${kind}: ${p}`));
 			}
 		}
+		for (const [name, w] of Object.entries(this.opts.workerSettings ?? {}))
+			if (w.validate && isObj(eff.workers?.[name])) problems.push(...w.validate(eff.workers[name]).map((p) => `workers.${name}: ${p}`));
 		const approvals = eff.policy?.approvals ?? [];
 		if (new Set(approvals).size !== approvals.length) problems.push("policy.approvals: duplicate gate");
 		return problems;

@@ -100,6 +100,7 @@ function renderQuestion(v: RunView): string {
 }
 
 export function renderItem(i: TranscriptItem, indent = ""): string {
+	if (i.role === "user" && i.author === "human") return `${indent}${C.yellow(`✉ you (${i.by}):`)} ${clip(i.text ?? "", 400).replace(/\n/g, `\n${indent}  `)}`;
 	if (i.role === "user") return `${indent}${C.dim("▶ input:")} ${clip(i.text ?? "", 400).replace(/\n/g, `\n${indent}  `)}`;
 	if (i.role === "assistant") {
 		const parts: string[] = [];

@@ -4,8 +4,9 @@
 //
 //   npm run dry-run                  # fresh dir under /tmp
 //   DRYRUN_DIR=/tmp/x npm run dry-run
+//   DRYRUN_SANDBOX=0 npm run dry-run   # where the sandbox runtime can't run (e.g. no socat on Linux)
 import { type ChildProcess, execFile, spawn } from "node:child_process";
-import { createWriteStream, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -17,10 +18,12 @@ const ROOT = resolve(import.meta.dirname, "..");
 const DIR = process.env.DRYRUN_DIR ?? mkdtempSync(join(tmpdir(), "sf-dryrun-"));
 mkdirSync(DIR, { recursive: true });
 const CONFIG = join(DIR, "config.yaml");
-const SOCKET = join(DIR, "factory.sock");
+// Unix socket paths are limited to ~107 bytes: in a deep directory, use a relative path (commands run in DIR).
+const SOCKET = join(DIR, "factory.sock").length > 100 ? "factory.sock" : join(DIR, "factory.sock");
 const GH = join(DIR, "github");
 const BIN = join(ROOT, "bin/factory");
 const ME = "me";
+const SANDBOX = process.env.DRYRUN_SANDBOX !== "0";
 
 writeFileSync(
 	CONFIG,
@@ -36,12 +39,13 @@ roles:
 stages:
   interface:
     socket: ${SOCKET}
+    port: 0
   repo:
     workdir: ${join(DIR, "work")}
   environment:
     root: ${join(DIR, "work")}
     sandbox:
-      enabled: true
+      enabled: ${SANDBOX}
   delivery:
     ci:
       noChecksTimeout: 4s
@@ -68,6 +72,7 @@ function section(s: string) {
 let server: ChildProcess | undefined;
 async function serve() {
 	server = spawn(BIN, ["serve", "--config", CONFIG, "--fake-github", GH, "--scripted", "--ci-poll-ms", "200"], {
+		cwd: DIR,
 		env: { ...process.env, DRYRUN_TURN_DELAY_MS: process.env.DRYRUN_TURN_DELAY_MS ?? "250" },
 		stdio: ["ignore", "ignore", "pipe"],
 	});
@@ -90,7 +95,7 @@ async function kill9() {
 }
 
 async function factory(...args: string[]): Promise<string> {
-	const { stdout } = await pexec(BIN, args, { env: { ...process.env, FACTORY_SOCKET: SOCKET, NO_COLOR: "1" }, maxBuffer: 64 << 20 });
+	const { stdout } = await pexec(BIN, args, { cwd: DIR, env: { ...process.env, FACTORY_SOCKET: SOCKET, NO_COLOR: "1" }, maxBuffer: 64 << 20 });
 	return stdout.trim();
 }
 async function factoryFails(...args: string[]): Promise<string | undefined> {
@@ -192,7 +197,7 @@ async function main() {
 	check("after restart the run is still BUILDING at the same round", after.state === "BUILDING" && after.reviewRound === mid.reviewRound, `${after.state} round ${after.reviewRound}`);
 	check("same builder Conversation after restart", after.conversations.builder === before.conversations.builder);
 	const attachLog = join(DIR, "attach-run1.log");
-	const attachProc = spawn(BIN, ["attach", run1, "--no-input"], { env: { ...process.env, FACTORY_SOCKET: SOCKET, NO_COLOR: "1" }, stdio: ["ignore", "pipe", "pipe"] });
+	const attachProc = spawn(BIN, ["attach", run1, "--no-input"], { cwd: DIR, env: { ...process.env, FACTORY_SOCKET: SOCKET, NO_COLOR: "1" }, stdio: ["ignore", "pipe", "pipe"] });
 	attachProc.stdout!.pipe(createWriteStream(attachLog));
 	v1 = await drive(run1, []);
 	await Promise.race([new Promise((r) => (attachProc.exitCode !== null ? r(null) : attachProc.once("exit", r))), sleep(3000)]);
@@ -240,7 +245,8 @@ async function main() {
 	const prSrc = (await pexec("git", ["--git-dir", join(GH, "remotes", ME, "todo.git"), "show", `${v2.artifacts.delivery!.ref}:src/todo.js`])).stdout;
 	check("PR branch has the due-date feature", /parseDue/.test(prSrc) && /isOverdue/.test(prSrc));
 	const pushTry = (await transcript(run2, "builder")).items.find((i: any) => i.toolResult?.name === "bash" && /PUSH-EXIT/.test(i.toolResult.text))?.toolResult.text ?? "";
-	check("agent cannot reach GitHub directly: git push to origin and api.github.com fail inside the sandbox", /origin\s+\S+todo\.git \(push\)/.test(pushTry) && /PUSH-EXIT=[1-9]/.test(pushTry) && /GITHUB-API-EXIT=[1-9]/.test(pushTry), pushTry.slice(0, 600));
+	if (!SANDBOX) say("  (sandbox OFF: the check that agents can't reach GitHub is skipped)");
+	else check("agent cannot reach GitHub directly: git push to origin and api.github.com fail inside the sandbox", /origin\s+\S+todo\.git \(push\)/.test(pushTry) && /PUSH-EXIT=[1-9]/.test(pushTry) && /GITHUB-API-EXIT=[1-9]/.test(pushTry), pushTry.slice(0, 600));
 	say(`  builder's push attempt inside the sandbox:\n${pushTry.trim().split("\n").map((l: string) => `      ${l}`).join("\n")}`);
 	check("in-flight run kept its pinned reviewer (scripted/reviewer, high)", v2.cost.filter((c) => c.role === "reviewer").every((c) => c.model === "scripted/reviewer" && c.thinking === "high"), JSON.stringify(v2.cost.filter((c) => c.role === "reviewer").map((c) => [c.model, c.thinking])));
 
@@ -330,12 +336,32 @@ async function main() {
 	await factory("escalation", run8, "abort");
 	await until(run8, (x) => x.state === "CANCELLED", "cancel");
 
+	// ---------------------------------------------------------------- the web UI that ships by default
+	section("Web UI (default interface extension)");
+	const runs = JSON.parse(await factory("runs", "--json")) as RunView[];
+	const urlFile = join(DIR, "web-url");
+	const link = existsSync(urlFile) ? readFileSync(urlFile, "utf8").trim() : "";
+	check("factory serve started the web UI and wrote its link (mode 0600)", /^http:\/\/127\.0\.0\.1:\d+\/\?token=/.test(link) && (statSync(urlFile).mode & 0o777) === 0o600, link ? undefined : "no web-url file");
+	if (link) {
+		check("factory web prints the link", (await factory("web", "--config", CONFIG)) === link);
+		const base = new URL(link);
+		const post = (op: string, args: unknown[], auth = true) =>
+			fetch(new URL(`/api/op/${op}`, base), { method: "POST", headers: { "content-type": "application/json", ...(auth ? { authorization: `Bearer ${base.searchParams.get("token")}` } : {}) }, body: JSON.stringify({ args }) });
+		check("the API refuses requests without the token", (await post("listRuns", [], false)).status === 401);
+		const listed = (await (await post("listRuns", [])).json()) as { ok: boolean; result: RunView[] };
+		check("with the token it lists the same runs as the CLI", listed.ok && listed.result.map((r) => r.id).sort().join() === runs.map((r) => r.id).sort().join());
+		const page = await fetch(new URL(`/?token=${base.searchParams.get("token")}`, base), { redirect: "manual" });
+		check("the link sets an HttpOnly, SameSite=Strict session cookie", page.status === 303 && /HttpOnly; SameSite=Strict/.test(page.headers.get("set-cookie") ?? ""));
+		const err = await factoryFails("message", run1, "thanks!");
+		check("messages to a finished run are refused with a pointer to a new run (CLI `message`)", !!err && /start a new run/.test(err), err);
+	}
+
 	// ---------------------------------------------------------------- pass criteria summary
 	section("§8.5 pass criteria");
-	const runs = JSON.parse(await factory("runs", "--json")) as RunView[];
 	check("all runs recorded with cost and round counts", runs.every((r) => Array.isArray(r.cost) && typeof r.reviewRound === "number"));
 	const refs = (await Promise.all([`${ME}/todo`, `${ME}/todo2`].map((r) => pexec("git", ["--git-dir", join(GH, "remotes", `${r}.git`), "for-each-ref", "--format=%(refname)"]).then((x) => x.stdout)))).join("");
-	check("no agent-made ref reached the remotes (only main and factory/<run> branches)", refs.split("\n").filter(Boolean).every((r) => r === "refs/heads/main" || r.startsWith("refs/heads/factory/")), refs);
+	if (!SANDBOX) say("  (sandbox OFF: the builder's deliberate push attempt reaches the fake remote, so the remote-refs check is skipped)");
+	else check("no agent-made ref reached the remotes (only main and factory/<run> branches)", refs.split("\n").filter(Boolean).every((r) => r === "refs/heads/main" || r.startsWith("refs/heads/factory/")), refs);
 }
 
 main()
@@ -348,7 +374,7 @@ main()
 		const md = [
 			`# Dry run of spec §8 — ${new Date().toISOString()}`,
 			"",
-			`Directory: ${DIR}. Scripted agents (no model credentials), sandbox ON, fake GitHub with local CI runner, SQLite storage, driven through the \`factory\` CLI.`,
+			`Directory: ${DIR}. Scripted agents (no model credentials), sandbox ${SANDBOX ? "ON" : "OFF (DRYRUN_SANDBOX=0)"}, fake GitHub with local CI runner, SQLite storage, driven through the \`factory\` CLI.`,
 			"",
 			`**${checks.length - failed.length}/${checks.length} checks passed.**`,
 			"",

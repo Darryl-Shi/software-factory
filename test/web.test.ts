@@ -1,0 +1,187 @@
+// Interface extension `web` (spec §3.6 transport): token and cookie auth, Host/Origin/content-type checks, the
+// operation allowlist and error codes, the event stream, the token file, a busy port, and the static UI.
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { createServer, request } from "node:http";
+import { join } from "node:path";
+import { Script } from "node:vm";
+import { afterEach, describe, expect, test } from "vitest";
+import type { FactoryEvent } from "../src/core/types.ts";
+import { loadToken, webInterface } from "../src/extensions/web/server.ts";
+import { inState, makeFactory, type TestEnv, until } from "./helpers.ts";
+
+let t: TestEnv | undefined;
+let stops: (() => Promise<void>)[] = [];
+afterEach(async () => {
+	for (const s of stops) await s().catch(() => {});
+	stops = [];
+	await t?.factory.close().catch(() => {});
+	t = undefined;
+});
+
+const UI = join(import.meta.dirname, "../src/extensions/web/ui");
+
+async function serve(opts: { port?: number } = {}) {
+	t ??= await makeFactory();
+	const logs: string[] = [];
+	const tokenFile = join(t.dir, "home", "web-token");
+	const web = await webInterface({ tokenFile, port: opts.port ?? 0, log: (m) => logs.push(m) }).start(t.factory.as("web"));
+	const { url, stop } = web as { url?: string; stop(): Promise<void> };
+	stops.push(stop);
+	const u = url ? new URL(url) : undefined;
+	return { url, stop, logs, tokenFile, token: u?.searchParams.get("token") ?? "", port: u ? Number(u.port) : 0 };
+}
+
+interface Res {
+	status: number;
+	headers: Record<string, string | string[] | undefined>;
+	body: string;
+}
+function http(port: number, method: string, path: string, opts: { headers?: Record<string, string>; body?: string } = {}): Promise<Res> {
+	return new Promise((resolve, reject) => {
+		const req = request({ host: "127.0.0.1", port, method, path, headers: { host: `127.0.0.1:${port}`, ...opts.headers } }, (res) => {
+			let body = "";
+			res.on("data", (c) => (body += c));
+			res.on("end", () => resolve({ status: res.statusCode ?? 0, headers: res.headers, body }));
+		});
+		req.on("error", reject);
+		req.end(opts.body);
+	});
+}
+const op = (port: number, token: string, name: string, args: unknown[] = [], headers: Record<string, string> = {}) =>
+	http(port, "POST", `/api/op/${name}`, { headers: { authorization: `Bearer ${token}`, "content-type": "application/json", ...headers }, body: JSON.stringify({ args }) });
+
+describe("access", () => {
+	test("the link's token is swapped for an HttpOnly SameSite=Strict cookie; without it, a login page", async () => {
+		const { port, token, tokenFile } = await serve();
+		expect(token.length).toBeGreaterThanOrEqual(32);
+		expect(statSync(tokenFile).mode & 0o777).toBe(0o600);
+		expect(readFileSync(tokenFile, "utf8").trim()).toBe(token);
+		const anon = await http(port, "GET", "/");
+		expect(anon.status).toBe(401);
+		expect(anon.body).toContain("factory web");
+		expect((await http(port, "GET", "/?token=wrong")).status).toBe(401);
+		const swap = await http(port, "GET", `/?token=${token}`);
+		expect(swap.status).toBe(303);
+		expect(swap.headers.location).toBe("/");
+		const cookie = String(swap.headers["set-cookie"]);
+		expect(cookie).toMatch(/^factory_web=[^;]+; HttpOnly; SameSite=Strict; Path=\//);
+		const page = await http(port, "GET", "/", { headers: { cookie: cookie.split(";")[0]! } });
+		expect(page.status).toBe(200);
+		expect(page.body).toContain('<script src="/app.js"');
+		expect(String(page.headers["content-security-policy"])).toContain("script-src 'self'");
+		expect(page.headers["x-frame-options"]).toBe("DENY");
+		const js = await http(port, "GET", "/app.js", { headers: { cookie: cookie.split(";")[0]! } });
+		expect(js.status).toBe(200);
+		expect(js.headers["content-type"]).toMatch(/^text\/javascript/);
+		expect((await http(port, "GET", "/app.js")).status).toBe(401);
+	});
+
+	test("foreign Host (DNS rebinding) and Origin are refused; POST needs application/json", async () => {
+		const { port, token } = await serve();
+		expect((await http(port, "GET", "/", { headers: { host: `evil.example:${port}`, authorization: `Bearer ${token}` } })).status).toBe(421);
+		expect((await op(port, token, "listProjects", [], { origin: "http://evil.example" })).status).toBe(403);
+		expect((await op(port, token, "listProjects", [], { origin: `http://127.0.0.1:${port}` })).status).toBe(200);
+		const plain = await http(port, "POST", "/api/op/listProjects", { headers: { authorization: `Bearer ${token}`, "content-type": "text/plain" }, body: "{}" });
+		expect(plain.status).toBe(415);
+		expect((await http(port, "GET", "/api/op/listProjects", { headers: { authorization: `Bearer ${token}` } })).status).toBe(405);
+		expect((await op(port, "x".repeat(token.length), "listProjects")).status).toBe(401);
+	});
+
+	test("the token survives restarts (kept in its file); the link file is written and removed with the server", async () => {
+		const first = await serve();
+		const urlFile = join(first.tokenFile, "..", "web-url");
+		expect(readFileSync(urlFile, "utf8").trim()).toContain(`token=${first.token}`);
+		expect(statSync(urlFile).mode & 0o777).toBe(0o600);
+		await first.stop();
+		expect(existsSync(urlFile)).toBe(false);
+		expect(loadToken(first.tokenFile)).toBe(first.token);
+		const second = await serve();
+		expect(second.token).toBe(first.token);
+	});
+
+	test("a busy port leaves the factory running without the web UI", async () => {
+		const blocker = createServer();
+		await new Promise<void>((r) => blocker.listen(0, "127.0.0.1", () => r()));
+		const port = (blocker.address() as { port: number }).port;
+		try {
+			const { url, logs } = await serve({ port });
+			expect(url).toBeUndefined();
+			expect(logs.join("\n")).toContain("in use");
+			expect(await t!.factory.listProjects()).toEqual([]);
+		} finally {
+			blocker.close();
+		}
+	});
+});
+
+describe("operations and events", () => {
+	test("operations go through the allowlist; core errors map to HTTP statuses with their codes", async () => {
+		const { port, token } = await serve();
+		const created = JSON.parse((await op(port, token, "createProject", ["p", "me/p"])).body);
+		expect(created).toMatchObject({ ok: true, result: { name: "p", repo: "me/p" } });
+		expect(JSON.parse((await op(port, token, "listProjects")).body).result).toHaveLength(1);
+		const missing = await op(port, token, "getRun", ["nope"]);
+		expect(missing.status).toBe(404);
+		expect(JSON.parse(missing.body)).toMatchObject({ ok: false, code: "not_found" });
+		const invalid = await op(port, token, "message", ["nope", "   "]);
+		expect(invalid.status).toBe(400);
+		expect(JSON.parse(invalid.body).code).toBe("invalid");
+		expect((await op(port, token, "createProject", ["p", "other/p"])).status).toBe(409);
+		expect((await op(port, token, "subscribe")).status).toBe(404);
+		expect((await op(port, token, "harnessForTests")).status).toBe(404);
+		const bad = await http(port, "POST", "/api/op/listProjects", { headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: "{" });
+		expect(bad.status).toBe(400);
+		const schema = JSON.parse((await op(port, token, "settingsSchema")).body).result;
+		expect(Object.keys(schema)).toContain("workers");
+		expect(webInterface().settings!.schema).toMatchObject({ host: { default: "127.0.0.1" }, port: { type: "number", default: 7317 } });
+	});
+
+	test("the event stream carries core events; runs started over HTTP are attributed to `web`", async () => {
+		const { port, token } = await serve();
+		await op(port, token, "createProject", ["p", "me/p"]);
+		const events: FactoryEvent[] = [];
+		const stream = await new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
+			const req = request({ host: "127.0.0.1", port, path: "/api/events?project=p", headers: { host: `127.0.0.1:${port}`, authorization: `Bearer ${token}` } }, resolve);
+			req.on("error", reject);
+			req.end();
+		});
+		expect(stream.headers["content-type"]).toBe("text/event-stream");
+		let buf = "";
+		stream.on("data", (c) => {
+			buf += c;
+			for (let i = buf.indexOf("\n\n"); i >= 0; i = buf.indexOf("\n\n")) {
+				const chunk = buf.slice(0, i);
+				buf = buf.slice(i + 2);
+				const data = /^data: (.*)$/m.exec(chunk)?.[1];
+				if (data) events.push(JSON.parse(data));
+			}
+		});
+		await t!.factory.setSetting({ project: "p" }, "policy.approvals", ["spec"]);
+		const run = JSON.parse((await op(port, token, "startRun", ["p", { source: "web", title: "hello", body: "make hello" }])).body).result as string;
+		const v = await until(t!.factory, run, inState("AWAITING_APPROVAL"));
+		expect((await op(port, token, "approve", [run, "spec"])).status).toBe(200);
+		await until(t!.factory, run, inState("DELIVERED"));
+		await new Promise((r) => setTimeout(r, 200));
+		stream.destroy();
+		expect(events.filter((e) => e.type === "run.state").map((e: any) => e.to)).toContain("DELIVERED");
+		expect(events).toContainEqual(expect.objectContaining({ type: "run.ask", run, ask: v.pendingAsk!.id }));
+		expect(events).toContainEqual(expect.objectContaining({ type: "run.askResolved", run, by: "web" }));
+	});
+});
+
+describe("static UI", () => {
+	test("app.js parses; index.html loads only same-origin files and has no inline script (CSP)", () => {
+		const js = readFileSync(join(UI, "app.js"), "utf8");
+		expect(() => new Script(js, { filename: "app.js" })).not.toThrow();
+		const html = readFileSync(join(UI, "index.html"), "utf8");
+		expect(html).toContain('href="/app.css"');
+		expect([...html.matchAll(/<script\b[^>]*>/g)].map((m) => m[0])).toEqual(['<script src="/app.js" defer>']);
+		expect(html).not.toMatch(/https?:\/\//);
+		expect(readFileSync(join(UI, "app.css"), "utf8")).not.toMatch(/@import|url\(https?:/);
+		// every operation the UI calls is one the server allows
+		const used = new Set([...js.matchAll(/core\.([a-zA-Z]+)\(/g)].map((m) => m[1]!));
+		used.delete("subscribe");
+		const server = readFileSync(join(import.meta.dirname, "../src/core/types.ts"), "utf8");
+		for (const name of used) expect(server).toContain(`"${name}",`);
+	});
+});

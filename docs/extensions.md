@@ -8,7 +8,7 @@ read the shipped extensions under `src/extensions/`.
 
 | `kind` | Contract | Called by the core | v1 implementation |
 |---|---|---|---|
-| `interface` | `InterfaceExtension` | `start(core)` at process start | `cli` |
+| `interface` | `InterfaceExtension` | `start(core)` at process start | `cli`, `web` |
 | `intake` | `IntakeExtension` | `pull()` every 30 s, `subscribe?()`, `writeBack()` | (none) |
 | `repo` | `RepoExtension` | `open`, `create`, `diff`, `merge`, `writeArtifact` (`fork?` is declared but never called) | `github` |
 | `delivery` | `DeliveryExtension` | `deliver`, `checks`, `annotate?` | `github-delivery` |
@@ -27,11 +27,11 @@ Extensions are installed in code; v1 does not load extensions dynamically. There
 - Pass it through `ProcessOptions.extraExtensions`.
 
 Installing an extension does not activate it. A stage extension is used only when `stages.<kind>.use` names it.
-`stages.interface.use` is a list, so several interfaces can run at once.
+`stages.interface.use` is a list, so several interfaces can run at once; it defaults to every installed interface.
 
 ```ts
 // src/main.ts
-extensions: [githubRepo(host), githubDelivery(host), localWorktree({...}), cliInterface(), myInterface()],
+extensions: [githubRepo(host), githubDelivery(host), localWorktree({...}), cliInterface(), webInterface({...}), myInterface()],
 ```
 
 ## Settings an extension owns
@@ -78,7 +78,9 @@ An interface gets a `FactoryCore` handle in `start(core)`. The handle attributes
 `start` returns `{ stop() }`. Transport is up to the interface: the core defines none. An interface:
 - calls the operations;
 - renders `subscribe` events;
-- answers pending asks with `answer`, `approve`, `reject`, `submitHumanFindings` and `resolveEscalation`.
+- answers pending asks with `answer`, `approve`, `reject`, `submitHumanFindings` and `resolveEscalation`;
+- may send messages to the agent a run is with (`message`). The core picks the recipient and the timing; an interface
+  can't address a role directly, and a message never moves the run.
 
 Pending asks are stored in the core. An interface that connects late should read `getRun(run).pendingAsk` instead of
 relying on having seen the `run.ask` event. The first valid answer from any interface wins.
@@ -99,8 +101,15 @@ export function logInterface(): InterfaceExtension {
 }
 ```
 
-Then add it to `stages.interface.use`, for example `factory settings set stages.interface.use '[cli, log]'`. For a
-complete example, see `src/extensions/cli/server.ts`, which maps the operations onto JSON lines over a Unix socket.
+Then add it to `stages.interface.use`, for example `factory settings set stages.interface.use '[cli, web, log]'`. For
+complete examples, see:
+- `src/extensions/cli/server.ts`, which maps the operations onto JSON lines over a Unix socket;
+- `src/extensions/web/server.ts`, which maps them onto HTTP (`POST /api/op/<op>`, events as server-sent events) and
+  serves the static UI in `src/extensions/web/ui/` (plain JavaScript, no build step). Both use `CORE_OPS` from
+  `src/core/types.ts` as the allowlist of operations a transport may call.
+
+An interface that listens on the network must protect the core itself: the web extension binds to localhost, checks
+the `Host` header (DNS rebinding) and `Origin` (cross-site requests), and requires an access token.
 
 ## Intake extensions
 
@@ -125,3 +134,14 @@ Worker extensions are ordinary Pi Durable extensions (`defineExtension` from `@e
   extensions should not try to change run state.
 - **Prompts:** each role's prompt lives in the `role-<role>` extension in the same file, and the core adds it
   automatically.
+- **Settings:** a worker extension can own settings under `workers.<name>`. Pass `{ [name]: { schema, description?,
+  validate? } }` as `workerSettings` to `Factory` (`DEFAULT_WORKER_SETTINGS` in `src/extensions/workers/index.ts`).
+  The values layer and pin per run like stage settings. The core writes the run's pinned values into each role
+  Conversation as a `factory.workers` Document; a tool reads its own with
+  `workerSettings(api, name, c)` from `src/core/worker-settings.ts`, which returns `{ runId?, settings }`.
+- **Calling out of the sandbox:** a tool's `execute` runs in the factory process. A tool that needs a secret or the
+  network (like `web-search`) can do its work there instead of through `api.env`, so the secret never enters the
+  sandbox. It then owns that risk: keep the inputs narrow and say in a section what leaves the machine.
+
+`web-search` (`src/extensions/workers/web-search.ts`) is a small, complete example: one tool, a settings schema with a
+secret reference, `replay: "safe"`, and a section that warns agents not to put secrets in queries.

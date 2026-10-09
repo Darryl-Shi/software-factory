@@ -159,9 +159,8 @@ describe("review loop", () => {
 	test("a fix round with an empty diff escalates early (no progress)", async () => {
 		await setup();
 		t!.control.reviews = ["fail"];
+		t!.control.noProgressFromInput = 2;
 		const run = await start();
-		await until(t!.factory, run, (v) => v.state === "BUILDING" && v.reviewRound === 2 && false, 100).catch(() => {});
-		t!.control.builderNoProgress = true;
 		const v = await until(t!.factory, run, inState("ESCALATED", "DELIVERED"));
 		expect(v.state).toBe("ESCALATED");
 		expect(v.escalation!.reason).toMatch(/no progress/);
@@ -492,9 +491,9 @@ describe("roles and isolation", () => {
 		const v = await until(t!.factory, run, done);
 		const h = t!.factory.harnessForTests;
 		const tools = async (id: string) => (await (await h.conversation(id as never, {} as never))!.agent({} as never)).tools.map((x) => x.name).sort();
-		expect(await tools(v.conversations.architect!)).toEqual(["ask_human", "bash", "read", "submit_spec"]);
-		expect(await tools(v.conversations.builder!)).toEqual(["bash", "edit", "read", "report_done", "run_tests", "subagent", "write"]);
-		expect(await tools(v.conversations.reviewers[0]!.id)).toEqual(["bash", "http_request", "read", "run_tests", "submit_review"]);
+		expect(await tools(v.conversations.architect!)).toEqual(["ask_human", "bash", "read", "submit_spec", "web_search"]);
+		expect(await tools(v.conversations.builder!)).toEqual(["bash", "edit", "read", "report_done", "run_tests", "subagent", "web_search", "write"]);
+		expect(await tools(v.conversations.reviewers[0]!.id)).toEqual(["bash", "http_request", "read", "run_tests", "submit_review", "web_search"]);
 	});
 
 	test("delivered artifacts: AGENTS.md pointer is the builder's job; docs/spec.md is committed by the core at SPEC_READY", async () => {

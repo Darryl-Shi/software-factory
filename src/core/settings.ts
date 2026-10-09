@@ -14,6 +14,17 @@ export function expandHome(p: string): string {
 	return p === "~" ? homedir() : p.startsWith("~/") ? homedir() + p.slice(1) : p;
 }
 
+/** Resolve a `secretRef` setting (`env:NAME` or `file:/path`) where the secret is used; undefined when missing. */
+export function resolveSecret(ref: string | undefined): string | undefined {
+	if (!ref) return undefined;
+	if (ref.startsWith("env:")) return process.env[ref.slice(4)];
+	if (ref.startsWith("file:")) {
+		const p = expandHome(ref.slice(5));
+		return existsSync(p) ? readFileSync(p, "utf8").trim() : undefined;
+	}
+	return undefined; // store: references need a secret-store integration (not in v1)
+}
+
 // ---------------------------------------------------------------- core schema (policy + roles; storage is global-only)
 const thinking: SettingField = { type: "enum", values: ["off", "low", "medium", "high"], description: "Thinking level" };
 function roleField(model: string, level: string, extensions: string[], description: string): SettingField {
@@ -35,10 +46,10 @@ export function coreSchema(): Record<string, SettingField> {
 			type: "object",
 			description: "Role → model, thinking level and worker extensions",
 			fields: {
-				architect: roleField("anthropic/claude-opus-5-5", "high", ["coding-readonly"], "Architect: discussion and spec"),
-				builder: roleField("anthropic/claude-opus-5-5", "high", ["coding", "subagent", "test-runner"], "Builder: the single writer"),
-				helper: roleField("anthropic/claude-sonnet-5-5", "medium", ["coding-readonly"], "Helpers the builder spawns (read/analysis only)"),
-				reviewer: roleField("openai/gpt-6-sol", "high", ["coding-readonly", "test-runner", "browser"], "Reviewer: whole product vs spec"),
+				architect: roleField("anthropic/claude-opus-5-5", "high", ["coding-readonly", "web-search"], "Architect: discussion and spec"),
+				builder: roleField("anthropic/claude-opus-5-5", "high", ["coding", "subagent", "test-runner", "web-search"], "Builder: the single writer"),
+				helper: roleField("anthropic/claude-sonnet-5-5", "medium", ["coding-readonly", "web-search"], "Helpers the builder spawns (read/analysis only)"),
+				reviewer: roleField("openai/gpt-6-sol", "high", ["coding-readonly", "test-runner", "browser", "web-search"], "Reviewer: whole product vs spec"),
 			},
 		},
 		policy: {
@@ -53,6 +64,12 @@ export function coreSchema(): Record<string, SettingField> {
 				},
 				reviewRoundCap: { type: "number", default: 3, min: 1, max: 20, description: "Review rounds before escalation" },
 				escalateOnNoProgress: { type: "boolean", default: true, description: "Escalate when a fix round leaves an empty diff" },
+				messages: {
+					type: "list",
+					of: { type: "enum", values: ["architect", "builder", "reviewer"], description: "role" },
+					default: ["architect", "builder", "reviewer"],
+					description: "Roles a human can message while a run is going (drop reviewer for an independent review)",
+				},
 			},
 		},
 		storage: {

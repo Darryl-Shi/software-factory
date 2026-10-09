@@ -229,6 +229,8 @@ export interface CostRecord {
 	totalTokens: number;
 	usd: number;
 	durationMs: number;
+	/** Set on usage from turns your messages started while the role was idle (see `message`). */
+	trigger?: "message";
 }
 
 export interface PendingAsk {
@@ -243,6 +245,18 @@ export type AskResponse =
 	| { type: "approve"; by: string }
 	| { type: "reject"; findings: HumanFinding[]; feedback: string; by: string }
 	| { type: "escalation"; choice: { accept: true } | { moreRounds: number } | { abort: true }; by: string };
+
+/** A message a human sent to the agent the run is with (`message`). */
+export interface HumanMessage {
+	id: string;
+	text: string;
+	/** The interface that sent it. */
+	by: string;
+	to: Role;
+	/** Set once the message is handed to a conversation; unset while the role hasn't started yet. */
+	conversationId?: string;
+	at: number;
+}
 
 export interface RunView {
 	id: RunId;
@@ -268,6 +282,7 @@ export interface RunView {
 	findingsLog: FindingsLogEntry[];
 	noCi?: boolean;
 	notices: Notice[];
+	messages: HumanMessage[];
 	history: { from: RunState | null; to: RunState; at: number; round: number }[];
 	workspace?: Workspace;
 	createdAt: number;
@@ -294,6 +309,11 @@ export interface TranscriptItem {
 	entryId: string;
 	kind: string;
 	role?: string;
+	/** For user items: `human` for a message sent with `message`, `factory` for the core's own input. */
+	author?: "factory" | "human";
+	/** For human messages: the interface that sent it and the message id. `text` is the human's text only. */
+	by?: string;
+	msgId?: string;
 	text?: string;
 	toolCalls?: { id: string; name: string; args: unknown }[];
 	toolResult?: { callId: string; name: string; isError: boolean; text: string; details?: unknown };
@@ -306,6 +326,8 @@ export interface TranscriptView {
 	/** Helper conversations the builder spawned (found through tool `details`). */
 	helpers: string[];
 	busy: boolean;
+	/** Human messages waiting in the conversation's inbox for the agent's next step boundary. */
+	queued: { msgId: string; by: string; text: string }[];
 }
 
 export type FactoryEvent =
@@ -314,6 +336,7 @@ export type FactoryEvent =
 	| { type: "run.askResolved"; run: RunId; ask: AskId; by: string }
 	| { type: "run.notice"; run: RunId; notice: Notice }
 	| { type: "conversation.updated"; run: RunId; conversationId: string; role: Role }
+	| { type: "run.message"; run: RunId; message: { id: string; to: Role; conversationId?: string } }
 	| { type: "settings.changed"; scope: Scope; path: string };
 
 export interface FactoryCore {
@@ -331,12 +354,37 @@ export interface FactoryCore {
 	reject(run: RunId, gate: Gate, feedback: string): Promise<void>;
 	submitHumanFindings(run: RunId, gate: "delivery" | "merge", findings: HumanFinding[]): Promise<void>;
 	resolveEscalation(run: RunId, ask: AskId, choice: { accept: true } | { moreRounds: number } | { abort: true }): Promise<void>;
+	/** Send a message to the agent the run is with. It never moves the run; see `messageTarget` for who receives it. */
+	message(run: RunId, text: string): Promise<{ message: string; to: Role; conversationId?: string }>;
 	settingsSchema(): Record<string, SettingField>;
 	getSettings(scope: Scope): Promise<EffectiveSettings>;
 	setSetting(scope: Scope, path: string, value: unknown): Promise<void>;
 	unsetSetting(scope: Scope, path: string): Promise<void>;
 	subscribe(filter: { project?: string; run?: RunId }, on: (e: FactoryEvent) => void): Unsubscribe;
 }
+
+/** The operations an interface may call over its transport (everything but `subscribe`). */
+export const CORE_OPS = [
+	"createProject",
+	"getProject",
+	"listProjects",
+	"startRun",
+	"getRun",
+	"listRuns",
+	"getConversation",
+	"cancelRun",
+	"retryRun",
+	"answer",
+	"approve",
+	"reject",
+	"submitHumanFindings",
+	"resolveEscalation",
+	"message",
+	"settingsSchema",
+	"getSettings",
+	"setSetting",
+	"unsetSetting",
+] as const satisfies readonly (keyof FactoryCore)[];
 
 export class FactoryError extends Error {
 	constructor(

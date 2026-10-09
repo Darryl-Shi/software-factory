@@ -3,7 +3,7 @@
 // acceptance behaviours; the builder really writes, tests and commits code in the sandboxed worktree (and spawns a
 // helper); the reviewer really runs the test suite and the acceptance behaviours and reports evidence it observed.
 // Round 1 of a new todo build deliberately ships without `remove`, so the first review fails for a real reason.
-import { call, calls, type Script, type ScriptContext, say } from "./scripted.ts";
+import { call, calls, humanText, type Script, type ScriptContext, say } from "./scripted.ts";
 
 const delay = Number(process.env.DRYRUN_TURN_DELAY_MS ?? 0);
 const slow = async <T>(v: T): Promise<T> => {
@@ -110,6 +110,20 @@ export const architect: Script = async (ctx) => {
 		return slow(call("submit_spec", { markdown: DUE_SPEC }));
 	}
 	return slow(call("submit_spec", { markdown: GENERIC_SPEC(title) }));
+};
+
+// A message at the spec gate that asks for a change: revise the spec (it replaces the version waiting for approval).
+architect.onMessage = (ctx) => {
+	const side = ctx.side!;
+	const atGate = /waiting for the human's approval/.test(side.message);
+	const text = humanText(side.message).trim();
+	if (side.turn === 0 && atGate && /\b(change|revise|add|rename|instead|should|must|please)\b/i.test(text)) {
+		const last = [...ctx.messages].reverse().flatMap((m: any) => (m.role === "assistant" ? m.content : [])).find((p: any) => p.type === "toolCall" && p.name === "submit_spec") as any;
+		const spec = String(last?.arguments?.markdown ?? GENERIC_SPEC("change"));
+		return slow(call("submit_spec", { markdown: `${spec.trimEnd()}\n\n## Requested in a message\n- ${text.split("\n")[0]}\n` }));
+	}
+	if (side.turn > 0) return say(side.results.at(-1)?.isError ? `I couldn't revise the spec: ${side.results.at(-1)?.text}` : "Done: I revised the spec with your change. The new version is waiting for your approval.");
+	return say(atGate ? `Thanks. ${/\?\s*$/.test(text) ? "The spec covers that in its acceptance behaviours; ask me to change it and I'll revise it." : "Noted; tell me if the spec should change."}` : `Noted: ${text.split("\n")[0]}`);
 };
 
 // ------------------------------------------------------------------ builder: the product's source files

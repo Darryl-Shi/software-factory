@@ -8,8 +8,8 @@ import { githubDelivery } from "../src/extensions/github/delivery.ts";
 import { LocalGitHubHost } from "../src/extensions/github/host.ts";
 import { githubRepo } from "../src/extensions/github/repo.ts";
 import { localWorktree } from "../src/extensions/local-worktree/index.ts";
-import { DEFAULT_WORKER_EXTENSIONS } from "../src/extensions/workers/index.ts";
-import { call, calls, type Script, say, scriptedProvider } from "../src/testing/scripted.ts";
+import { DEFAULT_WORKER_EXTENSIONS, DEFAULT_WORKER_SETTINGS } from "../src/extensions/workers/index.ts";
+import { call, calls, humanText, type Script, say, scriptedProvider } from "../src/testing/scripted.ts";
 
 export type ReviewPlan = "pass" | "fail" | "invalid-then-pass" | "pass-advisory";
 
@@ -17,6 +17,8 @@ export type ReviewPlan = "pass" | "fail" | "invalid-then-pass" | "pass-advisory"
 export interface Control {
 	reviews: ReviewPlan[];
 	builderNoProgress: boolean;
+	/** The builder makes no change from its N-th input on (deterministic "no progress" fix rounds). */
+	noProgressFromInput?: number;
 	/** The builder delegates to a helper (subagent) before its first write. */
 	builderSubagent?: boolean;
 	builderHang: boolean;
@@ -31,10 +33,15 @@ export interface Control {
 	builderInputs: string[];
 	architectInputs: string[];
 	reviewerModels: string[];
+	/** Human messages the agents answered in side turns ("role:text"). */
+	messagesSeen: string[];
+	/** The architect calls web_search before writing the spec; the tool results land here. */
+	searchFirst?: boolean;
+	searchResults: string[];
 }
 
 export function newControl(): Control {
-	return { reviews: [], builderNoProgress: false, builderHang: false, askFirst: false, responsePlan: [], architectDouble: false, architectNoAB: false, reviewerInputs: [], builderInputs: [], architectInputs: [], reviewerModels: [] };
+	return { reviews: [], builderNoProgress: false, builderHang: false, askFirst: false, responsePlan: [], architectDouble: false, architectNoAB: false, reviewerInputs: [], builderInputs: [], architectInputs: [], reviewerModels: [], messagesSeen: [], searchResults: [] };
 }
 
 const SPEC = (v: number) => `# Spec v${v}\n\nA tiny product.\n\n## Acceptance behaviours\n\n- running it prints hello\n`;
@@ -65,39 +72,63 @@ export function scripts(control: Control): Record<string, Script> {
 			return call("submit_review", { verdict: "pass", findings: [{ severity: "minor", blocking: false, specRef: "AB1", description: "consider colours", evidence }] });
 		return call("submit_review", { verdict: "pass", findings: [] });
 	};
+	// Human messages that started a side turn: "REVISE: x" makes the architect resubmit the spec with x;
+	// "EDIT: x" makes the builder change a file. Anything else gets a one-line reply.
+	const architect: Script = (ctx) => {
+		if (control.searchFirst && ctx.inputs.length === 1) {
+			if (ctx.turn === 0) return call("web_search", { objective: "How do CLIs print hello?", queries: ["print hello cli", "hello world node"] });
+			if (ctx.results.at(-1)?.name === "web_search") {
+				control.searchResults.push(ctx.results.at(-1)!.text);
+				return call("submit_spec", { markdown: SPEC(1) });
+			}
+		}
+		if (ctx.turn > 0 && ctx.results.at(-1)?.name === "submit_spec" && ctx.results.at(-1)?.isError && !control.architectDouble)
+			return call("submit_spec", { markdown: SPEC(ctx.inputs.length) });
+		if (ctx.turn > 0) return say("waiting");
+		if (control.architectNoAB) return call("submit_spec", { markdown: "# Spec\n\nNo scenarios here, just prose about the product." });
+		control.architectInputs.push(ctx.input);
+		const nUser = ctx.inputs.length;
+		if (control.askFirst && nUser === 1) return call("ask_human", { question: "Which language?" });
+		if (control.architectDouble) return calls(["submit_spec", { markdown: SPEC(1) }], ["submit_spec", { markdown: SPEC(99) }]);
+		return call("submit_spec", { markdown: SPEC(nUser) });
+	};
+	architect.onMessage = (ctx) => {
+		const text = humanText(ctx.side!.message);
+		control.messagesSeen.push(`architect:${text}`);
+		if (ctx.side!.turn === 0 && text.startsWith("REVISE:")) return call("submit_spec", { markdown: `${SPEC(ctx.inputs.length)}- ${text.slice(7).trim()}\n` });
+		return say(ctx.side!.turn === 0 ? `re: ${text}` : "revised");
+	};
+	const builder: Script = async (ctx) => {
+		if (ctx.turn === 0) {
+			control.builderInputs.push(ctx.input);
+			if (control.hangAtInput === ctx.inputs.length) control.builderHang = true;
+			while (control.builderHang) await new Promise((r) => setTimeout(r, 50));
+			if (control.builderSubagent && ctx.inputs.length === 1) return call("subagent", { task: "count the files" });
+		}
+		if (control.builderSubagent && ctx.turn === 1 && ctx.inputs.length === 1) return call("write", { path: "round-1.txt", content: "round 1\n" });
+		if (ctx.turn === 0) {
+			const noProgress = control.builderNoProgress || (control.noProgressFromInput !== undefined && ctx.inputs.length >= control.noProgressFromInput);
+			if (!noProgress) return call("write", { path: `round-${ctx.inputs.length}.txt`, content: `round ${ctx.inputs.length}\n` });
+		}
+		const ids = [...ctx.inputs.at(-1)!.matchAll(/\[(F\d+)\] \([a-z]+, BLOCKING/g)].map((m) => m[1]!);
+		const plan = ids.length ? (control.responsePlan.shift() ?? "ok") : "ok";
+		const responses =
+			plan === "omit"
+				? []
+				: ids.map((findingId) =>
+						plan === "wontfix-noreason" ? { findingId, status: "wontfix" } : plan === "wontfix" ? { findingId, status: "wontfix", reason: "out of scope for the spec" } : { findingId, status: "fixed" },
+					);
+		return call("report_done", { summary: `round ${ctx.inputs.length}`, responses });
+	};
+	builder.onMessage = (ctx) => {
+		const text = humanText(ctx.side!.message);
+		control.messagesSeen.push(`builder:${text}`);
+		if (ctx.side!.turn === 0 && text.startsWith("EDIT:")) return call("write", { path: "CHANGELOG.md", content: `${text.slice(5).trim()}\n` });
+		return say(ctx.side!.turn === 0 ? `re: ${text}` : "changed CHANGELOG.md");
+	};
 	return {
-		architect: (ctx) => {
-			if (ctx.turn > 0 && ctx.results.at(-1)?.name === "submit_spec" && ctx.results.at(-1)?.isError && !control.architectDouble)
-				return call("submit_spec", { markdown: SPEC(ctx.inputs.length) });
-			if (ctx.turn > 0) return say("waiting");
-			if (control.architectNoAB) return call("submit_spec", { markdown: "# Spec\n\nNo scenarios here, just prose about the product." });
-			control.architectInputs.push(ctx.input);
-			const nUser = ctx.inputs.length;
-			if (control.askFirst && nUser === 1) return call("ask_human", { question: "Which language?" });
-			if (control.architectDouble) return calls(["submit_spec", { markdown: SPEC(1) }], ["submit_spec", { markdown: SPEC(99) }]);
-			return call("submit_spec", { markdown: SPEC(nUser) });
-		},
-		builder: async (ctx) => {
-			if (ctx.turn === 0) {
-				control.builderInputs.push(ctx.input);
-				if (control.hangAtInput === ctx.inputs.length) control.builderHang = true;
-				while (control.builderHang) await new Promise((r) => setTimeout(r, 50));
-				if (control.builderSubagent && ctx.inputs.length === 1) return call("subagent", { task: "count the files" });
-			}
-			if (control.builderSubagent && ctx.turn === 1 && ctx.inputs.length === 1) return call("write", { path: "round-1.txt", content: "round 1\n" });
-			if (ctx.turn === 0) {
-				if (!control.builderNoProgress) return call("write", { path: `round-${ctx.inputs.length}.txt`, content: `round ${ctx.inputs.length}\n` });
-			}
-			const ids = [...ctx.inputs.at(-1)!.matchAll(/\[(F\d+)\] \([a-z]+, BLOCKING/g)].map((m) => m[1]!);
-			const plan = ids.length ? (control.responsePlan.shift() ?? "ok") : "ok";
-			const responses =
-				plan === "omit"
-					? []
-					: ids.map((findingId) =>
-							plan === "wontfix-noreason" ? { findingId, status: "wontfix" } : plan === "wontfix" ? { findingId, status: "wontfix", reason: "out of scope for the spec" } : { findingId, status: "fixed" },
-						);
-			return call("report_done", { summary: `round ${ctx.inputs.length}`, responses });
-		},
+		architect,
+		builder,
 		helper: (ctx) => {
 			if (!control.builderSubagent) return say("helper");
 			if (ctx.turn === 0) return calls(["bash", { command: "ls | wc -l" }], ["write", { path: "helper.txt", content: "x" }]);
@@ -149,6 +180,7 @@ policy:
 			models,
 			extensions: [githubRepo(host), githubDelivery(host), localWorktree({ stateDir: join(dir, "state", "environments") })],
 			workerExtensions: DEFAULT_WORKER_EXTENSIONS,
+			workerSettings: DEFAULT_WORKER_SETTINGS,
 			storage: opts.storage === "sqlite" ? { sqlite: join(dir, "factory.sqlite") } : "memory",
 			ciPollMs: 50,
 			log: (m) => process.env.SF_DEBUG && console.error(m),

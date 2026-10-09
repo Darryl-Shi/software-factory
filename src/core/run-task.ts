@@ -14,11 +14,13 @@ import {
 import { createEditTool, createWriteTool } from "@earendil-works/pi-durable/tools";
 import { BridgeDoc, type BridgeTool, bridgeToolsNotFor, EnvDoc } from "./bridge.ts";
 import { formatFinding, validateReview } from "./findings.ts";
+import { messageContent } from "./messages.ts";
 import { RunDoc, type RunDocState } from "./run-doc.ts";
 import { parseDuration } from "./settings.ts";
+import { addCost, sumUsage, type UsageSum } from "./usage.ts";
+import { WorkerSettingsDoc } from "./worker-settings.ts";
 import type {
 	CiStatus,
-	CostRecord,
 	DeliveryExtension,
 	EnvironmentExtension,
 	EscalationInfo,
@@ -85,6 +87,7 @@ export function createRunTask(svc: CoreServices) {
 				d.state = next;
 			}
 			if (next !== "AWAITING_APPROVAL") delete d.gate;
+			delete d.driving;
 			d.updatedAt = svc.now();
 			return { status: "running", checkpoint: { phase: next, n } };
 		}, c);
@@ -141,10 +144,26 @@ export function createRunTask(svc: CoreServices) {
 		e.runId = d.id;
 		e.role = role;
 		if (env) e.envId = env.envId;
+		const w = await tx.doc(WorkerSettingsDoc, conv.id);
+		w.runId = d.id;
+		w.settings = JSON.parse(JSON.stringify(d.pinned.config.workers ?? {}));
 		return conv.id as unknown as string;
 	}
 
-	type AgentResult = { tool: BridgeTool; payload: any; cost: CostRecord };
+	type AgentResult = { tool: BridgeTool; payload: any; usage: { before: UsageSum; after: UsageSum; durationMs: number } };
+
+	/** Hand human messages that were waiting for this role's turn to its Conversation, as steers (see messages.ts). */
+	async function deliverHeld(rt: TaskRuntime<any, any, any, any>, c: Context, runId: string, role: Role, conversationId: string, handle: { submit: (s: any, c: Context) => Promise<unknown> }) {
+		const doc = await read(rt, runId, c);
+		const held = (doc.messages ?? []).filter((m) => m.to === role && m.conversationId === undefined);
+		if (!held.length) return;
+		for (const m of held) await handle.submit({ type: "input", content: messageContent(doc, m), requestId: m.id, whenBusy: "steer" }, c);
+		await rt.commit(async (tx) => {
+			const r = (await tx.doc(RunDoc, runId, null as never)) as unknown as RunDocState;
+			for (const m of r.messages ?? []) if (held.some((h) => h.id === m.id)) m.conversationId = String(conversationId);
+			return undefined;
+		}, c);
+	}
 
 	/** Submit input to a role Conversation (idempotent by request key) and read what it committed through the bridge. */
 	async function runAgent(
@@ -164,22 +183,10 @@ export function createRunTask(svc: CoreServices) {
 			if (b.expect?.key !== key) b.expect = { key, tools, ...(findingIds ? { findingIds } : {}) };
 			const r = await tx.doc(RunDoc, d.id, null as never);
 			r.conversations.active = conversationId;
+			r.driving = { conversationId, key };
 			return undefined;
 		}, c);
-		const usageOf = async () => {
-			const u = await rt.snapshot(UsageDoc, conversationId as never, c);
-			const sum = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, usd: 0 };
-			for (const bucket of [u?.models ?? {}, u?.tools ?? {}])
-				for (const v of Object.values(bucket) as any[]) {
-					sum.input += v.input ?? 0;
-					sum.output += v.output ?? 0;
-					sum.cacheRead += v.cacheRead ?? 0;
-					sum.cacheWrite += v.cacheWrite ?? 0;
-					sum.totalTokens += v.totalTokens ?? 0;
-					sum.usd += v.cost?.total ?? 0;
-				}
-			return sum;
-		};
+		const usageOf = async () => sumUsage((await rt.snapshot(UsageDoc, conversationId as never, c)) as any);
 		const before = await rt.memo(`${key}:usage0`, await usageOf(), c);
 		const startedAt = await rt.memo(`${key}:t0`, svc.now(), c);
 		const handle = await rt.conversation(conversationId as never, c);
@@ -193,6 +200,7 @@ export function createRunTask(svc: CoreServices) {
 					? content
 					: `You stopped without calling ${tools.join(" or ")}. The factory only continues when you call ${tools.join(" or ")}. Continue your work if needed, then call it.`;
 			const sub = await handle.submit({ type: "input", content: text, requestId }, c);
+			await deliverHeld(rt, c, d.id, role, conversationId, handle);
 			const settled = await sub.wait(c);
 			result = (await rt.snapshot(BridgeDoc, conversationId as never, c))?.results[key];
 			if (result === undefined && settled.status === "unanswered") {
@@ -201,30 +209,45 @@ export function createRunTask(svc: CoreServices) {
 			}
 		}
 		if (result === undefined) throw new Error(`${role} conversation finished without calling ${tools.join("/")}${lastStatus ? `; last input ${lastStatus}` : ""}`);
-		const after = await usageOf();
-		const round = role === "reviewer" || role === "builder" ? d.counters.reviewRound : d.counters.discussionSeq;
-		const cost: CostRecord = {
-			role,
-			round,
-			seq: role === "reviewer" ? d.counters.reviewSeq : role === "builder" ? d.counters.buildSeq : d.counters.discussionSeq,
-			conversationId,
-			model: String(d.pinned.config.roles?.[role]?.model ?? ""),
-			thinking: String(d.pinned.config.roles?.[role]?.thinking ?? ""),
-			input: after.input - before.input,
-			output: after.output - before.output,
-			cacheRead: after.cacheRead - before.cacheRead,
-			cacheWrite: after.cacheWrite - before.cacheWrite,
-			totalTokens: after.totalTokens - before.totalTokens,
-			usd: after.usd - before.usd,
-			durationMs: svc.now() - startedAt,
-		};
-		return { ...result, cost };
+		return { ...result, usage: { before, after: await usageOf(), durationMs: svc.now() - startedAt } };
+	}
+
+	const pushCost = (doc: RunDocState, role: Role, conversationId: string, r: AgentResult) =>
+		addCost(doc, role, conversationId, r.usage.before, r.usage.after, r.usage.durationMs, { always: true });
+
+	/** At the end of a run: usage of turns nobody recorded yet (a message's turn the core didn't see finish). */
+	async function settleUsage(rt: TaskRuntime<any, any, any, any>, c: Context, runId: string) {
+		const d = await read(rt, runId, c);
+		const convs: [Role, string][] = [
+			...(d.conversations.architect !== undefined ? [["architect", d.conversations.architect] as [Role, string]] : []),
+			...(d.conversations.builder !== undefined ? [["builder", d.conversations.builder] as [Role, string]] : []),
+			...d.conversations.reviewers.map((r) => ["reviewer", r.id] as [Role, string]),
+		];
+		const now = await Promise.all(convs.map(async ([, id]) => sumUsage((await rt.snapshot(UsageDoc, id as never, c)) as any)));
+		if (!convs.some(([, id], i) => now[i]!.totalTokens > (d.usage?.[String(id)]?.totalTokens ?? 0))) return;
+		await rt.commit(async (tx) => {
+			const doc = (await tx.doc(RunDoc, runId, null as never)) as unknown as RunDocState;
+			// Only Conversations with accounted usage: runs started before accounting existed have no baseline.
+			convs.forEach(([role, id], i) => {
+				const seen = doc.usage?.[String(id)];
+				if (seen && now[i]!.totalTokens > seen.totalTokens) addCost(doc, role, id, seen, now[i]!, 0, { trigger: "message" });
+			});
+			return undefined;
+		}, c);
 	}
 
 	async function awaitResponse(rt: TaskRuntime<any, any, any, any>, c: Context, runId: string, askId: string) {
+		const r = await awaitResponseOr(rt, c, runId, askId);
+		return r.response!;
+	}
+
+	/** Wait for the human's response to an ask, or for `other` to produce something first (checked after the response). */
+	async function awaitResponseOr<T>(rt: TaskRuntime<any, any, any, any>, c: Context, runId: string, askId: string, other?: () => Promise<T | undefined>) {
 		for (;;) {
 			const d = await read(rt, runId, c);
-			if (d.pendingAsk?.id === askId && d.pendingAsk.response) return d.pendingAsk.response;
+			if (d.pendingAsk?.id === askId && d.pendingAsk.response) return { response: d.pendingAsk.response };
+			const o = other ? await other() : undefined;
+			if (o !== undefined) return { other: o };
 			if (rt.signal.aborted) throw new Cancelled();
 			await Promise.race([svc.changed(runId, 1000), rt.sleep(svc.now() + 1000, c).catch(() => undefined)]);
 			if (rt.signal.aborted) throw new Cancelled();
@@ -421,7 +444,7 @@ export function createRunTask(svc: CoreServices) {
 			const key = `${d.id}:DISCUSSING:${d.counters.discussionSeq}`;
 			const r = await runAgent(rt, c, d, "architect", conv, key, d.pending.architectInput ?? "", ["ask_human", "submit_spec"]);
 			await transition(rt, c, d.id, (doc): Phase => {
-				doc.cost.push(r.cost);
+				pushCost(doc, "architect", conv, r);
 				delete doc.pending.architectInput;
 				if (r.tool === "ask_human") {
 					newAsk(doc, { kind: "discussion", text: r.payload.question });
@@ -440,6 +463,9 @@ export function createRunTask(svc: CoreServices) {
 			await transition(rt, c, d.id, async (doc, tx): Promise<Phase> => {
 				const next = toGateOrNext(doc, "spec", "BUILDING");
 				if (next === "BUILDING") await startBuild(rt, tx, doc);
+				// While the spec waits for approval, a human message may ask the architect for a change: it may answer
+				// with one submit_spec, which replaces the version waiting (see AWAITING_APPROVAL).
+				else await setBridgeExpect(tx, doc.conversations.architect!, { key: specGateKey(doc.pendingAsk!.id), tools: ["submit_spec"] });
 				return next;
 			});
 		},
@@ -447,7 +473,27 @@ export function createRunTask(svc: CoreServices) {
 		AWAITING_APPROVAL: async (rt, c, d) => {
 			const ask = d.pendingAsk!;
 			const gate = d.gate!;
-			const resp = await awaitResponse(rt, c, d.id, ask.id);
+			const architect = d.conversations.architect;
+			const revisedSpec =
+				gate === "spec" && architect !== undefined
+					? async () => (await rt.snapshot(BridgeDoc, architect as never, c))?.results[specGateKey(ask.id)]
+					: undefined;
+			const got = await awaitResponseOr(rt, c, d.id, ask.id, revisedSpec);
+			if (got.other) {
+				// The architect revised the spec after a human message: it replaces the version waiting for approval.
+				const text = String(got.other.payload.markdown);
+				await transition(rt, c, d.id, async (doc, tx): Promise<Phase> => {
+					doc.closedAsk = { id: ask.id, by: "architect" };
+					delete doc.pendingAsk;
+					await setBridgeExpect(tx, architect!, null);
+					const version = (doc.artifacts.spec?.version ?? 0) + 1;
+					doc.artifacts.spec = { kind: "spec", path: "docs/spec.md", version, sha256: sha(text), text };
+					notice(doc, { level: "info", text: `The architect revised the spec to v${version} after a message; it needs approval again` });
+					return "SPEC_READY";
+				});
+				return;
+			}
+			const resp = got.response!;
 			if (resp.type === "approve" && gate === "merge") {
 				const pr = d.artifacts.delivery?.pr;
 				if (!pr) throw new Error("merge approved but the delivery has no PR");
@@ -455,6 +501,7 @@ export function createRunTask(svc: CoreServices) {
 			}
 			await transition(rt, c, d.id, async (doc, tx): Promise<Phase> => {
 				delete doc.pendingAsk;
+				if (gate === "spec" && architect !== undefined) await setBridgeExpect(tx, architect, null);
 				if (resp.type === "approve") {
 					if (gate === "spec") {
 						await startBuild(rt, tx, doc);
@@ -488,7 +535,7 @@ export function createRunTask(svc: CoreServices) {
 			const noProgress =
 				d.counters.buildSeq > 1 && d.pinned.config.policy?.escalateOnNoProgress !== false && diff.fingerprint === d.lastFingerprint;
 			await transition(rt, c, d.id, async (doc, tx): Promise<Phase> => {
-				doc.cost.push(r.cost);
+				pushCost(doc, "builder", conv, r);
 				const responses = r.payload.responses as FindingResponse[];
 				const entry = [...doc.findingsLog].reverse().find((e) => e.findings.some((f) => ids.includes(f.id!)));
 				if (entry) entry.responses = [...(entry.responses ?? []), ...responses];
@@ -516,7 +563,7 @@ export function createRunTask(svc: CoreServices) {
 			const checked = validateReview(r.payload);
 			if (!checked.ok) throw new Error(`invalid review reached the core: ${checked.problems.join("; ")}`);
 			await transition(rt, c, d.id, async (doc, tx): Promise<Phase> => {
-				doc.cost.push(r.cost);
+				pushCost(doc, "reviewer", conv, r);
 				const findings = assignIds(doc, checked.review.findings);
 				const review: ReviewResult = { verdict: checked.review.verdict, findings };
 				doc.lastReview = review;
@@ -574,6 +621,22 @@ export function createRunTask(svc: CoreServices) {
 		DELIVERING: async (rt, c, d) => {
 			const ws = d.workspace!;
 			const repo = svc.repo(stage(d, "repo"));
+			if (d.lastFingerprint !== undefined) {
+				// A human message can lead the builder to change files after the review (at a gate or an escalation).
+				// Unreviewed changes are never delivered: they go through review first.
+				const now = await repo.diff(ws, ws.baseRef);
+				if (now.fingerprint !== d.lastFingerprint) {
+					await transition(rt, c, d.id, async (doc, tx): Promise<Phase> => {
+						doc.lastFingerprint = now.fingerprint;
+						notice(doc, { level: "warn", text: "The workspace changed after the last review (the builder acted on a message); reviewing again before delivery" });
+						doc.counters.reviewSeq += 1;
+						const reviewer = await createRoleConversation(rt, tx, doc, "reviewer");
+						doc.conversations.reviewers.push({ id: reviewer, seq: doc.counters.reviewSeq });
+						return "REVIEWING";
+					});
+					return;
+				}
+			}
 			if (ws.newRepo) await repo.create(d.repo, opts(d, "repo"));
 			const delivery = svc.delivery(stage(d, "delivery"));
 			const out = await delivery.deliver(ws, {
@@ -665,6 +728,13 @@ export function createRunTask(svc: CoreServices) {
 		FINAL: async (rt, c, d) => finalize(rt, c, d),
 	};
 
+	const specGateKey = (askId: string) => `${askId}:spec-revision`;
+
+	async function setBridgeExpect(tx: Tx, conversationId: string, expect: { key: string; tools: BridgeTool[] } | null) {
+		const b = await tx.doc(BridgeDoc, conversationId as never);
+		b.expect = expect;
+	}
+
 	async function startBuild(rt: TaskRuntime<any, any, any, any>, tx: Tx, d: RunDocState) {
 		if (!d.conversations.builder) d.conversations.builder = await createRoleConversation(rt, tx, d, "builder");
 		if (d.counters.buildSeq === 0) toBuilding(d, []);
@@ -687,6 +757,7 @@ export function createRunTask(svc: CoreServices) {
 	}
 
 	async function finalize(rt: RT, c: Context, d: RunDocState) {
+		await settleUsage(rt, c, d.id);
 		await sideEffectsAtEnd(d);
 		await rt.commit(() => ({ status: "terminal", outcome: { status: "completed", result: d.state } }), c);
 	}
@@ -719,11 +790,13 @@ export function createRunTask(svc: CoreServices) {
 				await rt.commit(async (tx) => {
 					const doc = (await tx.doc(RunDoc, runId, null as never)) as unknown as RunDocState;
 					toFinal(doc, "CANCELLED", doc.cancelReason ?? "cancelled");
+					delete doc.driving;
 					doc.updatedAt = svc.now();
 					return undefined;
 				}, c);
 				d = await read(rt, runId, c);
 			}
+			await settleUsage(rt, c, runId).catch((e) => svc.log(`usage settle failed: ${e}`));
 			await sideEffectsAtEnd(d);
 			await rt.commit(() => ({ status: "terminal", outcome: { status: "aborted", reason: "cancelled" } }), c);
 		},

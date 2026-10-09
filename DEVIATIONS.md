@@ -62,12 +62,12 @@ doesn't work, I took the closest faithful approach.
     - **Spec example:** `anthropic/claude-opus`, `anthropic/claude-sonnet` and `openai/gpt-6-sol`.
     - **Problem:** the first two are not model IDs that pi-ai's `createModels()` knows.
     - **Built:** `anthropic/claude-opus-5-5`, `anthropic/claude-sonnet-5-5` and `openai/gpt-6-sol`. The reviewer stays in a different model family, per §8's open risks.
-14. **No `docs` worker extension.** The §5 example gives the architect `[coding-readonly, docs]`. No `docs` extension exists in Pi, so the architect's default is `[coding-readonly]`.
+14. **No `docs` worker extension.** The §5 example gives the architect `[coding-readonly, docs]`. No `docs` extension exists in Pi; the architect's default is `[coding-readonly, web-search]`, and `web_search` covers looking up library docs (see 26).
 15. **`secretRef` supports `env:NAME` and `file:/path` only.** A `store:` key needs a secret-store integration, which Pi doesn't provide as a ready service here. The validator rejects inline secrets that look like tokens.
 16. **Extra settings were added** (each owned by its extension; none weaken §6):
     - `stages.environment.setupScripts` and `sandbox.enabled` (tests disable the sandbox), `sandbox.unixSockets` (see 9);
     - `stages.repo.workdir`;
-    - `stages.interface.socket`.
+    - `stages.interface.socket` (`cli`), `stages.interface.host` and `stages.interface.port` (`web`).
 
 ## Runs and durability (§4)
 
@@ -87,3 +87,25 @@ doesn't work, I took the closest faithful approach.
     - A local CI runner executes a workflow's `run:` steps in a clone of the pushed commit and treats `uses:` steps as satisfied.
     - Tests and the dry run use it. `GhApiHost` (real GitHub via `gh api`) is covered by request-shape tests against a fake `gh` binary, but has **not** run against github.com.
 23. **Scripted agents instead of models.** `src/testing/scripted.ts` is a provider on pi-ai's faux provider. `src/testing/dry-run-agents.ts` is a small scripted team that writes, tests and commits a real Node.js CLI inside the sandbox, and reviews it with real test runs and acceptance commands. The prompts and the reviewer's leniency are untested against real models.
+
+## Web UI, messages and web search (added after v1)
+
+The spec was amended for this release (§1, §3.3, §3.4, §3.6, §4, §6, §7): a local web UI ships as a second interface,
+humans can message the agent a run is with, and workers get a `web-search` extension. The entries below are the
+choices the amended spec leaves open, and the places where the code still differs from it.
+
+24. **Web transport and access.** The spec leaves transport to the extension (§3.6).
+    - **Built:** HTTP on `127.0.0.1:7317`: `POST /api/op/<op>` with `{ args }` (allowlist `CORE_OPS`, now in `src/core/types.ts` and shared with the CLI) and `GET /api/events` as server-sent events for `subscribe`. Core error codes map to HTTP statuses (`not_found` 404, `invalid` 400, `conflict` and `not_pending` 409).
+    - **Access:** a token in `~/.factory/web-token` (mode 0600, kept across restarts). The link `factory serve` prints carries it; the first visit swaps it for an HttpOnly, SameSite=Strict cookie and drops it from the address bar. `Authorization: Bearer` also works. The server rejects foreign `Host` headers (DNS rebinding) and `Origin`s, requires `application/json` on operations, and sends a CSP that allows only same-origin scripts.
+    - **Busy port:** the factory logs it and runs without the web UI rather than failing to start.
+    - **Extra command:** `factory web` prints the link again (from `web-url` next to the token file, written while the server runs).
+25. **`stages.interface.use` defaults to every installed interface** (`[cli, web]`). Before, the default was the first one installed (`[cli]`). The web UI is meant to ship on; drop it from the list to turn it off.
+26. **`web-search` runs in the factory process, not in the sandbox.** Like `subagent`, its `execute` runs where the core runs, so the Parallel API key never enters the sandbox and `api.parallel.ai` needs no `allowedDomains` entry. The cost: query text is an outbound channel from agents that the sandbox's network allowlist doesn't cover. Queries are kept in the transcript, the tool's section warns against secrets in queries, and a role can drop the extension. Without a key the tool returns an actionable error instead of failing the run.
+27. **Worker settings travel in a Document.** The spec (§3.3) says worker extensions are plain Pi Durable extensions configured by `configure({ extensions, tools, cwd })`, which has no slot for per-run values. The core writes the run's pinned `workers.*` into each role Conversation (and helpers) as a `factory.workers` Document (conversation scope, forked as initial) that tools read with `workerSettings()`. Schemas are passed as `workerSettings` to `Factory`.
+28. **How messages are delivered.**
+    - A message is a two-part user input: a header with the sender and message id plus a note on where the run is, then the human's text. Interfaces get the text back from `getConversation` as items with `author: "human"`; `TranscriptView.queued` lists messages still in the inbox.
+    - Messages the core can't hand over yet (the role hasn't started, or the core is about to submit its next input) wait in the run Document and are steered in right after that input. Request ids make each delivery idempotent across crashes.
+    - Turns that a message starts while the agent is idle are recorded with `trigger: "message"`. To avoid counting a turn twice, the run Document keeps the usage already accounted per Conversation, and every cost record is the difference from that baseline.
+29. **The re-review before delivery compares fingerprints.** `DELIVERING` compares the workspace diff's fingerprint with the one the last passing review saw; any difference (including uncommitted or untracked files) sends the run back to `REVIEWING` with a fresh reviewer and no added round.
+30. **Scripted agents understand messages.** `src/testing/scripted.ts` keeps human messages out of a script's `input`/`turn`/`results`, routes side turns to an optional `onMessage`, and acknowledges steers. The dry-run architect revises the spec when a message at the spec gate asks for a change. As with entry 23, real models are untested here.
+

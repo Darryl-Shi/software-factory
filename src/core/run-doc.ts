@@ -10,6 +10,7 @@ import type {
 	Finding,
 	FindingsLogEntry,
 	Gate,
+	HumanMessage,
 	Notice,
 	PendingAsk,
 	Request,
@@ -31,12 +32,14 @@ export type RunDocState = {
 	createdAt: number;
 	updatedAt: number;
 	pinned: { config: Record<string, any>; configHash: string; piVersion: string };
-	counters: { reviewRound: number; ciFixes: number; buildSeq: number; reviewSeq: number; discussionSeq: number; askSeq: number; findingSeq: number; attempt?: number };
+	counters: { reviewRound: number; ciFixes: number; buildSeq: number; reviewSeq: number; discussionSeq: number; askSeq: number; findingSeq: number; attempt?: number; msgSeq?: number };
 	caps: { review: number; ciFix: number };
 	loop: "review" | "ci";
 	workspace?: Workspace;
 	envs: Partial<Record<Role, { envId: string; cwd: string }>>;
 	conversations: { architect?: string; builder?: string; reviewers: { id: string; seq: number }[]; active?: string };
+	/** The Conversation the core is driving right now (set when runAgent submits, cleared by the next transition). */
+	driving?: { conversationId: string; key: string };
 	pending: { architectInput?: string; builderFindings?: Finding[]; builderNote?: string };
 	pendingAsk?: PendingAsk;
 	artifacts: { spec?: ArtifactRef & { text: string }; delivery?: Delivery };
@@ -54,6 +57,12 @@ export type RunDocState = {
 	failure?: { state: RunState; gate?: Gate; reason: string; pendingAsk?: PendingAsk };
 	notices: Notice[];
 	history: { from: RunState | null; to: RunState; at: number; round: number }[];
+	/** Messages humans sent with `message` (missing on runs started before messages existed). */
+	messages?: HumanMessage[];
+	/** Usage already in cost records, per Conversation (see usage.ts). */
+	usage?: Record<string, { input: number; output: number; cacheRead: number; cacheWrite: number; totalTokens: number; usd: number }>;
+	/** The last ask the core closed without a human response, and who closed it (a superseded spec approval). */
+	closedAsk?: { id: string; by: string };
 };
 
 // Typed loosely for Chord's JSON constraint; use `as RunDocState` at read sites.
@@ -97,6 +106,7 @@ export function toView(d: RunDocState): RunView {
 		findingsLog: d.findingsLog,
 		...(d.noCi ? { noCi: true } : {}),
 		notices: d.notices,
+		messages: d.messages ?? [],
 		history: d.history,
 		...(d.workspace ? { workspace: d.workspace } : {}),
 		createdAt: d.createdAt,

@@ -130,7 +130,7 @@ describe("settings layering", () => {
 	test("settingsSchema includes the core's and every installed extension's schemas", async () => {
 		t = await makeFactory();
 		const schema = t.factory.settingsSchema();
-		expect(Object.keys(schema)).toEqual(["version", "roles", "policy", "storage", "stages"]);
+		expect(Object.keys(schema)).toEqual(["version", "roles", "policy", "storage", "stages", "workers"]);
 		const stages = (schema.stages as any).fields;
 		expect(Object.keys(stages)).toEqual(["intake", "interface", "repo", "delivery", "environment"]);
 		expect(Object.keys(stages.delivery.fields)).toEqual(["use", "newRepo", "existingRepo", "ci"]);
