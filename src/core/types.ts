@@ -219,6 +219,9 @@ export interface CostRecord {
 	round: number;
 	seq: number;
 	conversationId: string;
+	/** provider/modelId and thinking level the role ran with (from the run's pinned config). */
+	model: string;
+	thinking: string;
 	input: number;
 	output: number;
 	cacheRead: number;

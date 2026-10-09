@@ -418,11 +418,13 @@ export class Factory implements FactoryCore {
 		return out;
 	}
 
-	async getConversation(run: RunId, conversationId: string): Promise<TranscriptView> {
+	async getConversation(run: RunId, conversationIdIn: string | number): Promise<TranscriptView> {
 		const d = await this.doc(run);
-		const known = new Set([d.conversations.architect, d.conversations.builder, ...d.conversations.reviewers.map((r) => r.id)].filter(Boolean));
-		const mapped = this.convIndex.get(conversationId);
-		if (!known.has(conversationId) && mapped?.run !== run) {
+		// Interfaces may hand ids back as strings (CLI arguments, JSON); the harness's ids are numeric.
+		const conversationId = (/^\d+$/.test(String(conversationIdIn)) ? Number(conversationIdIn) : conversationIdIn) as unknown as string;
+		const known = new Set([d.conversations.architect, d.conversations.builder, ...d.conversations.reviewers.map((r) => r.id)].filter(Boolean).map(String));
+		const mapped = this.convIndex.get(conversationId) ?? this.convIndex.get(String(conversationId) as never);
+		if (!known.has(String(conversationId)) && mapped?.run !== run) {
 			const env = await this.harness.snapshot(EnvDoc, conversationId as never, this.ctx);
 			if (env?.runId !== run) throw new FactoryError("not_found", `conversation ${conversationId} does not belong to run ${run}`);
 		}
@@ -452,7 +454,7 @@ export class Factory implements FactoryCore {
 				});
 			} else if (m.role === "toolResult") {
 				const child = (m.details as any)?.conversationId;
-				if (typeof child === "string") helpers.add(child);
+				if (typeof child === "string" || typeof child === "number") helpers.add(child as unknown as string);
 				items.push({
 					entryId: e.id,
 					kind: e.kind,

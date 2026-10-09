@@ -208,6 +208,8 @@ export function createRunTask(svc: CoreServices) {
 			round,
 			seq: role === "reviewer" ? d.counters.reviewSeq : role === "builder" ? d.counters.buildSeq : d.counters.discussionSeq,
 			conversationId,
+			model: String(d.pinned.config.roles?.[role]?.model ?? ""),
+			thinking: String(d.pinned.config.roles?.[role]?.thinking ?? ""),
 			input: after.input - before.input,
 			output: after.output - before.output,
 			cacheRead: after.cacheRead - before.cacheRead,
@@ -322,6 +324,9 @@ export function createRunTask(svc: CoreServices) {
 				"",
 				d.artifacts.spec?.text ?? "",
 				"",
+				...(stage(d, "delivery").ci?.mode === "required"
+					? [`Delivery constraint — CI: required. The delivered commit must pass the repo's CI checks, so the repo must have CI that runs the tests.`]
+					: []),
 				`When the product meets the spec, call report_done (responses: []).`,
 			].join("\n");
 		}

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# `factory` launcher: runs src/cli.ts with tsx (no build step).
+here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+exec node --import "$here/node_modules/tsx/dist/esm/index.mjs" --no-warnings "$here/src/cli.ts" "$@"

@@ -4,7 +4,9 @@
   "description": "Software factory on Pi Durable",
   "scripts": {
     "test": "vitest run",
-    "typecheck": "tsc -p ."
+    "typecheck": "tsc -p .",
+    "dry-run": "tsx scripts/dry-run.ts",
+    "factory": "bin/factory"
   },
   "keywords": [],
   "author": "",
@@ -14,13 +16,16 @@
     "@earendil-works/chord": "1.1.0",
     "@earendil-works/pi-ai": "1.1.0",
     "@earendil-works/pi-durable": "1.1.0",
-    "yaml": "2.9.1"
+    "yaml": "2.9.1",
+    "tsx": "4.23.15"
   },
   "devDependencies": {
-    "@types/node": "^26.6.4",
-    "tsx": "^4.23.15",
-    "typescript": "^7.0.2",
-    "vitest": "^5.0.3"
+    "@types/node": "26.6.4",
+    "typescript": "7.0.2",
+    "vitest": "5.0.3"
   },
-  "type": "module"
+  "type": "module",
+  "bin": {
+    "factory": "bin/factory"
+  }
 }

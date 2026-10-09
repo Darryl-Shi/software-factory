@@ -5,6 +5,7 @@ import { type AssistantMessage, Type } from "@earendil-works/pi-ai";
 import {
 	AssistantEntry,
 	type ConversationId,
+	AgentDoc,
 	configure,
 	defineExtension,
 	defineTool,
@@ -45,7 +46,10 @@ export const Subagent: Extension = defineExtension({
 					if (existing !== undefined) return existing.id;
 					// The host's conversationCreated hook gives the child the helper role (model, read-only env).
 					const created = await tx.createConversation({ ownership: { kind: "task", taskId: api.taskId } });
-					await configure(tx, created.id, { extensions: { remove: [Subagent] } });
+					// A host hook (the factory's conversationCreated) may already have given the helper an explicit,
+					// subagent-free extension list; only fall back to "inherit minus subagent" when it did not.
+					const agent = await tx.doc(AgentDoc, created.id);
+					if (!Array.isArray(agent.extensions)) await configure(tx, created.id, { extensions: { remove: [Subagent] } });
 					return created.id;
 				}, c);
 				await api.details({ conversationId: child }, c);

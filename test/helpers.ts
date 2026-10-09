@@ -17,6 +17,8 @@ export type ReviewPlan = "pass" | "fail" | "invalid-then-pass" | "pass-advisory"
 export interface Control {
 	reviews: ReviewPlan[];
 	builderNoProgress: boolean;
+	/** The builder delegates to a helper (subagent) before its first write. */
+	builderSubagent?: boolean;
 	builderHang: boolean;
 	/** Hang the builder at turn 0 of its N-th input (crash tests). */
 	hangAtInput?: number;
@@ -80,6 +82,10 @@ export function scripts(control: Control): Record<string, Script> {
 				control.builderInputs.push(ctx.input);
 				if (control.hangAtInput === ctx.inputs.length) control.builderHang = true;
 				while (control.builderHang) await new Promise((r) => setTimeout(r, 50));
+				if (control.builderSubagent && ctx.inputs.length === 1) return call("subagent", { task: "count the files" });
+			}
+			if (control.builderSubagent && ctx.turn === 1 && ctx.inputs.length === 1) return call("write", { path: "round-1.txt", content: "round 1\n" });
+			if (ctx.turn === 0) {
 				if (!control.builderNoProgress) return call("write", { path: `round-${ctx.inputs.length}.txt`, content: `round ${ctx.inputs.length}\n` });
 			}
 			const ids = [...ctx.inputs.at(-1)!.matchAll(/\[(F\d+)\] \([a-z]+, BLOCKING/g)].map((m) => m[1]!);
@@ -92,7 +98,11 @@ export function scripts(control: Control): Record<string, Script> {
 						);
 			return call("report_done", { summary: `round ${ctx.inputs.length}`, responses });
 		},
-		helper: () => say("helper"),
+		helper: (ctx) => {
+			if (!control.builderSubagent) return say("helper");
+			if (ctx.turn === 0) return calls(["bash", { command: "ls | wc -l" }], ["write", { path: "helper.txt", content: "x" }]);
+			return say(`helper saw: ${ctx.results.map((r) => `${r.name}:${r.isError ? "error" : "ok"}`).join(", ")}`);
+		},
 		reviewer: reviewer("reviewer"),
 		"reviewer-strict": reviewer("reviewer-strict"),
 	};

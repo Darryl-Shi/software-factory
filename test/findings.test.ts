@@ -108,3 +108,31 @@ describe("bridge enforcement in a live run", () => {
 		expect(results[0]!.text).toMatch(/must end with an "Acceptance behaviours" section/);
 	});
 });
+
+describe("helpers (subagent)", () => {
+	let t: TestEnv | undefined;
+	afterEach(async () => {
+		await t?.factory.close().catch(() => {});
+		t = undefined;
+	});
+	test("the builder's helper runs with the helper role: its model, read tools incl. bash, no write tools, no bridge tools", async () => {
+		t = await makeFactory();
+		t.control.builderSubagent = true;
+		await t.factory.createProject("p", "me/p");
+		const run = await t.factory.startRun("p", { source: "t", title: "x", body: "x" });
+		const v = await t.factory.waitForState(run, (x) => x.state === "DELIVERED");
+		const tr = await t.factory.getConversation(run, v.conversations.builder!);
+		expect(tr.helpers.length).toBe(1);
+		const h = await t.factory.getConversation(run, tr.helpers[0]!);
+		expect(h.role).toBe("helper");
+		const results = h.items.filter((i) => i.toolResult).map((i) => [i.toolResult!.name, i.toolResult!.isError]);
+		expect(results.sort()).toEqual([
+			["bash", false],
+			["write", true],
+		]);
+		const sub = tr.items.find((i) => i.toolResult?.name === "subagent")!.toolResult!;
+		expect(sub.text).toMatch(/helper saw: (bash:ok, write:error|write:error, bash:ok)/);
+		// ids handed back as strings (CLI/JSON) work too
+		expect((await t.factory.getConversation(run, String(tr.helpers[0]))).items.length).toBe(h.items.length);
+	});
+});
