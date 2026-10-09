@@ -388,7 +388,7 @@ export class Factory implements FactoryCore {
 
 	async getConversation(run: RunId, conversationIdIn: string | number): Promise<TranscriptView> {
 		const d = await this.doc(run);
-		// Interfaces may hand ids back as strings (CLI arguments, JSON); the harness's ids are numeric.
+		// Ids may come back as strings in the JSON from the web UI; the harness's ids are numeric.
 		const conversationId = (/^\d+$/.test(String(conversationIdIn)) ? Number(conversationIdIn) : conversationIdIn) as unknown as string;
 		const known = new Set([d.conversations.architect, d.conversations.builder, ...d.conversations.reviewers.map((r) => r.id)].filter(Boolean).map(String));
 		const mapped = this.convIndex.get(conversationId) ?? this.convIndex.get(String(conversationId) as never);

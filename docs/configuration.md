@@ -162,12 +162,28 @@ has a `stages` or `workers` section, at the top level or under `projects.<name>`
 error: config uses removed sections (stages, workers); move stages.repo.{identity,visibility} → github.*, stages.repo.workdir and stages.environment.root → workdir, stages.delivery.ci.* → ci.*, stages.environment.sandbox.* → sandbox.*, stages.environment.setupScripts → sandbox.setupScripts, stages.interface.{host,port} → web.*, workers.web-search.* → webSearch.*; found in projects: todo
 ```
 
-The list names the sections it found, and the last part appears only when a project has them. `factory doctor`
-prints the same message as a `FAIL` line. Any other unknown key fails validation on save as before.
+The list names the sections it found, and the last part appears only when a project has them.
+
+A `roles.<role>.extensions` key, at the top level or under `projects.<name>.roles.<role>`, is refused the same way.
+Left in place it would be ignored, and the role would get its full fixed tool set back, including `web_search` if you
+had removed `web-search` from its list:
+
+```
+error: config uses removed keys (roles.reviewer.extensions, projects.todo.roles.builder.extensions); tool sets are now fixed per role, so delete these keys. Web search can no longer be removed from a role: to turn it off, leave webSearch.apiKey unresolved (web_search calls then fail without sending a query)
+```
+
+Delete the key. Tool sets are fixed per role now (see [Settings](#settings)). The only way to keep search queries on this
+machine is to leave `webSearch.apiKey` unresolved (for the default `env:PARALLEL_API_KEY`, don't set
+`PARALLEL_API_KEY`): the tool stays listed, but every call fails without sending a query. If the config also has
+`stages` or `workers`, this text follows the sections message after `. Also: `.
+
+`factory doctor` prints the same message as a `FAIL` line. Any other unknown key fails validation on save as before.
 
 **Finish or cancel in-flight runs before upgrading.** Runs started before this change are not migrated: their pinned
 config still has the old paths. If such a run resumes, it doesn't see its old values and falls back to the default CI
-mode, GitHub identity and workdir.
+mode, GitHub identity and workdir. If its sandbox environment hasn't been provisioned yet, the environment gets the
+sandbox defaults, so no `sandbox.allowedDomains` and no setup script, and `web_search` uses its own defaults
+(`env:PARALLEL_API_KEY`, `fast`, 10 results).
 
 ## Example
 

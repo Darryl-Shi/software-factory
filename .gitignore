@@ -14,15 +14,14 @@ coverage/
 *.pem
 *.key
 
-# local state: factory storage, sockets, test and dry-run work dirs
+# local state: factory storage, test and dry-run work dirs
 .factory/
 .factory-test/
 *.sqlite
 *.sqlite-*
 *.sqlite*
 *.db
-*.sock
-dryrun-work/
+.dryrun/
 
 # logs
 *.log

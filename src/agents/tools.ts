@@ -1,5 +1,5 @@
-// Agent tools: plain Pi Durable extensions, visible to agents. Each role gets a fixed set (ROLE_TOOLS). They never call
-// factory extensions. Role guidance lives in ./prompts.ts (prompt sections), not in the core.
+// The fixed per-role agent tools: plain Pi Durable extensions, visible to agents. Each role gets a fixed set
+// (ROLE_TOOLS). Role guidance lives in ./prompts.ts (prompt sections), not in the core.
 import type { Context } from "@earendil-works/chord";
 import { type AssistantMessage, Type } from "@earendil-works/pi-ai";
 import {
@@ -19,8 +19,6 @@ import { createBashTool, createEditTool, createReadTool, createWriteTool } from 
 import type { Role } from "../core/types.ts";
 import { RoleArchitect, RoleBuilder, RoleHelper, RoleReviewer } from "./prompts.ts";
 import { WebSearch } from "./web-search.ts";
-
-export { WebSearch } from "./web-search.ts";
 
 export const Coding = defineExtension({ name: "coding", tools: [createReadTool(), createWriteTool(), createEditTool(), createBashTool()] });
 export const CodingReadonly = defineExtension({

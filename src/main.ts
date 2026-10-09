@@ -44,7 +44,6 @@ export async function createModels(scripted: boolean): Promise<Models> {
 
 export interface FactoryProcess {
 	factory: Factory;
-	host: GitHubHost;
 	web: { url: string; stop(): Promise<void> };
 	/** Stops the web server, then the factory. */
 	close(): Promise<void>;
@@ -97,7 +96,6 @@ export async function startFactoryProcess(opts: ProcessOptions = {}): Promise<Fa
 	}
 	return {
 		factory,
-		host,
 		web,
 		async close() {
 			try {

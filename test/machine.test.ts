@@ -62,8 +62,8 @@ describe("new repo (zero to MVP), push-main", () => {
 		await expect(t!.factory.answer(run, "nope", "TypeScript")).rejects.toThrow(/not pending/);
 		await expect(t!.factory.approve(run, "spec")).rejects.toThrow(/no spec approval/);
 		const ask = v.pendingAsk!.id;
-		const cli = t!.factory.as("cli");
-		await cli.answer(run, ask, "TypeScript");
+		const web = t!.factory.as("web");
+		await web.answer(run, ask, "TypeScript");
 		await expect(t!.factory.answer(run, ask, "again")).rejects.toThrow(/already answered|not pending|no pending/);
 		v = await until(t!.factory, run, (x) => x.state === "AWAITING_APPROVAL");
 		expect(v.gate).toBe("spec");
@@ -73,7 +73,7 @@ describe("new repo (zero to MVP), push-main", () => {
 		v = await until(t!.factory, run, done);
 		expect(v.state).toBe("DELIVERED");
 		const resolved = events.filter((e) => e.type === "run.askResolved");
-		expect(resolved[0]).toMatchObject({ type: "run.askResolved", by: "cli" });
+		expect(resolved[0]).toMatchObject({ type: "run.askResolved", by: "web" });
 		expect(events.filter((e) => e.type === "run.ask").length).toBe(2);
 		expect(events.filter((e) => e.type === "run.state").map((e) => (e as any).to)).toEqual(states(v));
 	});

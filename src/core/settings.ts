@@ -169,7 +169,9 @@ export const PROJECT_ONLY = ["repo"];
 
 /**
  * Refuse a config file that still has the removed `stages` or `workers` sections, at the top level or in a project's
- * overrides (no migrator; left in place they would be ignored, e.g. a project's CI mode or GitHub identity).
+ * overrides (no migrator; left in place they would be ignored, e.g. a project's CI mode or GitHub identity). Also refuse
+ * the removed `roles.<role>.extensions` key: ignored, it would silently give a role tools (e.g. web search) the operator
+ * had taken away.
  */
 export function assertNoLegacySections(configPath: string): void {
 	if (!existsSync(configPath)) return;
@@ -180,12 +182,28 @@ export function assertNoLegacySections(configPath: string): void {
 	const LEGACY = ["stages", "workers"];
 	const projects = Object.entries(isObj(raw.projects) ? raw.projects : {}).filter(([, p]) => isObj(p) && LEGACY.some((k) => k in p));
 	const found = LEGACY.filter((k) => k in raw || projects.some(([, p]) => k in p));
-	if (found.length === 0) return;
+	const extensions = [
+		...roleExtensionPaths(raw.roles, "roles"),
+		...Object.entries(isObj(raw.projects) ? raw.projects : {}).flatMap(([name, p]) => (isObj(p) ? roleExtensionPaths(p.roles, `projects.${name}.roles`) : [])),
+	];
+	const extMessage = extensions.length
+		? `config uses removed keys (${extensions.join(", ")}); tool sets are now fixed per role, so delete these keys. Web search can no longer be removed from a role: to turn it off, leave webSearch.apiKey unresolved (web_search calls then fail without sending a query)`
+		: "";
+	if (found.length === 0) {
+		if (extMessage) throw new FactoryError("invalid", extMessage);
+		return;
+	}
 	throw new FactoryError(
 		"invalid",
 		`config uses removed sections (${found.join(", ")}); move stages.repo.{identity,visibility} → github.*, stages.repo.workdir and stages.environment.root → workdir, stages.delivery.ci.* → ci.*, stages.environment.sandbox.* → sandbox.*, stages.environment.setupScripts → sandbox.setupScripts, stages.interface.{host,port} → web.*, workers.web-search.* → webSearch.*` +
-			(projects.length ? `; found in projects: ${projects.map(([name]) => name).join(", ")}` : ""),
+			(projects.length ? `; found in projects: ${projects.map(([name]) => name).join(", ")}` : "") +
+			(extMessage ? `. Also: ${extMessage}` : ""),
 	);
+}
+
+function roleExtensionPaths(roles: unknown, prefix: string): string[] {
+	if (!isObj(roles)) return [];
+	return Object.entries(roles).flatMap(([role, r]) => (isObj(r) && "extensions" in r ? [`${prefix}.${role}.extensions`] : []));
 }
 
 // ---------------------------------------------------------------- schema helpers

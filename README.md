@@ -28,7 +28,9 @@ code differs from them is listed in [`DEVIATIONS.md`](DEVIATIONS.md).
 - **Verified so far:** the test suite and a scripted end-to-end dry run of the spec's §8 trial plan
   ([`docs/dry-run-report.md`](docs/dry-run-report.md) has the checks and their results). Both use a fake GitHub on the
   local disk and scripted agents in place of models. The web UI was also driven end to end in a headless browser
-  against a scripted factory.
+  against a scripted factory. The latest dry run ran with the sandbox off (`DRYRUN_SANDBOX=0`). The bubblewrap tests
+  (`test/sandbox.test.ts`) and a dry run with the sandbox on have not been run since the fixed-architecture refactor;
+  both need `bubblewrap` and `socat`.
 - **Not yet done:** a live trial against github.com with real models. The real-GitHub client (`GhApiHost`) has only
   been tested against a fake `gh` binary, `web_search` only against a fake Parallel endpoint, and the role prompts
   have not been tested with real models.
@@ -60,7 +62,8 @@ There is no build step: `bin/factory` runs `src/cli.ts` through `tsx`.
 ## Quickstart
 
 **Without credentials.** This drives the whole §8 trial through the web UI's HTTP API. It uses a fake GitHub with a
-local CI runner, scripted agents, SQLite storage and the real sandbox, and takes a few minutes:
+local CI runner, scripted agents, SQLite storage and the real sandbox (unless `DRYRUN_SANDBOX=0`), and takes a few
+minutes. On a Linux host without `socat`, run it with `DRYRUN_SANDBOX=0`:
 
 ```sh
 npm run dry-run          # DRYRUN_DIR=/some/dir to choose where it writes; report.md is the result
@@ -90,8 +93,8 @@ factory doctor [--config p]
   process that owns storage and the core.
   - `--foreground` keeps it attached to the terminal, for systemd/launchd and development. SIGINT or SIGTERM stops it.
   - It exits 1 with a one-line reason, and nothing keeps running, if the web port is taken, a factory already runs
-    for this config, or the config is invalid or still has the removed `stages`/`workers` sections (see
-    [configuration](docs/configuration.md#old-config-files)). The factory never runs without its web UI.
+    for this config, or the config can't be parsed or still has the removed `stages`/`workers` sections or
+    `roles.<role>.extensions` keys (see [configuration](docs/configuration.md#old-config-files)). The factory never runs without its web UI.
   - Unknown options are refused.
 - **`stop`** stops the running factory and waits for it to exit.
 - **`status`** prints `running (pid N)` and the link, or `not running` (exit 1).
@@ -148,7 +151,7 @@ npm run typecheck   # tsc (noEmit)
 | File | Covers |
 |---|---|
 | `test/machine.test.ts` | State transitions, gates, rejections, escalations, round and fix caps, CI modes, cancel/retry, events, pinning |
-| `test/settings.test.ts` | Layering and source attribution, unset, validate-on-save, the fixed schema and role tool sets, refusing a legacy `stages`/`workers` config, projects |
+| `test/settings.test.ts` | Layering and source attribution, unset, validate-on-save, the fixed schema and role tool sets, refusing a legacy `stages`/`workers` config or `roles.<role>.extensions` key, projects |
 | `test/findings.test.ts` | Review and findings validation, builder responses, bridge enforcement, helper role tools |
 | `test/durability.test.ts` | `kill -9` mid-build and at a pending approval (SQLite), then resume |
 | `test/sandbox.test.ts` | The real bubblewrap sandbox: write rules, denyRead, no credential env vars, network allowlist |

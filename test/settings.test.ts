@@ -153,6 +153,21 @@ describe("settings layering", () => {
 		await expect(makeFactory({ config: both })).rejects.toThrow(/removed sections \(stages, workers\); move .*projects: b$/);
 	});
 
+	test("a removed roles.<role>.extensions key refuses to start (it would silently re-enable web search)", async () => {
+		const top = "version: 1\nroles:\n  reviewer: { model: openai/gpt-6-sol, extensions: [coding-readonly, test-runner, browser] }\n";
+		await expect(makeFactory({ config: top })).rejects.toThrow(
+			/^config uses removed keys \(roles\.reviewer\.extensions\); tool sets are now fixed per role, so delete these keys\. .*webSearch\.apiKey unresolved/,
+		);
+		const project =
+			"version: 1\nroles:\n  helper: { extensions: [] }\nprojects:\n  todo:\n    repo: me/todo\n    roles:\n      builder: { extensions: [coding] }\n      reviewer: { thinking: high }\n";
+		await expect(makeFactory({ config: project })).rejects.toThrow(/removed keys \(roles\.helper\.extensions, projects\.todo\.roles\.builder\.extensions\); /);
+		const onlyProject = "version: 1\nprojects:\n  todo:\n    repo: me/todo\n    roles: { builder: { extensions: [coding] } }\n";
+		await expect(makeFactory({ config: onlyProject })).rejects.toThrow(/^config uses removed keys \(projects\.todo\.roles\.builder\.extensions\)/);
+		// together with removed sections: the sections message comes first, unchanged, then the extensions part
+		const mixed = "version: 1\nworkers:\n  web-search: { mode: fast }\nroles:\n  reviewer: { extensions: [browser] }\n";
+		await expect(makeFactory({ config: mixed })).rejects.toThrow(/^config uses removed sections \(workers\); move .*webSearch\.\*\. Also: config uses removed keys \(roles\.reviewer\.extensions\)/);
+	});
+
 	test("roles have fixed tool sets", async () => {
 		t = await makeFactory();
 		expect(Object.keys((t.factory.settingsSchema().roles as any).fields.builder.fields)).toEqual(["model", "thinking"]);

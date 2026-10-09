@@ -173,7 +173,7 @@ server is its transport.
   web server listens and removes it on SIGINT or SIGTERM.
 - **The factory never runs without its web UI.** `serve` exits 1 with a one-line reason if the web port is taken, a
   live pid file names a running factory, the config can't be loaded, or the config still has a `stages` or `workers`
-  section (also under `projects.<name>`). The port is checked before any run resumes. Unknown options are refused.
+  section or a `roles.<role>.extensions` key (also under `projects.<name>`). The port is checked before any run resumes. Unknown options are refused.
 - A pid file that names no running factory (a dead process, or a reused pid) is removed.
 - `stop` sends SIGTERM and waits for the process to exit; `status` prints the pid and the link; `web` prints the
   link from `web-url`; `doctor` checks the config, models, sandbox, GitHub identity and `gh`.

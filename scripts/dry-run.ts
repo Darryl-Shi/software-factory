@@ -1,4 +1,4 @@
-// Dry trial of spec §8 through the web HTTP API: a daemonized `factory serve` (SQLite storage, sandbox ON, a fake
+// Dry trial of spec §8 through the web HTTP API: a daemonized `factory serve` (SQLite storage, sandbox ON unless DRYRUN_SANDBOX=0, a fake
 // GitHub on the local disk with a local CI runner, scripted agents) driven by `POST /api/op/<op>` calls and the
 // `GET /api/events` stream; `factory serve`, `web` and `stop` are the only CLI commands it runs. Every step names the
 // §8 item it exercises. Writes <dir>/report.md and exits non-zero if a check fails.
@@ -431,7 +431,7 @@ async function main() {
 	check("the API refuses requests without the token", noToken.status === 401);
 	const runs = await api<RunView[]>("listRuns");
 	const started = [run1, run2, run3, run4, run5, run6, run7, run8];
-	check("with the token it lists every run of the trial", runs.map((r) => r.id).sort().join() === started.sort().join(), runs.map((r) => r.id).join());
+	check("with the token it lists every run of the trial", runs.map((r) => r.id).sort().join() === [...started].sort().join(), runs.map((r) => r.id).join());
 	const page = await fetch(new URL(`/?token=${token()}`, link), { redirect: "manual" });
 	check("the link sets an HttpOnly, SameSite=Strict session cookie", page.status === 303 && /HttpOnly; SameSite=Strict/.test(page.headers.get("set-cookie") ?? ""));
 	const msgErr = await apiFails("message", run1, "thanks!");

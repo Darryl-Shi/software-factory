@@ -37,10 +37,10 @@ entries name the code as it is now.
    - **Problem:** this host (Ubuntu 26.04) sets `kernel.apparmor_restrict_unprivileged_userns=1`. Under it, sandbox-runtime's `apply-seccomp` helper fails with "nested userns is capability-restricted", and every sandboxed command fails.
    - **Built:**
      - In `auto` mode, `Sandbox` probes once. If the seccomp step fails, it runs with `allowAllUnixSockets: true`.
-     - That drops only the seccomp filter that blocks *creating Unix sockets*. Bubblewrap's filesystem, network-namespace and PID isolation, the proxy allowlist, denyRead and the credential denial all remain, and are tested in `test/sandbox.test.ts` and the dry run.
+     - That drops only the seccomp filter that blocks *creating Unix sockets*. Bubblewrap's filesystem, network-namespace and PID isolation, the proxy allowlist, denyRead and the credential denial all remain, and are tested in `test/sandbox.test.ts` and the dry run. Those tests and a sandbox-on dry run need `bubblewrap` and `socat`, and have not been run since the fixed-architecture refactor (the latest dry run used `DRYRUN_SANDBOX=0`).
      - `block` forces the strict mode; `allow` forces the relaxed one.
    - **Residual risk:** a sandboxed process can connect to Unix sockets it can see on the host (for example a world-accessible Docker socket). Keep such sockets unreadable, or allow nested user namespaces for bubblewrap via an AppArmor profile, and set `unixSockets: block`.
-   - **Host setup:** `socat` was installed with apt; it is a sandbox-runtime dependency.
+   - **Host setup:** `socat` is a sandbox-runtime dependency; install it with apt.
 8. **`TMPDIR` is redirected inside the sandbox.** sandbox-runtime sets `TMPDIR=/tmp/claude`, which is shared and read-only for read-only roles. `Sandbox` re-exports `TMPDIR` to the environment's own scratch dir (§3.3: "a per-run scratch dir that `TMPDIR` and tool caches point to"). `HOME` and the tool caches also point there.
 9. **Worktrees are kept after `dispose`.**
    - **Spec:** `DELIVERED` disposes the environment, and only `FAILED`/`CANCELLED` keep the "workspace for inspection".
@@ -68,7 +68,7 @@ entries name the code as it is now.
 
 ## Interface (§7)
 
-17. **Extra command: `factory doctor`.** It checks the config file (including removed `stages`/`workers` sections), model credentials, the sandbox, the GitHub identity and `gh`.
+17. **Extra command: `factory doctor`.** It checks the config file (including removed `stages`/`workers` sections and `roles.<role>.extensions` keys), model credentials, the sandbox, the GitHub identity and `gh`.
 18. **Run with tsx, no build step.** `bin/factory` runs `src/cli.ts` through tsx, so `tsx` is a runtime dependency.
 
 ## Testing substitutes (per the brief: no GitHub token, no model credentials)
