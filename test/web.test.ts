@@ -128,7 +128,7 @@ describe("operations and events", () => {
 		const bad = await http(port, "POST", "/api/op/listProjects", { headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: "{" });
 		expect(bad.status).toBe(400);
 		const schema = JSON.parse((await op(port, token, "settingsSchema")).body).result;
-		expect(Object.keys(schema)).toContain("workers");
+		expect(Object.keys(schema)).toContain("webSearch");
 		expect(schema.web.fields).toMatchObject({ host: { default: "127.0.0.1" }, port: { type: "number", default: 7317 } });
 	});
 

@@ -1,5 +1,5 @@
-// Worker extensions (spec §3.3): plain Pi Durable extensions, visible to agents, selected per role by name.
-// They never call factory extensions. Role guidance lives in ./prompts.ts (prompt sections), not in the core.
+// Agent tools: plain Pi Durable extensions, visible to agents. Each role gets a fixed set (ROLE_TOOLS). They never call
+// factory extensions. Role guidance lives in ./prompts.ts (prompt sections), not in the core.
 import type { Context } from "@earendil-works/chord";
 import { type AssistantMessage, Type } from "@earendil-works/pi-ai";
 import {
@@ -16,10 +16,11 @@ import {
 	UsageDoc,
 } from "@earendil-works/pi-durable";
 import { createBashTool, createEditTool, createReadTool, createWriteTool } from "@earendil-works/pi-durable/tools";
+import type { Role } from "../core/types.ts";
 import { RoleArchitect, RoleBuilder, RoleHelper, RoleReviewer } from "./prompts.ts";
-import { WebSearch, webSearchSettings } from "./web-search.ts";
+import { WebSearch } from "./web-search.ts";
 
-export { WebSearch, webSearchSettings } from "./web-search.ts";
+export { WebSearch } from "./web-search.ts";
 
 export const Coding = defineExtension({ name: "coding", tools: [createReadTool(), createWriteTool(), createEditTool(), createBashTool()] });
 export const CodingReadonly = defineExtension({
@@ -133,7 +134,13 @@ export const Browser = defineExtension({
 	],
 });
 
-export const DEFAULT_WORKER_EXTENSIONS: Extension[] = [Coding, CodingReadonly, Subagent, TestRunner, Browser, WebSearch, RoleArchitect, RoleBuilder, RoleReviewer, RoleHelper];
+/** The fixed tool set of each role: its role prompt first, then its tools. */
+export const ROLE_TOOLS: Record<Role, Extension[]> = {
+	architect: [RoleArchitect, CodingReadonly, WebSearch],
+	builder: [RoleBuilder, Coding, Subagent, TestRunner, WebSearch],
+	helper: [RoleHelper, CodingReadonly, WebSearch],
+	reviewer: [RoleReviewer, CodingReadonly, TestRunner, Browser, WebSearch],
+};
 
-/** Settings schemas of the default worker extensions (`workers.<name>`), for `CoreOptions.workerSettings`. */
-export const DEFAULT_WORKER_SETTINGS = { "web-search": webSearchSettings };
+/** Every distinct agent extension, installed into the registry so persisted Conversations resolve them on resume. */
+export const AGENT_EXTENSIONS: Extension[] = [...new Set(Object.values(ROLE_TOOLS).flat())];

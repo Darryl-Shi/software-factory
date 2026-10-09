@@ -4,7 +4,6 @@ import { join } from "node:path";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { Factory } from "../src/core/core.ts";
 import type { RunView } from "../src/core/types.ts";
-import { DEFAULT_WORKER_EXTENSIONS, DEFAULT_WORKER_SETTINGS } from "../src/agents/tools.ts";
 import { githubDelivery } from "../src/github/delivery.ts";
 import { LocalGitHubHost } from "../src/github/host.ts";
 import { githubRepo } from "../src/github/repo.ts";
@@ -179,8 +178,6 @@ policy:
 			configPath,
 			models,
 			extensions: [githubRepo(host), githubDelivery(host), localWorktree({ stateDir: join(dir, "state", "environments") })],
-			workerExtensions: DEFAULT_WORKER_EXTENSIONS,
-			workerSettings: DEFAULT_WORKER_SETTINGS,
 			storage: opts.storage === "sqlite" ? { sqlite: join(dir, "factory.sqlite") } : "memory",
 			ciPollMs: 50,
 			log: (m) => process.env.SF_DEBUG && console.error(m),

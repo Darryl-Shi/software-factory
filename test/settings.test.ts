@@ -1,6 +1,7 @@
 // Layered settings (spec §5, §6): default → global → project, validate on save, file unchanged on rejection.
 import { readFileSync, writeFileSync } from "node:fs";
 import { afterEach, describe, expect, test } from "vitest";
+import { ROLE_TOOLS } from "../src/agents/tools.ts";
 import { makeFactory, type TestEnv } from "./helpers.ts";
 
 let t: TestEnv | undefined;
@@ -98,7 +99,7 @@ describe("settings layering", () => {
 			[G, "policy.approvals", ["spec", "spec"], /duplicate gate/],
 			[G, "roles.reviewer.model", "openai/no-such-model", /not a model createModels\(\) knows/],
 			[G, "roles.reviewer.thinking", "extreme", /expected one of off, low, medium, high/],
-			[G, "roles.builder.extensions", ["coding", "teleport"], /teleport is not an installed worker extension/],
+			[G, "roles.builder.extensions", ["coding"], /unknown setting/],
 			[G, "stages.repo.identity.tokenRef", "ghp_abc123", /secret reference/],
 			[G, "stages.environment.sandbox.extraWrite", ["~"], /home directory/],
 			[G, "stages.environment.sandbox.extraWrite", ["~/.ssh/keys"], /denied secret path/],
@@ -132,13 +133,19 @@ describe("settings layering", () => {
 	test("settingsSchema includes the core's and every installed extension's schemas", async () => {
 		t = await makeFactory();
 		const schema = t.factory.settingsSchema();
-		expect(Object.keys(schema)).toEqual(["version", "roles", "policy", "web", "storage", "stages", "workers"]);
+		expect(Object.keys(schema)).toEqual(["version", "roles", "policy", "web", "webSearch", "storage", "stages"]);
 		const stages = (schema.stages as any).fields;
 		expect(Object.keys(stages)).toEqual(["repo", "delivery", "environment"]);
 		expect(Object.keys(stages.delivery.fields)).toEqual(["use", "newRepo", "existingRepo", "ci"]);
 		expect(Object.keys(stages.delivery.fields.ci.fields)).toEqual(["mode", "fixRounds", "checks", "noChecksTimeout"]);
 		expect(Object.keys(stages.repo.fields)).toContain("identity");
 		expect(Object.keys(stages.environment.fields.sandbox.fields)).toEqual(["enabled", "allowedDomains", "deniedDomains", "denyRead", "extraWrite", "unixSockets"]);
+	});
+
+	test("roles have fixed tool sets", async () => {
+		t = await makeFactory();
+		expect(Object.keys((t.factory.settingsSchema().roles as any).fields.builder.fields)).toEqual(["model", "thinking"]);
+		expect(ROLE_TOOLS.reviewer.map((e) => e.name)).toEqual(["role-reviewer", "coding-readonly", "test-runner", "browser", "web-search"]);
 	});
 
 	test("projects: createProject is idempotent, validates names and repo bindings, and rejects rebinding", async () => {

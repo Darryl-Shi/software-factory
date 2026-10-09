@@ -1,13 +1,12 @@
 // The factory process: the one process that owns the storage and the core (spec §3.6 "Transport belongs to the
 // extension"). It wires the platform services (pi-ai models, storage) into the core through dependency injection,
-// installs the factory extensions and the worker extensions, and starts the web server.
+// installs the factory extensions, and starts the web server.
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Models } from "@earendil-works/pi-ai";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import { Factory } from "./core/core.ts";
 import { expandHome } from "./core/settings.ts";
-import { DEFAULT_WORKER_EXTENSIONS, DEFAULT_WORKER_SETTINGS } from "./agents/tools.ts";
 import { githubDelivery } from "./github/delivery.ts";
 import { GhApiHost, type GitHubHost, LocalGitHubHost } from "./github/host.ts";
 import { githubRepo } from "./github/repo.ts";
@@ -67,8 +66,6 @@ export async function startFactoryProcess(opts: ProcessOptions = {}): Promise<Fa
 			githubDelivery(host),
 			localWorktree({ stateDir: join(factoryHome(configPath), "environments") }),
 		],
-		workerExtensions: DEFAULT_WORKER_EXTENSIONS,
-		workerSettings: DEFAULT_WORKER_SETTINGS,
 		...(opts.ciPollMs ? { ciPollMs: opts.ciPollMs } : {}),
 		log,
 	});

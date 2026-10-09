@@ -12,7 +12,6 @@ import {
 	configure,
 	createRegistry,
 	defineExtension,
-	type Extension,
 	Harness,
 	MemoryStorage,
 	type Registry,
@@ -20,14 +19,15 @@ import {
 	UsageDoc,
 } from "@earendil-works/pi-durable";
 import { createEditTool, createWriteTool } from "@earendil-works/pi-durable/tools";
+import { AGENT_EXTENSIONS, ROLE_TOOLS } from "../agents/tools.ts";
 import { Bridge, BridgeDoc, bridgeToolsNotFor, EnvDoc } from "./bridge.ts";
 import { humanFindings } from "./findings.ts";
 import { DEFAULT_MESSAGE_ROLES, holdMessage, messageContent, messageTarget, parseMessage } from "./messages.ts";
 import { RunDoc, type RunDocState, RunIndex, toView } from "./run-doc.ts";
+import { RunConfigDoc } from "./run-config.ts";
 import { createRunTask } from "./run-task.ts";
 import { ConfigStore, coreSchema, expandHome, hashConfig, isObj, type Obj } from "./settings.ts";
 import { addCost, sumUsage, type UsageSum } from "./usage.ts";
-import { WorkerSettingsDoc } from "./worker-settings.ts";
 import {
 	type AskId,
 	type AskResponse,
@@ -66,10 +66,6 @@ export interface CoreOptions {
 	models: Models;
 	/** Factory extensions (layer 2) and the environment extension (layer 3). */
 	extensions: FactoryExtension[];
-	/** Worker extensions (Pi Durable extensions) agents may select by name. */
-	workerExtensions: Extension[];
-	/** Settings schemas of worker extensions, by extension name: they appear under `workers.<name>` and are pinned per run. */
-	workerSettings?: Record<string, { schema: Record<string, SettingField>; description?: string; validate?(value: unknown): string[] }>;
 	/** Storage override (tests): "memory", or a sqlite path. Default: the config's `storage`. */
 	storage?: "memory" | { sqlite: string } | { jsonl: string };
 	now?: () => number;
@@ -104,13 +100,12 @@ export class Factory implements FactoryCore {
 
 	// ------------------------------------------------------------------ lifecycle
 	async start(): Promise<void> {
-		for (const ext of this.opts.workerExtensions) this.registry.install(ext);
+		for (const ext of AGENT_EXTENSIONS) this.registry.install(ext);
 		this.registry.install(Bridge);
 		this.runTask = createRunTask({
 			repo: (cfg) => this.ext<RepoExtension>("repo", cfg.use),
 			delivery: (cfg) => this.ext<DeliveryExtension>("delivery", cfg.use),
 			environment: (cfg) => this.ext<EnvironmentExtension>("environment", cfg.use),
-			workerExtensions: (role, names) => this.workerExtensionsFor(role, names),
 			bridge: Bridge,
 			changed: (runId, ms) => this.changed(runId, ms),
 			now: this.now,
@@ -145,7 +140,7 @@ export class Factory implements FactoryCore {
 					await configure(tx, rec.id, {
 						model: { provider: provider!, modelId: rest.join("/") },
 						thinkingLevel: (cfg.thinking ?? "medium") as any,
-						extensions: [...this.workerExtensionsFor("helper", cfg.extensions ?? []), Bridge],
+						extensions: [...ROLE_TOOLS.helper, Bridge],
 						tools: { remove: [...bridgeToolsNotFor("helper"), createWriteTool(), createEditTool()] as any },
 						...(helperEnv ? { cwd: helperEnv.cwd } : {}),
 					});
@@ -153,9 +148,9 @@ export class Factory implements FactoryCore {
 					e.runId = parent.runId;
 					e.role = "helper";
 					if (helperEnv) e.envId = helperEnv.envId;
-					const w = await tx.doc(WorkerSettingsDoc, rec.id);
-					w.runId = parent.runId;
-					w.settings = JSON.parse(JSON.stringify(run.pinned.config.workers ?? {}));
+					const rc = await tx.doc(RunConfigDoc, rec.id);
+					rc.runId = parent.runId;
+					rc.webSearch = JSON.parse(JSON.stringify(run.pinned.config.webSearch ?? {}));
 				},
 				onReport: (e) => this.log(`harness report: ${e instanceof Error ? e.stack : String(e)}`),
 			},
@@ -235,18 +230,6 @@ export class Factory implements FactoryCore {
 		const found = this.opts.extensions.find((e) => e.kind === kind && (name === undefined || e.name === name));
 		if (!found) throw new FactoryError("not_found", `no ${kind} extension named ${name ?? "(default)"} is installed`);
 		return found as T;
-	}
-
-	private workerExtensionsFor(role: Role, names: string[]): Extension[] {
-		const snap = this.registry.snapshot();
-		const out: Extension[] = [];
-		const guide = snap.extension(`role-${role}`);
-		if (guide) out.push(guide);
-		for (const n of names) {
-			const e = snap.extension(n);
-			if (e && !out.includes(e)) out.push(e);
-		}
-		return out;
 	}
 
 	// ------------------------------------------------------------------ events
@@ -657,32 +640,20 @@ export class Factory implements FactoryCore {
 				fields: { use: { type: "enum", values: names(kind), default: names(kind)[0] ?? "", description: `${kind} extension` }, ...fieldsOf(stage(kind)) } as Record<string, SettingField>,
 			};
 		}
-		const workers = Object.entries(this.opts.workerSettings ?? {}).filter(([name]) => this.opts.workerExtensions.some((e) => e.name === name));
 		return {
 			...schema,
 			stages: { type: "object", description: "Stage → factory extension + its settings", fields: stages },
-			...(workers.length
-				? {
-						workers: {
-							type: "object",
-							description: "Worker extension settings (pinned per run)",
-							fields: Object.fromEntries(workers.map(([name, w]) => [name, { type: "object", description: w.description ?? `${name} worker extension`, fields: w.schema } as SettingField])),
-						},
-					}
-				: {}),
 		};
 	}
 
 	private coreRules(eff: Obj, _scope: Scope): string[] {
 		const problems: string[] = [];
-		const installed = new Set(this.opts.workerExtensions.map((e) => e.name));
 		for (const role of ["architect", "builder", "helper", "reviewer"] as Role[]) {
 			const r = eff.roles?.[role];
 			if (!isObj(r)) continue;
 			const [provider, ...rest] = String(r.model ?? "").split("/");
 			if (!provider || rest.length === 0) problems.push(`roles.${role}.model: expected provider/modelId`);
 			else if (!this.opts.models.getModel(provider, rest.join("/"))) problems.push(`roles.${role}.model: ${r.model} is not a model createModels() knows`);
-			for (const n of (r.extensions ?? []) as string[]) if (!installed.has(n)) problems.push(`roles.${role}.extensions: ${n} is not an installed worker extension`);
 		}
 		for (const kind of ["repo", "delivery", "environment"] as const) {
 			const st = eff.stages?.[kind];
@@ -695,8 +666,6 @@ export class Factory implements FactoryCore {
 				else if (ext.settings?.validate) problems.push(...ext.settings.validate(st).map((p) => `stages.${kind}: ${p}`));
 			}
 		}
-		for (const [name, w] of Object.entries(this.opts.workerSettings ?? {}))
-			if (w.validate && isObj(eff.workers?.[name])) problems.push(...w.validate(eff.workers[name]).map((p) => `workers.${name}: ${p}`));
 		const approvals = eff.policy?.approvals ?? [];
 		if (new Set(approvals).size !== approvals.length) problems.push("policy.approvals: duplicate gate");
 		return problems;

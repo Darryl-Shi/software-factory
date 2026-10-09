@@ -1,8 +1,10 @@
-// Worker extension `web-search`: the request it sends to Parallel's Search API, how results reach the agent,
-// failures, and a live run where the architect searches with the run's pinned `workers.web-search` settings.
+// The `web-search` agent tool: the request it sends to Parallel's Search API, how results reach the agent,
+// failures, and a live run where the architect searches with the run's pinned `webSearch` settings.
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import { parallelSearch, webSearchSettings } from "../src/agents/web-search.ts";
+import { parallelSearch } from "../src/agents/web-search.ts";
+import { coreSchema } from "../src/core/settings.ts";
+import { ROLE_TOOLS } from "../src/agents/tools.ts";
 import { inState, makeFactory, type TestEnv, until } from "./helpers.ts";
 
 let t: TestEnv | undefined;
@@ -66,8 +68,8 @@ describe("parallelSearch", () => {
 	});
 
 	test("defaults: fast mode and 10 results; an unknown mode falls back to fast; at most 5 queries", async () => {
-		expect(webSearchSettings.schema.mode).toMatchObject({ default: "fast" });
-		expect(webSearchSettings.schema.apiKey).toMatchObject({ type: "secretRef", default: "env:PARALLEL_API_KEY" });
+		expect((coreSchema().webSearch as any).fields.mode).toMatchObject({ default: "fast" });
+		expect((coreSchema().webSearch as any).fields.apiKey).toMatchObject({ type: "secretRef", default: "env:PARALLEL_API_KEY" });
 		await parallelSearch({ objective: "x", queries: ["a", "b", "c", "d", "e", "f", "g"] }, settings({ mode: "warp", maxCharsTotal: 5000 }));
 		expect(seen[0]!.body).toMatchObject({ mode: "fast", search_queries: ["a", "b", "c", "d", "e"], max_chars_total: 5000, advanced_settings: { max_results: 10 } });
 		await parallelSearch({ objective: "only an objective", queries: [] }, settings({ mode: "advanced" }));
@@ -84,16 +86,15 @@ describe("parallelSearch", () => {
 });
 
 describe("in a run", () => {
-	test("web_search is on for every role by default and uses the run's pinned workers.web-search settings", async () => {
+	test("web_search is on for every role and uses the run's pinned webSearch settings", async () => {
 		t = await makeFactory();
 		const G = { global: true } as const;
 		const eff = await t.factory.getSettings(G);
-		expect(eff["workers.web-search.mode"]).toEqual({ value: "fast", source: "default" });
-		for (const role of ["architect", "builder", "helper", "reviewer"]) expect(eff[`roles.${role}.extensions`]!.value).toContain("web-search");
-		await t.factory.setSetting(G, "workers.web-search.endpoint", endpoint);
-		await t.factory.setSetting(G, "workers.web-search.apiKey", "env:SF_TEST_PARALLEL_KEY");
-		await t.factory.setSetting(G, "workers.web-search.maxResults", 4);
-		await expect(t.factory.setSetting(G, "workers.web-search.mode", "warp")).rejects.toMatchObject({ code: "invalid" });
+		expect(eff["webSearch.mode"]).toEqual({ value: "fast", source: "default" });
+		for (const role of ["architect", "builder", "helper", "reviewer"] as const) expect(ROLE_TOOLS[role].map((e) => e.name)).toContain("web-search");
+		await t.factory.setSetting(G, "webSearch", { endpoint, apiKey: "env:SF_TEST_PARALLEL_KEY" });
+		await t.factory.setSetting(G, "webSearch.maxResults", 4);
+		await expect(t.factory.setSetting(G, "webSearch.mode", "warp")).rejects.toMatchObject({ code: "invalid" });
 		await t.factory.createProject("p", "me/p");
 		t.control.searchFirst = true;
 		const run = await t.factory.startRun("p", { source: "test", title: "hello", body: "make hello" });

@@ -923,10 +923,10 @@ function walk(schema, prefix = "", out = []) {
 }
 function groupOf(path) {
   const [a, b] = path.split(".");
-  return ["roles", "stages", "workers"].includes(a) && path.split(".").length > 2 ? `${a}.${b}` : a;
+  return a === "roles" && path.split(".").length > 2 ? `${a}.${b}` : a;
 }
 const GROUP_NAME = (g) => { const [a, b] = g.split("."); return b ? `${cap1(a)} · ${b}` : cap1(a); };
-const GROUP_ORDER = ["policy", "roles", "stages", "workers", "storage"];
+const GROUP_ORDER = ["policy", "roles", "github", "ci", "sandbox", "webSearch", "web", "workdir", "storage"];
 async function renderSettings() {
   const scope = ui.setScope === "global" ? { global: true } : { project: ui.setScope };
   let eff;

@@ -1,27 +1,14 @@
-// Worker extension `web-search`: one `web_search` tool backed by Parallel's Search API (https://docs.parallel.ai).
+// Agent tool `web-search`: one `web_search` tool backed by Parallel's Search API (https://docs.parallel.ai).
 // The tool runs in the factory process, not in the sandboxed environment, so the API key never reaches an agent's
-// commands and api.parallel.ai needs no sandbox allowlist entry. Its settings live under `workers.web-search` and are
-// pinned per run. Queries leave this machine and are kept in the transcript; drop the extension from
-// `roles.<role>.extensions` for roles that must not search.
+// commands and api.parallel.ai needs no sandbox allowlist entry. Its settings live under `webSearch` (schema in
+// core/settings.ts) and are pinned per run. Queries leave this machine and are kept in the transcript.
 import { Type } from "@earendil-works/pi-ai";
 import { defineExtension, defineTool, section } from "@earendil-works/pi-durable";
+import { runConfigOf } from "../core/run-config.ts";
 import { resolveSecret } from "../core/settings.ts";
-import type { SettingField } from "../core/types.ts";
-import { workerSettings } from "../core/worker-settings.ts";
 
 export const WEB_SEARCH_MODES = ["turbo", "fast", "basic", "advanced"] as const;
 export const DEFAULT_ENDPOINT = "https://api.parallel.ai/v1/search";
-
-export const webSearchSettings: { schema: Record<string, SettingField>; description: string } = {
-	description: "web_search tool (Parallel Search API)",
-	schema: {
-		mode: { type: "enum", values: [...WEB_SEARCH_MODES], default: "fast", description: "Parallel search mode: turbo, fast (~1 s), basic or advanced (~3 s, highest quality)" },
-		maxResults: { type: "number", default: 10, min: 1, max: 40, description: "Results per search" },
-		maxCharsTotal: { type: "number", min: 1000, max: 200_000, description: "Optional cap on the excerpt characters of one search" },
-		apiKey: { type: "secretRef", default: "env:PARALLEL_API_KEY", description: "Parallel API key (a reference, never the key)" },
-		endpoint: { type: "string", default: DEFAULT_ENDPOINT, description: "Search endpoint" },
-	},
-};
 
 export interface SearchInput {
 	objective: string;
@@ -49,7 +36,7 @@ export async function parallelSearch(input: SearchInput, s: SearchSettings, opts
 	if (queries.length === 0) queries.push(objective.slice(0, 200));
 	const ref = s.apiKey ?? "env:PARALLEL_API_KEY";
 	const key = resolveSecret(ref);
-	if (!key) throw new Error(`web_search is not configured: no API key at ${ref} (workers.web-search.apiKey). Ask the operator to set it, or continue without searching.`);
+	if (!key) throw new Error(`web_search is not configured: no API key at ${ref} (webSearch.apiKey). Ask the operator to set it, or continue without searching.`);
 	const mode = s.mode && (WEB_SEARCH_MODES as readonly string[]).includes(s.mode) ? s.mode : "fast";
 	const body = {
 		...(objective ? { objective } : {}),
@@ -101,8 +88,8 @@ export function createWebSearch(opts: { fetch?: typeof fetch } = {}) {
 				}),
 				replay: "safe",
 				execute: async (args, api, c) => {
-					const { runId, settings } = await workerSettings(api as any, "web-search", c);
-					const out = await parallelSearch(args, settings as SearchSettings, { ...(runId ? { sessionId: runId } : {}), ...(opts.fetch ? { fetch: opts.fetch } : {}) });
+					const { runId, webSearch } = await runConfigOf(api as any, c);
+					const out = await parallelSearch(args, webSearch as SearchSettings, { ...(runId ? { sessionId: runId } : {}), ...(opts.fetch ? { fetch: opts.fetch } : {}) });
 					return { content: [{ type: "text", text: out.text }], details: out.details };
 				},
 			}),

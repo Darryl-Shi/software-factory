@@ -12,13 +12,14 @@ import {
 	UsageDoc,
 } from "@earendil-works/pi-durable";
 import { createEditTool, createWriteTool } from "@earendil-works/pi-durable/tools";
+import { ROLE_TOOLS } from "../agents/tools.ts";
 import { BridgeDoc, type BridgeTool, bridgeToolsNotFor, EnvDoc } from "./bridge.ts";
 import { formatFinding, validateReview } from "./findings.ts";
 import { messageContent } from "./messages.ts";
+import { RunConfigDoc } from "./run-config.ts";
 import { RunDoc, type RunDocState } from "./run-doc.ts";
 import { parseDuration } from "./settings.ts";
 import { addCost, sumUsage, type UsageSum } from "./usage.ts";
-import { WorkerSettingsDoc } from "./worker-settings.ts";
 import type {
 	CiStatus,
 	DeliveryExtension,
@@ -44,8 +45,6 @@ export interface CoreServices {
 	repo(cfg: Record<string, any>): RepoExtension;
 	delivery(cfg: Record<string, any>): DeliveryExtension;
 	environment(cfg: Record<string, any>): EnvironmentExtension;
-	/** Worker extensions (Pi Durable extensions) for a role, from the run's pinned role config. */
-	workerExtensions(role: Role, names: string[]): Extension[];
 	bridge: Extension;
 	/** Resolves when the run's document changes (answers, approvals); never rejects. */
 	changed(runId: string, ms: number): Promise<void>;
@@ -125,7 +124,7 @@ export function createRunTask(svc: CoreServices) {
 		const env = d.envs[role] ?? d.envs.builder;
 		const conv = await tx.createConversation({ ownership: { kind: "task", taskId: rt.taskId } });
 		const [provider, ...rest] = String(roleCfg.model ?? "").split("/");
-		const extensions = [...svc.workerExtensions(role, roleCfg.extensions ?? []), svc.bridge];
+		const extensions = [...ROLE_TOOLS[role], svc.bridge];
 		const remove = [...bridgeToolsNotFor(role), ...(role === "builder" ? [] : WRITE_TOOLS)];
 		await configure(tx, conv.id, {
 			model: { provider: provider!, modelId: rest.join("/") },
@@ -141,9 +140,9 @@ export function createRunTask(svc: CoreServices) {
 		e.runId = d.id;
 		e.role = role;
 		if (env) e.envId = env.envId;
-		const w = await tx.doc(WorkerSettingsDoc, conv.id);
-		w.runId = d.id;
-		w.settings = JSON.parse(JSON.stringify(d.pinned.config.workers ?? {}));
+		const rc = await tx.doc(RunConfigDoc, conv.id);
+		rc.runId = d.id;
+		rc.webSearch = JSON.parse(JSON.stringify(d.pinned.config.webSearch ?? {}));
 		return conv.id as unknown as string;
 	}
 

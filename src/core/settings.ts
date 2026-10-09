@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { homedir } from "node:os";
 import { dirname } from "node:path";
 import YAML from "yaml";
+import { DEFAULT_ENDPOINT, WEB_SEARCH_MODES } from "../agents/web-search.ts";
 import { type EffectiveSettings, FactoryError, type Project, type Scope, type SettingField, type SettingSource } from "./types.ts";
 
 export type Obj = Record<string, any>;
@@ -27,14 +28,13 @@ export function resolveSecret(ref: string | undefined): string | undefined {
 
 // ---------------------------------------------------------------- core schema (policy + roles; web and storage are global-only)
 const thinking: SettingField = { type: "enum", values: ["off", "low", "medium", "high"], description: "Thinking level" };
-function roleField(model: string, level: string, extensions: string[], description: string): SettingField {
+function roleField(model: string, level: string, description: string): SettingField {
 	return {
 		type: "object",
 		description,
 		fields: {
 			model: { type: "string", default: model, description: "provider/modelId known to createModels()" },
 			thinking: { ...thinking, default: level } as SettingField,
-			extensions: { type: "list", of: { type: "string", description: "worker extension name" }, default: extensions, description: "Worker extensions" },
 		},
 	};
 }
@@ -44,12 +44,12 @@ export function coreSchema(): Record<string, SettingField> {
 		version: { type: "number", default: 1, description: "Config format version", min: 1, max: 1 },
 		roles: {
 			type: "object",
-			description: "Role → model, thinking level and worker extensions",
+			description: "Role → model and thinking level",
 			fields: {
-				architect: roleField("anthropic/claude-opus-5-5", "high", ["coding-readonly", "web-search"], "Architect: discussion and spec"),
-				builder: roleField("anthropic/claude-opus-5-5", "high", ["coding", "subagent", "test-runner", "web-search"], "Builder: the single writer"),
-				helper: roleField("anthropic/claude-sonnet-5-5", "medium", ["coding-readonly", "web-search"], "Helpers the builder spawns (read/analysis only)"),
-				reviewer: roleField("openai/gpt-6-sol", "high", ["coding-readonly", "test-runner", "browser", "web-search"], "Reviewer: whole product vs spec"),
+				architect: roleField("anthropic/claude-opus-5-5", "high", "Architect: discussion and spec"),
+				builder: roleField("anthropic/claude-opus-5-5", "high", "Builder: the single writer"),
+				helper: roleField("anthropic/claude-sonnet-5-5", "medium", "Helpers the builder spawns (read/analysis only)"),
+				reviewer: roleField("openai/gpt-6-sol", "high", "Reviewer: whole product vs spec"),
 			},
 		},
 		policy: {
@@ -78,6 +78,17 @@ export function coreSchema(): Record<string, SettingField> {
 			fields: {
 				host: { type: "string", default: "127.0.0.1", description: "Address the web UI listens on (keep it on localhost)" },
 				port: { type: "number", default: 7317, min: 0, max: 65535, description: "Port of the web UI (0 picks a free port)" },
+			},
+		},
+		webSearch: {
+			type: "object",
+			description: "web_search tool (Parallel Search API)",
+			fields: {
+				mode: { type: "enum", values: [...WEB_SEARCH_MODES], default: "fast", description: "Parallel search mode: turbo, fast (~1 s), basic or advanced (~3 s, highest quality)" },
+				maxResults: { type: "number", default: 10, min: 1, max: 40, description: "Results per search" },
+				maxCharsTotal: { type: "number", min: 1000, max: 200_000, description: "Optional cap on the excerpt characters of one search" },
+				apiKey: { type: "secretRef", default: "env:PARALLEL_API_KEY", description: "Parallel API key (a reference, never the key)" },
+				endpoint: { type: "string", default: DEFAULT_ENDPOINT, description: "Search endpoint" },
 			},
 		},
 		storage: {

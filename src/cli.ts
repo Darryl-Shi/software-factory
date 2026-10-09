@@ -68,12 +68,11 @@ async function doctor() {
 	const { githubDelivery } = await import("./github/delivery.ts");
 	const { GhApiHost, resolveSecret } = await import("./github/host.ts");
 	const { localWorktree } = await import("./sandbox/sandbox.ts");
-	const { DEFAULT_WORKER_EXTENSIONS, DEFAULT_WORKER_SETTINGS } = await import("./agents/tools.ts");
 	const { existsSync } = await import("node:fs");
 	const configPath = expandHome(typeof flags.config === "string" ? flags.config : (process.env.FACTORY_CONFIG ?? DEFAULT_CONFIG));
 	const models = await createModels(!!flags.scripted);
 	const host = new GhApiHost();
-	const f = new Factory({ configPath, models, extensions: [githubRepo(host), githubDelivery(host), localWorktree()], workerExtensions: DEFAULT_WORKER_EXTENSIONS, workerSettings: DEFAULT_WORKER_SETTINGS });
+	const f = new Factory({ configPath, models, extensions: [githubRepo(host), githubDelivery(host), localWorktree()] });
 	const eff = existsSync(configPath) ? f.config.effective({ global: true }) : f.config.effective({ global: true }, { version: 1 });
 	const line = (ok: boolean | "warn", s: string) => console.log(`${ok === true ? "ok  " : ok === "warn" ? "warn" : "FAIL"}  ${s}`);
 	line(true, `config ${configPath}${existsSync(configPath) ? "" : " (missing: defaults)"}`);
