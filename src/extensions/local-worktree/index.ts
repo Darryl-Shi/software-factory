@@ -247,8 +247,10 @@ export function localWorktree(
 		const wrap = async (cmd: string, signal?: AbortSignal) => {
 			if (!rec.sandbox.enabled) return cmd;
 			await ensureSandbox(rec);
+			// srt points TMPDIR at its shared /tmp/claude; point it back at this environment's scratch dir.
+			const inner = `export TMPDIR=${shellQuote([shellEnv.TMPDIR!])}\n${cmd}`;
 			return SandboxManager.wrapWithSandbox(
-				cmd,
+				inner,
 				undefined,
 				{
 					filesystem: fsConfig,

@@ -9,7 +9,7 @@ import { LocalGitHubHost } from "../src/extensions/github/host.ts";
 import { githubRepo } from "../src/extensions/github/repo.ts";
 import { localWorktree } from "../src/extensions/local-worktree/index.ts";
 import { DEFAULT_WORKER_EXTENSIONS } from "../src/extensions/workers/index.ts";
-import { call, type Script, say, scriptedProvider } from "../src/testing/scripted.ts";
+import { call, calls, type Script, say, scriptedProvider } from "../src/testing/scripted.ts";
 
 export type ReviewPlan = "pass" | "fail" | "invalid-then-pass" | "pass-advisory";
 
@@ -18,7 +18,13 @@ export interface Control {
 	reviews: ReviewPlan[];
 	builderNoProgress: boolean;
 	builderHang: boolean;
+	/** Hang the builder at turn 0 of its N-th input (crash tests). */
+	hangAtInput?: number;
 	askFirst: boolean;
+	/** Per report_done attempt that answers findings: omit | wontfix-noreason | wontfix | ok (default ok). */
+	responsePlan: string[];
+	architectDouble: boolean;
+	architectNoAB: boolean;
 	reviewerInputs: string[];
 	builderInputs: string[];
 	architectInputs: string[];
@@ -26,7 +32,7 @@ export interface Control {
 }
 
 export function newControl(): Control {
-	return { reviews: [], builderNoProgress: false, builderHang: false, askFirst: false, reviewerInputs: [], builderInputs: [], architectInputs: [], reviewerModels: [] };
+	return { reviews: [], builderNoProgress: false, builderHang: false, askFirst: false, responsePlan: [], architectDouble: false, architectNoAB: false, reviewerInputs: [], builderInputs: [], architectInputs: [], reviewerModels: [] };
 }
 
 const SPEC = (v: number) => `# Spec v${v}\n\nA tiny product.\n\n## Acceptance behaviours\n\n- running it prints hello\n`;
@@ -59,20 +65,32 @@ export function scripts(control: Control): Record<string, Script> {
 	};
 	return {
 		architect: (ctx) => {
+			if (ctx.turn > 0 && ctx.results.at(-1)?.name === "submit_spec" && ctx.results.at(-1)?.isError && !control.architectDouble)
+				return call("submit_spec", { markdown: SPEC(ctx.inputs.length) });
 			if (ctx.turn > 0) return say("waiting");
+			if (control.architectNoAB) return call("submit_spec", { markdown: "# Spec\n\nNo scenarios here, just prose about the product." });
 			control.architectInputs.push(ctx.input);
 			const nUser = ctx.inputs.length;
 			if (control.askFirst && nUser === 1) return call("ask_human", { question: "Which language?" });
+			if (control.architectDouble) return calls(["submit_spec", { markdown: SPEC(1) }], ["submit_spec", { markdown: SPEC(99) }]);
 			return call("submit_spec", { markdown: SPEC(nUser) });
 		},
 		builder: async (ctx) => {
 			if (ctx.turn === 0) {
 				control.builderInputs.push(ctx.input);
+				if (control.hangAtInput === ctx.inputs.length) control.builderHang = true;
 				while (control.builderHang) await new Promise((r) => setTimeout(r, 50));
 				if (!control.builderNoProgress) return call("write", { path: `round-${ctx.inputs.length}.txt`, content: `round ${ctx.inputs.length}\n` });
 			}
 			const ids = [...ctx.inputs.at(-1)!.matchAll(/\[(F\d+)\] \([a-z]+, BLOCKING/g)].map((m) => m[1]!);
-			return call("report_done", { summary: `round ${ctx.inputs.length}`, responses: ids.map((findingId) => ({ findingId, status: "fixed" })) });
+			const plan = ids.length ? (control.responsePlan.shift() ?? "ok") : "ok";
+			const responses =
+				plan === "omit"
+					? []
+					: ids.map((findingId) =>
+							plan === "wontfix-noreason" ? { findingId, status: "wontfix" } : plan === "wontfix" ? { findingId, status: "wontfix", reason: "out of scope for the spec" } : { findingId, status: "fixed" },
+						);
+			return call("report_done", { summary: `round ${ctx.inputs.length}`, responses });
 		},
 		helper: () => say("helper"),
 		reviewer: reviewer("reviewer"),
