@@ -1,4 +1,35 @@
+# dependencies
 node_modules/
+
+# build output (the project runs via tsx; nothing is built, but keep these out if a build is added)
+dist/
+build/
+*.tsbuildinfo
+coverage/
+
+# environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# local state: factory storage, sockets, test and dry-run work dirs
+.factory/
 .factory-test/
+*.sqlite
+*.sqlite-*
 *.sqlite*
+*.db
+*.sock
 dryrun-work/
+
+# logs
+*.log
+logs/
+npm-debug.log*
+
+# editors / OS
+.DS_Store
+.vscode/
+.idea/

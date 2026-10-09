@@ -1,4 +1,4 @@
-# Deviations from `software_factory_design.md`
+# Deviations from the design spec ([`docs/design-spec.md`](docs/design-spec.md))
 
 Each entry lists what the spec says, what was built, and why. When the spec named something that doesn't exist or
 doesn't work, I took the closest faithful approach.

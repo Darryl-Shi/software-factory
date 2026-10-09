@@ -1,184 +1,136 @@
 # software-factory
 
-A software factory built on **Pi Durable** (`@earendil-works/pi-durable@1.1.0`) and Pi's extension system. It implements
-`software_factory_design.md`: a request goes through an architecture discussion, a spec, an unattended build by one builder
-(plus the helpers it spawns), a whole-product review against the spec with enforced findings and evidence, delivery to
-GitHub and CI. It involves a human only for the discussion and for approvals.
+A general-purpose, interface-agnostic software factory built on **Pi Durable** (`@earendil-works/pi-durable@1.1.0`).
+You give it a software request for a project. It runs an architecture discussion with you, writes a spec, builds the
+product unattended, reviews the whole product against the spec, and delivers it to GitHub: a push to `main` for a new
+repo, a pull request for an existing one. It also waits for CI and can merge. You are involved only in the discussion
+and at the approval gates you turn on.
 
-- **Core** (`src/core/`): model-free and interface-agnostic. It holds:
-  - the state machine, a durable Pi Durable Task;
-  - the agent bridge, which enforces the findings and evidence rules;
-  - projects and layered settings;
-  - durable pending asks.
+- **The core is model-free and durable** (`src/core/`). It is a state machine that runs as a Pi Durable Task, plus the
+  agent bridge, projects, layered settings and durable pending asks. It never calls a model: it configures role
+  Conversations (architect, builder, reviewer, plus the builder's helpers) and reads what they submit through the bridge.
+  Its whole outside surface is a set of operations and an event stream (`FactoryCore` in `src/core/types.ts`).
+- **Everything else is an extension** (`src/extensions/`). That covers interfaces, intake, repo, delivery and the
+  execution environment, plus the worker extensions that give agents their tools.
+- **v1 ships one interface: a CLI.** It is a Unix-socket server inside the factory process plus the `factory` terminal
+  client. v1 has no intake extension, so runs start from the CLI.
 
-  It exposes only operations and events (`FactoryCore`, §3.6).
-- **Factory extensions** (`src/extensions/`):
-  - `github` (repo) and `github-delivery` (push-main / PR, CI modes `off` / `if-present` / `required`);
-  - `local-worktree` (per-run worktree, every command run inside `@anthropic-ai/sandbox-runtime`);
-  - `cli` (the interface: a socket server plus the `factory` terminal client with attach view and settings menu).
-- **Worker extensions** (`src/extensions/workers/`) are plain Pi Durable extensions:
-  - `coding`, `coding-readonly`, `subagent` (helpers as owned Conversations), `test-runner`, `browser` (an HTTP client);
-  - the role prompt sections.
+The design is in [`docs/design-spec.md`](docs/design-spec.md). Every place the code differs from it is listed in
+[`DEVIATIONS.md`](DEVIATIONS.md).
 
-See `DEVIATIONS.md` for every place this differs from the spec.
+## Status
+
+- **v1 was built in October 2026.**
+- **Verified so far:** the test suite (66 tests) and a scripted end-to-end dry run of the spec's §8 trial plan (50/50
+  checks, [`docs/dry-run-report.md`](docs/dry-run-report.md)). Both use a fake GitHub on the local disk and scripted
+  agents in place of models.
+- **Not yet done:** a live trial against github.com with real models. The real-GitHub client (`GhApiHost`) has only
+  been tested against a fake `gh` binary, and the role prompts have not been tested with real models.
 
 ## Requirements
 
-- Node.js ≥ 22 (tested on 22.23). `npm install`.
-- Linux: `bubblewrap` and `socat` for the sandbox (`sudo apt install bubblewrap socat`). macOS uses `sandbox-exec`.
-- `git`. For real GitHub you also need `gh` (the GitHub CLI) and a token (see *Going live* below).
-- Model credentials for the roles' providers, read by pi-ai from the environment: `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` for the defaults.
+- **Node.js ≥ 22** (tested on 22.23).
+- **`git`.**
+- **For the sandbox:**
+  - Linux: `bubblewrap` and `socat` (`sudo apt install bubblewrap socat`).
+  - macOS: `sandbox-exec`.
+- **For real GitHub:** the `gh` CLI and a token or a GitHub App. See [configuration](docs/configuration.md#github-identity).
+- **For real models:** the providers' API keys in the environment. pi-ai reads them, for example `ANTHROPIC_API_KEY`
+  and `OPENAI_API_KEY` for the default roles.
 
-`factory doctor` checks all of these.
+`bin/factory doctor` checks the model credentials, the sandbox, the GitHub identity and `gh`.
 
-## Running
+## Install
 
 ```sh
-bin/factory serve                       # the one process that owns storage + core; listens on ~/.factory/factory.sock
-bin/factory project create todo --repo me/todo
-bin/factory run todo "CLI todo tool: add/list/done/remove, JSON file storage, tests" --attach
-# or the shorthand that creates the project and starts its first run:
-bin/factory run todo --repo me/todo "CLI todo tool: …"
+npm install
+bin/factory --help
 ```
 
-`factory serve` options:
-- `--config <path>` (default `~/.factory/config.yaml`, or `$FACTORY_CONFIG`)
-- `--socket <path>`
-- `--fake-github <dir>`: a local fake GitHub with bare remotes and a local CI runner; no token needed
-- `--scripted`: the scripted demo agents, no model credentials needed
+There is no build step: `bin/factory` runs `src/cli.ts` through `tsx`.
 
-Client commands talk to the server over its socket (`$FACTORY_SOCKET` overrides it):
+## Quickstart
+
+**Without credentials.** This drives the whole §8 trial through the CLI. It uses a fake GitHub with a local CI runner,
+scripted agents, SQLite storage and the real sandbox, and takes about 2 minutes:
+
+```sh
+npm run dry-run          # DRYRUN_DIR=/some/dir to choose where it writes; report.md is the result
+```
+
+**With real GitHub and models.** Set `GH_TOKEN` and the model keys, then:
+
+```sh
+bin/factory doctor
+bin/factory serve &                                   # the one process that owns storage and the core
+bin/factory run todo --repo me/todo "CLI todo tool: add/list/done/remove, JSON file storage, tests" --attach
+```
+
+`run --repo` creates the project if it doesn't exist. `--attach` opens the live view, where you answer the
+architect's questions and the approval prompts.
+
+`factory serve` options:
+- `--config <path>`: the default is `~/.factory/config.yaml` (or `$FACTORY_CONFIG`). The file is created if missing.
+- `--socket <path>`
+- `--fake-github <dir>`: bare git remotes and a local CI runner instead of github.com.
+- `--scripted`: registers the scripted agents as provider `scripted`. Roles must be configured with
+  `scripted/<role>` models, as `scripted/architect` is in `scripts/dry-run.ts`.
+- `--ci-poll-ms <n>`
+
+### CLI commands
+
+The commands below talk to `factory serve` over its socket. `$FACTORY_SOCKET` or `--socket` overrides the socket path.
 
 ```
 factory project create <name> --repo owner/name | project list
 factory run <project> [--repo owner/name] [--title t] "<request>" [--attach]
 factory runs [--project p] [--json]          factory status <run> [--json]
-factory attach <run> [--no-input]            live view: run state, the active role's transcript incl. helpers,
-                                             events; answers questions / approvals / escalations at the prompt
+factory attach <run> [--no-input]            live view; answers questions / approvals / escalations
 factory transcript <run> [architect|builder|reviewer|<conversationId>] [--json]
 factory answer <run> "<text>"                factory approve <run> <spec|delivery|merge>
 factory reject <run> <gate> "<feedback>"     factory findings <run> <delivery|merge> '<json>' | @file.json
 factory escalation <run> accept | more <N> | abort
 factory cancel <run> [reason]                factory retry <run>
-factory settings [--project p]               interactive menu (Policy · Roles · Stages), generated from settingsSchema()
-factory settings get [<path>] [--project p]  every value with its source: default | global | project
-factory settings set <path> <value> [--project p]     e.g. policy.approvals '[spec, delivery, merge]'
-factory settings unset <path> [--project p]  project scope: back to inheriting
+factory settings [--project p]               interactive menu generated from settingsSchema()
+factory settings get|set|unset <path> [<value>] [--project p]
 factory doctor
 ```
-
-## Configuration
-
-`~/.factory/config.yaml` is plain data in the shape of spec §5. Every setting resolves in layers: schema default, then the
-global value (top level), then the project value (`projects.<name>`). Objects merge key by key; lists and scalars replace.
-`storage` is global only. Changes are validated on save against the schema, the owning extension's `validate`, and the
-core rules, applied to the effective config of every affected project. An invalid change is rejected and the file is left
-untouched. Runs pin the effective config, its hash and the Pi Durable version when they start.
-
-```yaml
-version: 1
-roles:
-  architect: { model: anthropic/claude-opus-5-5, thinking: high }     # extensions: [coding-readonly]
-  builder:   { model: anthropic/claude-opus-5-5, thinking: high }     # extensions: [coding, subagent, test-runner]
-  helper:    { model: anthropic/claude-sonnet-5-5, thinking: medium } # extensions: [coding-readonly]
-  reviewer:  { model: openai/gpt-6-sol, thinking: high }              # extensions: [coding-readonly, test-runner, browser]
-policy: { approvals: [spec], reviewRoundCap: 3, escalateOnNoProgress: true }
-storage: { kind: sqlite, path: ~/.factory/factory.sqlite }
-stages:
-  interface: { use: [cli], socket: ~/.factory/factory.sock }
-  repo:
-    use: github
-    visibility: private
-    workdir: ~/factory/work
-    identity: { kind: pat, tokenRef: env:GH_TOKEN }  # or kind: bot (tokenRef), or kind: app (appId, installationId, privateKeyRef: file:/path.pem)
-  delivery:
-    use: github-delivery
-    newRepo: push-main
-    existingRepo: pull-request
-    ci: { mode: if-present, fixRounds: 2, checks: [], noChecksTimeout: 2m }
-  environment:
-    use: local-worktree
-    root: ~/factory/work
-    setupScripts: [scripts/setup.sh, setup.sh, bin/setup]
-    sandbox:
-      enabled: true
-      allowedDomains: [registry.npmjs.org, pypi.org, files.pythonhosted.org, proxy.golang.org]
-      deniedDomains: []
-      denyRead: [~/.factory, ~/.ssh, ~/.config/gh]
-      extraWrite: []
-      unixSockets: auto     # see DEVIATIONS.md (Ubuntu ≥ 24.04 AppArmor userns restriction)
-projects:
-  todo:
-    repo: me/todo
-    stages: { delivery: { ci: { mode: required } } }
-```
-
-Secrets are references: `env:NAME` or `file:/path`. Values are never stored in the config.
 
 ## Tests
 
 ```sh
-npm test            # vitest: 66 tests, about 30 s
-npm run typecheck   # tsc, no emit
+npm test            # vitest, 66 tests, about 30 s; no credentials or network needed
+npm run typecheck   # tsc (noEmit)
 ```
 
 | File | Covers |
 |---|---|
-| `test/machine.test.ts` | Every §4 transition, gates (spec / delivery / merge), rejections, escalations (round cap, no progress, CI cap, no CI checks), fix-round caps, CI modes, cancel / retry, events, pinning, idempotent asks |
-| `test/settings.test.ts` | Layering and source attribution, inherit / unset, validate-on-save (file unchanged), the schema includes the extensions, projects |
-| `test/findings.test.ts` | Review validation (fail ⇔ blocking, evidence and specRef required), human findings, builder responses (wontfix needs a reason), live bridge enforcement, helper role tools |
-| `test/durability.test.ts` | `kill -9` mid-build and at a pending approval (SQLite): resumes at the same round with the same builder Conversation; pending asks survive |
-| `test/sandbox.test.ts` | The real bubblewrap sandbox: role write rules (bash and file tools), git hooks not writable, denyRead, no credential env vars, network allowlist |
-| `test/github-api.test.ts` | `GhApiHost` request shapes, token handling, App JWT exchange (fake `gh` plus a local token server) |
+| `test/machine.test.ts` | State transitions, gates, rejections, escalations, round and fix caps, CI modes, cancel/retry, events, pinning |
+| `test/settings.test.ts` | Layering and source attribution, unset, validate-on-save, extension schemas, projects |
+| `test/findings.test.ts` | Review and findings validation, builder responses, bridge enforcement, helper role tools |
+| `test/durability.test.ts` | `kill -9` mid-build and at a pending approval (SQLite), then resume |
+| `test/sandbox.test.ts` | The real bubblewrap sandbox: write rules, denyRead, no credential env vars, network allowlist |
+| `test/github-api.test.ts` | `GhApiHost` request shapes, token handling, the GitHub App JWT exchange |
 
-Tests use scripted agents (`src/testing/scripted.ts`, built on the pi-ai faux provider) and a fake GitHub
-(`LocalGitHubHost`), so they need no credentials or network. The network-allowlist test tolerates a host without internet.
-
-## Dry run of the §8 trial
-
-```sh
-npm run dry-run     # DRYRUN_DIR=/tmp/x to choose the directory; about 2 minutes
-```
-
-`scripts/dry-run.ts` runs `factory serve` with:
-- SQLite storage;
-- the sandbox on;
-- the fake GitHub with a local CI runner that executes workflow `run:` steps;
-- scripted agents (`src/testing/dry-run-agents.ts`) that write, test and commit a real Node.js todo CLI.
-
-It drives the whole §8 plan through the `factory` CLI:
-- zero-to-MVP with a spec rejection and a `kill -9` mid-build;
-- the incremental PR;
-- delivery and merge gate rejections;
-- CI modes `off` / `required` / `if-present`;
-- the round cap;
-- `todo2` with CI required, then CI failure with `fixRounds 0`;
-- the settings checks.
-
-It writes `report.md`; the last report is in `docs/dry-run-report.md` (50/50 checks).
-
-## Going live on GitHub
-
-1. Create a token for the account or org that will own the throwaway repos. A classic PAT needs `repo` (plus `workflow` if the
-   builder ships `.github/workflows`, and `delete_repo` to clean up). A fine-grained PAT needs:
-   - Administration (create repos): read & write
-   - Contents: read & write
-   - Pull requests: read & write
-   - Workflows: read & write
-   - Checks and Commit statuses: read
-
-   Or use a GitHub App: set `identity.kind: app`, `appId`, `installationId` and `privateKeyRef`.
-2. `export GH_TOKEN=…` (or point `stages.repo.identity.tokenRef` at another `env:`/`file:` ref) and set the model keys.
-3. `bin/factory doctor`, then `bin/factory serve` without `--fake-github` and `--scripted`.
-4. Run §8 by hand, or adapt `scripts/dry-run.ts`. Delete the throwaway repos afterwards.
+Notes:
+- The sandbox tests need bubblewrap (and socat) installed.
+- The durability tests and the fake GitHub write under `os.tmpdir()`. If `/tmp` is a small or quota-limited tmpfs,
+  run `TMPDIR=/path/with/space npm test`.
 
 ## Layout
 
 ```
-src/core/            types, settings (ConfigStore), findings, bridge, run-doc, run-task (the state machine), core (Factory)
-src/extensions/      git helpers, github/{host,repo,delivery}, local-worktree, workers, cli/{server,client}
-src/main.ts          process wiring (models, storage, extensions, interfaces)
-src/cli.ts           `factory` command        bin/factory   launcher (tsx)
-src/testing/         scripted provider, dry-run agents
-scripts/dry-run.ts   §8 dry run               test/          vitest suites
+src/core/                 types (contracts), core (Factory), run-task (state machine), run-doc, bridge, findings, settings
+src/extensions/cli/       interface: socket server + terminal client
+src/extensions/github/    repo `github`, delivery `github-delivery`, GitHub hosts (gh api / local fake)
+src/extensions/local-worktree/   environment: per-run worktree + sandbox-runtime
+src/extensions/workers/   worker extensions (Pi Durable): coding, coding-readonly, subagent, test-runner, browser, role prompts
+src/extensions/git.ts     git helpers
+src/main.ts               process wiring: models, storage, the installed extensions
+src/cli.ts, bin/factory   the `factory` command
+src/testing/              scripted provider and dry-run agents
+scripts/dry-run.ts        the §8 dry run          test/   vitest suites
+docs/                     design spec, architecture, configuration, extensions, dry-run report
 ```
+
+More: [architecture](docs/architecture.md) · [configuration](docs/configuration.md) · [writing extensions](docs/extensions.md)

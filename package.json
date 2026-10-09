@@ -10,7 +10,8 @@
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
+  "private": true,
+  "license": "UNLICENSED",
   "dependencies": {
     "@anthropic-ai/sandbox-runtime": "0.0.79",
     "@earendil-works/chord": "1.1.0",
