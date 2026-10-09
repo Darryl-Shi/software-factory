@@ -5,10 +5,7 @@
 import { Type } from "@earendil-works/pi-ai";
 import { defineExtension, defineTool, section } from "@earendil-works/pi-durable";
 import { runConfigOf } from "../core/run-config.ts";
-import { resolveSecret } from "../core/settings.ts";
-
-export const WEB_SEARCH_MODES = ["turbo", "fast", "basic", "advanced"] as const;
-export const DEFAULT_ENDPOINT = "https://api.parallel.ai/v1/search";
+import { DEFAULT_ENDPOINT, resolveSecret, WEB_SEARCH_MODES } from "../core/settings.ts";
 
 export interface SearchInput {
 	objective: string;

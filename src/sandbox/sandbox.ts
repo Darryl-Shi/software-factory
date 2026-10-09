@@ -1,4 +1,4 @@
-// Environment extension `local-worktree` (spec §3.3, §7): every role works in the run's git worktree; every command it
+// Sandbox (spec §3.3, §7): every role works in the run's git worktree; every command it
 // executes runs inside Anthropic's sandbox runtime (@anthropic-ai/sandbox-runtime, used as a library). In-process file
 // tools are not processes, so the ExecutionEnv applies the same path rules to their readers and writers.
 // Write access is fixed by role: only the builder may write the worktree (and its git dirs); the architect, reviewer
@@ -11,11 +11,10 @@ import type { Context } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { type ExecutionEnv, ExecutionError, FileError, type Result, type ShellExecOptions, type ShellExecResult } from "@earendil-works/pi-durable/env";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
-import { expandHome } from "../core/settings.ts";
-import type { EnvironmentExtension, Role, SettingField, StageCallOptions, Workspace } from "../core/types.ts";
+import { DEFAULT_DENY_READ, expandHome, type Obj } from "../core/settings.ts";
+import type { Role, RunCtx, Workspace } from "../core/types.ts";
 import { gitOut } from "../github/git.ts";
 
-export const DEFAULT_DENY_READ = ["~/.factory", "~/.ssh", "~/.config/gh"];
 export const CREDENTIAL_ENV_VARS = ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "FACTORY_GIT_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "AWS_SECRET_ACCESS_KEY"];
 
 type EnvRecord = {
@@ -27,29 +26,6 @@ type EnvRecord = {
 	scratch: string;
 	sandbox: { enabled: boolean; allowedDomains: string[]; deniedDomains: string[]; denyRead: string[]; extraWrite: string[]; unixSockets: string };
 	setup?: { script: string; exitCode: number };
-};
-
-const sandboxSchema: SettingField = {
-	type: "object",
-	description: "@anthropic-ai/sandbox-runtime policy for every command this environment runs",
-	fields: {
-		enabled: { type: "boolean", default: true, description: "Run commands inside the sandbox runtime (disable only where bubblewrap/sandbox-exec is unavailable, e.g. unit tests)" },
-		allowedDomains: {
-			type: "list",
-			of: { type: "string", description: "domain" },
-			default: ["registry.npmjs.org", "pypi.org", "files.pythonhosted.org", "proxy.golang.org"],
-			description: "Only these domains are reachable (through the host proxy)",
-		},
-		deniedDomains: { type: "list", of: { type: "string", description: "domain" }, default: [], description: "Always denied; wins over allows" },
-		denyRead: { type: "list", of: { type: "string", description: "path" }, default: DEFAULT_DENY_READ, description: "Hidden from every role" },
-		extraWrite: { type: "list", of: { type: "string", description: "path" }, default: [], description: "Added to the builder's worktree + scratch dir" },
-		unixSockets: {
-			type: "enum",
-			values: ["auto", "block", "allow"],
-			default: "auto",
-			description: "Linux: block Unix-socket creation with seccomp (auto = block when the host allows nested user namespaces)",
-		},
-	},
 };
 
 const shellQuote = (argv: readonly string[]) => argv.map((a) => `'${a.replace(/'/g, `'\\''`)}'`).join(" ");
@@ -158,66 +134,85 @@ class SandboxedEnv implements ExecutionEnv {
 	}
 }
 
-export function localWorktree(
-	options: { stateDir?: string } = {},
-): EnvironmentExtension & { sandboxStatus(): { initialized: boolean; unixSockets?: string } } {
-	// Environment records live with the factory's own state (hidden from agents by denyRead ~/.factory).
-	const stateDir = expandHome(options.stateDir ?? "~/.factory/environments");
-	const records = new Map<string, EnvRecord>();
-	let initialized = false;
-	let unixSocketMode: "block" | "allow" | undefined;
-	const network = new Map<string, { allowed: string[]; denied: string[] }>(); // per live env
-	let initPromise: Promise<void> | undefined;
+/** Rules on the `sandbox` settings section (core write limits, §3.3); problems are relative to the section. */
+export function sandboxProblems(sandbox: Obj): string[] {
+	const problems: string[] = [];
+	// extraWrite may never widen into secrets, home or the filesystem root.
+	const home = homedir();
+	const deny = [...(sandbox?.denyRead ?? DEFAULT_DENY_READ), "~/.factory", "~/.ssh"].map(expandHome);
+	for (const w of (sandbox?.extraWrite ?? []) as string[]) {
+		const p = resolve(expandHome(w));
+		if (p === "/" || p === home || within(home, p)) problems.push(`extraWrite: ${w} would make the home directory or the filesystem root writable`);
+		else if (deny.some((d) => within(p, d) || within(d, p))) problems.push(`extraWrite: ${w} overlaps a denied secret path`);
+	}
+	return problems;
+}
 
-	const recordPath = (envId: string) => join(stateDir, `${envId}.json`);
-	const load = (envId: string): EnvRecord => {
-		let r = records.get(envId);
+export class Sandbox {
+	// Environment records live with the factory's own state (hidden from agents by denyRead ~/.factory).
+	private readonly stateDir: string;
+	private readonly records = new Map<string, EnvRecord>();
+	private initialized = false;
+	private unixSocketMode: "block" | "allow" | undefined;
+	private readonly network = new Map<string, { allowed: string[]; denied: string[] }>(); // per live env
+	private initPromise: Promise<void> | undefined;
+
+	constructor(opts: { stateDir: string }) {
+		this.stateDir = expandHome(opts.stateDir);
+	}
+
+	private recordPath(envId: string) {
+		return join(this.stateDir, `${envId}.json`);
+	}
+
+	private load(envId: string): EnvRecord {
+		let r = this.records.get(envId);
 		if (!r) {
-			const p = recordPath(envId);
+			const p = this.recordPath(envId);
 			if (!existsSync(p)) throw new Error(`unknown environment ${envId}`);
 			r = JSON.parse(readFileSync(p, "utf8")) as EnvRecord;
-			records.set(envId, r);
+			this.records.set(envId, r);
 		}
 		return r;
-	};
+	}
 
-	function networkConfig() {
+	private networkConfig() {
 		const allowed = new Set<string>();
 		const denied = new Set<string>();
-		for (const n of network.values()) {
+		for (const n of this.network.values()) {
 			n.allowed.forEach((d) => allowed.add(d));
 			n.denied.forEach((d) => denied.add(d));
 		}
-		return { allowedDomains: [...allowed].filter((d) => !denied.has(d)), deniedDomains: [...denied], ...(unixSocketMode === "allow" ? { allowAllUnixSockets: true } : {}) };
+		return { allowedDomains: [...allowed].filter((d) => !denied.has(d)), deniedDomains: [...denied], ...(this.unixSocketMode === "allow" ? { allowAllUnixSockets: true } : {}) };
 	}
 
-	async function ensureSandbox(rec: EnvRecord) {
-		network.set(rec.envId, { allowed: rec.sandbox.allowedDomains, denied: rec.sandbox.deniedDomains });
-		if (!initialized) {
-			initPromise ??= (async () => {
+	private async ensureSandbox(rec: EnvRecord) {
+		this.network.set(rec.envId, { allowed: rec.sandbox.allowedDomains, denied: rec.sandbox.deniedDomains });
+		if (!this.initialized) {
+			this.initPromise ??= (async () => {
 				const deps = SandboxManager.checkDependencies();
 				if (deps.errors.length) throw new Error(`sandbox runtime unavailable: ${deps.errors.join("; ")}`);
 				const fsBase = { denyRead: [], allowWrite: [], denyWrite: [] };
 				const want = rec.sandbox.unixSockets;
-				unixSocketMode = want === "allow" ? "allow" : "block";
-				await SandboxManager.initialize({ network: networkConfig(), filesystem: fsBase } as any);
+				this.unixSocketMode = want === "allow" ? "allow" : "block";
+				await SandboxManager.initialize({ network: this.networkConfig(), filesystem: fsBase } as any);
 				if (want === "auto" && process.platform === "linux") {
 					// Ubuntu 24.04+ restricts unprivileged user namespaces; the seccomp layer then cannot start.
 					const probe = await SandboxManager.wrapWithSandbox("true");
 					const { spawnSync } = await import("node:child_process");
 					const r = spawnSync("bash", ["-c", probe], { encoding: "utf8" });
 					if (r.status !== 0 && /setgroups|CAP_SYS_ADMIN|nested userns/i.test(r.stderr)) {
-						unixSocketMode = "allow";
-						SandboxManager.updateConfig({ network: networkConfig(), filesystem: fsBase } as any);
+						this.unixSocketMode = "allow";
+						SandboxManager.updateConfig({ network: this.networkConfig(), filesystem: fsBase } as any);
 					}
 				}
-				initialized = true;
+				this.initialized = true;
 			})();
-			await initPromise;
-		} else SandboxManager.updateConfig({ ...(SandboxManager.getConfig() as any), network: networkConfig() });
+			await this.initPromise;
+		} else SandboxManager.updateConfig({ ...(SandboxManager.getConfig() as any), network: this.networkConfig() });
 	}
 
-	function policy(rec: EnvRecord) {
+	private policy(rec: EnvRecord) {
 		const deny = rec.sandbox.denyRead.map((p) => real(expandHome(p)));
 		const builder = rec.role === "builder";
 		const writeRoots = [rec.scratch, ...(builder ? [rec.worktree, ...(rec.gitCommonDir ? [rec.gitCommonDir] : []), ...rec.sandbox.extraWrite.map(expandHome)] : [])].map(real);
@@ -246,7 +241,7 @@ export function localWorktree(
 		};
 		const wrap = async (cmd: string, signal?: AbortSignal) => {
 			if (!rec.sandbox.enabled) return cmd;
-			await ensureSandbox(rec);
+			await this.ensureSandbox(rec);
 			// srt points TMPDIR at its shared /tmp/claude; point it back at this environment's scratch dir.
 			const inner = `export TMPDIR=${shellQuote([shellEnv.TMPDIR!])}\n${cmd}`;
 			return SandboxManager.wrapWithSandbox(
@@ -262,89 +257,63 @@ export function localWorktree(
 		return { deny, writeRoots, denyWrite, shellEnv, wrap };
 	}
 
-	return {
-		kind: "environment",
-		name: "local-worktree",
-		settings: {
-			schema: {
-				root: { type: "string", default: "~/factory/work", description: "Scratch dirs and environment records" },
-				setupScripts: {
-					type: "list",
-					of: { type: "string", description: "path" },
-					default: ["scripts/setup.sh", "setup.sh", "bin/setup"],
-					description: "The first of these that exists in the worktree runs at provision (sandboxed, builder rights)",
-				},
-				sandbox: sandboxSchema,
-			},
-			validate(value) {
-				const v = value as Record<string, any>;
-				const problems: string[] = [];
-				// Core write limits (§3.3): extraWrite may never widen into secrets, home or the filesystem root.
-				const home = homedir();
-				const deny = [...(v?.sandbox?.denyRead ?? DEFAULT_DENY_READ), "~/.factory", "~/.ssh"].map(expandHome);
-				for (const w of (v?.sandbox?.extraWrite ?? []) as string[]) {
-					const p = resolve(expandHome(w));
-					if (p === "/" || p === home || within(home, p)) problems.push(`sandbox.extraWrite: ${w} would make the home directory or the filesystem root writable`);
-					else if (deny.some((d) => within(p, d) || within(d, p))) problems.push(`sandbox.extraWrite: ${w} overlaps a denied secret path`);
-				}
-				return problems;
-			},
-		},
-		sandboxStatus: () => ({ initialized, ...(unixSocketMode ? { unixSockets: unixSocketMode } : {}) }),
+	status(): { initialized: boolean; unixSockets?: string } {
+		return { initialized: this.initialized, ...(this.unixSocketMode ? { unixSockets: this.unixSocketMode } : {}) };
+	}
 
-		async provision(ws: Workspace, role: Role, opts: StageCallOptions) {
-			const root = expandHome(opts.settings.root ?? "~/factory/work");
-			const envId = `${opts.runId}-${role}`;
-			const existing = existsSync(recordPath(envId)) ? load(envId) : undefined;
-			if (existing) return { envId, cwd: existing.cwd };
-			const sb = opts.settings.sandbox ?? {};
-			const rec: EnvRecord = {
-				envId,
-				role,
-				worktree: ws.path,
-				cwd: ws.path,
-				scratch: join(root, "scratch", envId),
-				sandbox: {
-					enabled: sb.enabled !== false,
-					allowedDomains: sb.allowedDomains ?? [],
-					deniedDomains: sb.deniedDomains ?? [],
-					denyRead: sb.denyRead ?? DEFAULT_DENY_READ,
-					extraWrite: sb.extraWrite ?? [],
-					unixSockets: sb.unixSockets ?? "auto",
-				},
-			};
-			const common = await gitOut(ws.path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).catch(() => "");
-			if (common) rec.gitCommonDir = common;
-			mkdirSync(rec.scratch, { recursive: true });
-			if (role === "builder") {
-				const script = ((opts.settings.setupScripts ?? []) as string[]).find((s) => existsSync(join(ws.path, s)));
-				if (script) {
-					const p = policy(rec);
-					const env = new SandboxedEnv(rec, ws.path, p.writeRoots, p.denyWrite, p.deny, p.shellEnv, p.wrap);
-					let log = "";
-					const r = await env.exec(`bash ${shellQuote([script])}`, { timeout: 900, onOutput: (t) => (log += t) }, BACKGROUND_CONTEXT);
-					rec.setup = { script, exitCode: r.ok ? r.value.exitCode : -1 };
-					writeFileSync(join(rec.scratch, "setup.log"), log);
-				}
+	/** Reads the run's pinned `workdir` (scratch root) and `sandbox.*` (including `setupScripts`). */
+	async provision(ws: Workspace, role: Role, rc: RunCtx): Promise<{ envId: string; cwd: string }> {
+		const root = expandHome(rc.config.workdir ?? "~/factory/work");
+		const envId = `${rc.runId}-${role}`;
+		const existing = existsSync(this.recordPath(envId)) ? this.load(envId) : undefined;
+		if (existing) return { envId, cwd: existing.cwd };
+		const sb = rc.config.sandbox ?? {};
+		const rec: EnvRecord = {
+			envId,
+			role,
+			worktree: ws.path,
+			cwd: ws.path,
+			scratch: join(root, "scratch", envId),
+			sandbox: {
+				enabled: sb.enabled !== false,
+				allowedDomains: sb.allowedDomains ?? [],
+				deniedDomains: sb.deniedDomains ?? [],
+				denyRead: sb.denyRead ?? DEFAULT_DENY_READ,
+				extraWrite: sb.extraWrite ?? [],
+				unixSockets: sb.unixSockets ?? "auto",
+			},
+		};
+		const common = await gitOut(ws.path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).catch(() => "");
+		if (common) rec.gitCommonDir = common;
+		mkdirSync(rec.scratch, { recursive: true });
+		if (role === "builder") {
+			const script = ((sb.setupScripts ?? []) as string[]).find((s) => existsSync(join(ws.path, s)));
+			if (script) {
+				const p = this.policy(rec);
+				const env = new SandboxedEnv(rec, ws.path, p.writeRoots, p.denyWrite, p.deny, p.shellEnv, p.wrap);
+				let log = "";
+				const r = await env.exec(`bash ${shellQuote([script])}`, { timeout: 900, onOutput: (t) => (log += t) }, BACKGROUND_CONTEXT);
+				rec.setup = { script, exitCode: r.ok ? r.value.exitCode : -1 };
+				writeFileSync(join(rec.scratch, "setup.log"), log);
 			}
-			mkdirSync(dirname(recordPath(envId)), { recursive: true });
-			writeFileSync(recordPath(envId), JSON.stringify(rec, null, 2));
-			records.set(envId, rec);
-			return { envId, cwd: rec.cwd };
-		},
+		}
+		mkdirSync(dirname(this.recordPath(envId)), { recursive: true });
+		writeFileSync(this.recordPath(envId), JSON.stringify(rec, null, 2));
+		this.records.set(envId, rec);
+		return { envId, cwd: rec.cwd };
+	}
 
-		env(input) {
-			const rec = load(input.envId);
-			const p = policy(rec);
-			return new SandboxedEnv(rec, input.cwd ?? rec.cwd, p.writeRoots, p.denyWrite, p.deny, p.shellEnv, p.wrap);
-		},
+	env(input: { conversationId: string; cwd?: string; envId: string }): ExecutionEnv {
+		const rec = this.load(input.envId);
+		const p = this.policy(rec);
+		return new SandboxedEnv(rec, input.cwd ?? rec.cwd, p.writeRoots, p.denyWrite, p.deny, p.shellEnv, p.wrap);
+	}
 
-		async dispose(envId: string) {
-			network.delete(envId);
-			records.delete(envId);
-			// The worktree stays for inspection; only the environment record is retired.
-			const p = recordPath(envId);
-			if (existsSync(p)) writeFileSync(p, JSON.stringify({ ...JSON.parse(readFileSync(p, "utf8")), disposed: true }, null, 2));
-		},
-	};
+	async dispose(envId: string): Promise<void> {
+		this.network.delete(envId);
+		this.records.delete(envId);
+		// The worktree stays for inspection; only the environment record is retired.
+		const p = this.recordPath(envId);
+		if (existsSync(p)) writeFileSync(p, JSON.stringify({ ...JSON.parse(readFileSync(p, "utf8")), disposed: true }, null, 2));
+	}
 }

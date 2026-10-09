@@ -61,18 +61,22 @@ async function main() {
 
 async function doctor() {
 	const { Factory } = await import("./core/core.ts");
-	const { createModels, DEFAULT_CONFIG } = await import("./main.ts");
+	const { createModels, DEFAULT_CONFIG, factoryHome } = await import("./main.ts");
 	const { SandboxManager } = await import("@anthropic-ai/sandbox-runtime");
 	const { expandHome } = await import("./core/settings.ts");
-	const { githubRepo } = await import("./github/repo.ts");
-	const { githubDelivery } = await import("./github/delivery.ts");
+	const { GitHub } = await import("./github/github.ts");
 	const { GhApiHost, resolveSecret } = await import("./github/host.ts");
-	const { localWorktree } = await import("./sandbox/sandbox.ts");
+	const { Sandbox } = await import("./sandbox/sandbox.ts");
 	const { existsSync } = await import("node:fs");
+	const { join } = await import("node:path");
 	const configPath = expandHome(typeof flags.config === "string" ? flags.config : (process.env.FACTORY_CONFIG ?? DEFAULT_CONFIG));
 	const models = await createModels(!!flags.scripted);
-	const host = new GhApiHost();
-	const f = new Factory({ configPath, models, extensions: [githubRepo(host), githubDelivery(host), localWorktree()] });
+	const f = new Factory({
+		configPath,
+		models,
+		github: new GitHub(new GhApiHost()),
+		sandbox: new Sandbox({ stateDir: join(factoryHome(configPath), "environments") }),
+	});
 	const eff = existsSync(configPath) ? f.config.effective({ global: true }) : f.config.effective({ global: true }, { version: 1 });
 	const line = (ok: boolean | "warn", s: string) => console.log(`${ok === true ? "ok  " : ok === "warn" ? "warn" : "FAIL"}  ${s}`);
 	line(true, `config ${configPath}${existsSync(configPath) ? "" : " (missing: defaults)"}`);
@@ -85,7 +89,7 @@ async function doctor() {
 	}
 	const deps = SandboxManager.checkDependencies();
 	line(deps.errors.length === 0, `sandbox runtime: ${deps.errors.join("; ") || "bubblewrap/socat present"}`);
-	const id = eff.stages.repo.identity ?? {};
+	const id = eff.github.identity ?? {};
 	const tokenOk = id.kind === "app" ? !!resolveSecret(id.privateKeyRef) : !!resolveSecret(id.tokenRef ?? "env:GH_TOKEN");
 	line(tokenOk ? true : "warn", `GitHub identity (${id.kind ?? "pat"}): ${tokenOk ? "credential found" : `no credential at ${id.kind === "app" ? id.privateKeyRef : (id.tokenRef ?? "env:GH_TOKEN")}`}`);
 	const { run } = await import("./github/git.ts");

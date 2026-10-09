@@ -5,7 +5,6 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { homedir } from "node:os";
 import { dirname } from "node:path";
 import YAML from "yaml";
-import { DEFAULT_ENDPOINT, WEB_SEARCH_MODES } from "../agents/web-search.ts";
 import { type EffectiveSettings, FactoryError, type Project, type Scope, type SettingField, type SettingSource } from "./types.ts";
 
 export type Obj = Record<string, any>;
@@ -26,7 +25,23 @@ export function resolveSecret(ref: string | undefined): string | undefined {
 	return undefined; // store: references need a secret-store integration (not in v1)
 }
 
-// ---------------------------------------------------------------- core schema (policy + roles; web and storage are global-only)
+// ---------------------------------------------------------------- the schema (web, storage and version are global-only)
+export const WEB_SEARCH_MODES = ["turbo", "fast", "basic", "advanced"] as const;
+export const DEFAULT_ENDPOINT = "https://api.parallel.ai/v1/search";
+export const DEFAULT_DENY_READ = ["~/.factory", "~/.ssh", "~/.config/gh"];
+
+const identity: SettingField = {
+	type: "object",
+	description: "GitHub identity the core uses (never visible to agents)",
+	fields: {
+		kind: { type: "enum", values: ["pat", "bot", "app"], default: "pat", description: "own account PAT, bot account PAT, or GitHub App" },
+		tokenRef: { type: "secretRef", default: "env:GH_TOKEN", description: "PAT reference (pat/bot)" },
+		appId: { type: "number", description: "GitHub App ID (app)" },
+		installationId: { type: "number", description: "GitHub App installation ID (app)" },
+		privateKeyRef: { type: "secretRef", description: "GitHub App private key reference, e.g. file:~/.factory/app.pem (app)" },
+	},
+};
+
 const thinking: SettingField = { type: "enum", values: ["off", "low", "medium", "high"], description: "Thinking level" };
 function roleField(model: string, level: string, description: string): SettingField {
 	return {
@@ -42,6 +57,7 @@ function roleField(model: string, level: string, description: string): SettingFi
 export function coreSchema(): Record<string, SettingField> {
 	return {
 		version: { type: "number", default: 1, description: "Config format version", min: 1, max: 1 },
+		workdir: { type: "string", default: "~/factory/work", description: "Where clones, per-run worktrees and the roles' scratch dirs live" },
 		roles: {
 			type: "object",
 			description: "Role → model and thinking level",
@@ -69,6 +85,52 @@ export function coreSchema(): Record<string, SettingField> {
 					of: { type: "enum", values: ["architect", "builder", "reviewer"], description: "role" },
 					default: ["architect", "builder", "reviewer"],
 					description: "Roles a human can message while a run is going (drop reviewer for an independent review)",
+				},
+			},
+		},
+		github: {
+			type: "object",
+			description: "GitHub: identity and new-repo visibility",
+			fields: {
+				identity,
+				visibility: { type: "enum", values: ["private", "public"], default: "private", description: "Visibility of repos the factory creates" },
+			},
+		},
+		ci: {
+			type: "object",
+			description: "CI on the delivered commit",
+			fields: {
+				mode: { type: "enum", values: ["off", "if-present", "required"], default: "if-present", description: "off | if-present | required" },
+				fixRounds: { type: "number", default: 2, min: 0, max: 3, description: "CI fix rounds before escalation (0–3)" },
+				checks: { type: "list", of: { type: "string", description: "check name" }, default: [], description: "Names of the checks that count; empty = all" },
+				noChecksTimeout: { type: "string", default: "2m", description: "If no checks appear by then, the repo has no CI (e.g. 2m, 90s)" },
+			},
+		},
+		sandbox: {
+			type: "object",
+			description: "@anthropic-ai/sandbox-runtime policy for every command a role runs",
+			fields: {
+				enabled: { type: "boolean", default: true, description: "Run commands inside the sandbox runtime (disable only where bubblewrap/sandbox-exec is unavailable, e.g. unit tests)" },
+				allowedDomains: {
+					type: "list",
+					of: { type: "string", description: "domain" },
+					default: ["registry.npmjs.org", "pypi.org", "files.pythonhosted.org", "proxy.golang.org"],
+					description: "Only these domains are reachable (through the host proxy)",
+				},
+				deniedDomains: { type: "list", of: { type: "string", description: "domain" }, default: [], description: "Always denied; wins over allows" },
+				denyRead: { type: "list", of: { type: "string", description: "path" }, default: DEFAULT_DENY_READ, description: "Hidden from every role" },
+				extraWrite: { type: "list", of: { type: "string", description: "path" }, default: [], description: "Added to the builder's worktree + scratch dir" },
+				unixSockets: {
+					type: "enum",
+					values: ["auto", "block", "allow"],
+					default: "auto",
+					description: "Linux: block Unix-socket creation with seccomp (auto = block when the host allows nested user namespaces)",
+				},
+				setupScripts: {
+					type: "list",
+					of: { type: "string", description: "path" },
+					default: ["scripts/setup.sh", "setup.sh", "bin/setup"],
+					description: "The first of these that exists in the worktree runs at provision (sandboxed, builder rights)",
 				},
 			},
 		},
@@ -104,6 +166,21 @@ export function coreSchema(): Record<string, SettingField> {
 
 export const GLOBAL_ONLY = ["storage", "version", "web"];
 export const PROJECT_ONLY = ["repo"];
+
+/** Refuse a config file that still has the removed top-level `stages` or `workers` sections (no migrator). */
+export function assertNoLegacySections(configPath: string): void {
+	if (!existsSync(configPath)) return;
+	const doc = YAML.parseDocument(readFileSync(configPath, "utf8"));
+	if (doc.errors.length > 0) return; // the config store reports parse errors
+	const raw = doc.toJS();
+	if (!isObj(raw)) return;
+	const found = ["stages", "workers"].filter((k) => k in raw);
+	if (found.length === 0) return;
+	throw new FactoryError(
+		"invalid",
+		`config uses removed sections (${found.join(", ")}); move stages.repo.{identity,visibility} → github.*, stages.repo.workdir and stages.environment.root → workdir, stages.delivery.ci.* → ci.*, stages.environment.sandbox.* → sandbox.*, stages.environment.setupScripts → sandbox.setupScripts, stages.interface.{host,port} → web.*, workers.web-search.* → webSearch.*`,
+	);
+}
 
 // ---------------------------------------------------------------- schema helpers
 export function fieldAt(schema: Record<string, SettingField>, path: string[]): SettingField | undefined {

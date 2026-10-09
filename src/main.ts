@@ -7,10 +7,9 @@ import type { Models } from "@earendil-works/pi-ai";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import { Factory } from "./core/core.ts";
 import { expandHome } from "./core/settings.ts";
-import { githubDelivery } from "./github/delivery.ts";
+import { GitHub } from "./github/github.ts";
 import { GhApiHost, type GitHubHost, LocalGitHubHost } from "./github/host.ts";
-import { githubRepo } from "./github/repo.ts";
-import { localWorktree } from "./sandbox/sandbox.ts";
+import { Sandbox } from "./sandbox/sandbox.ts";
 import { startWebServer } from "./web/server.ts";
 
 export interface ProcessOptions {
@@ -61,11 +60,8 @@ export async function startFactoryProcess(opts: ProcessOptions = {}): Promise<Fa
 	const factory = new Factory({
 		configPath,
 		models: await createModels(!!opts.scripted),
-		extensions: [
-			githubRepo(host),
-			githubDelivery(host),
-			localWorktree({ stateDir: join(factoryHome(configPath), "environments") }),
-		],
+		github: new GitHub(host),
+		sandbox: new Sandbox({ stateDir: join(factoryHome(configPath), "environments") }),
 		...(opts.ciPollMs ? { ciPollMs: opts.ciPollMs } : {}),
 		log,
 	});

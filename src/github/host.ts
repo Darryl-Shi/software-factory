@@ -1,4 +1,4 @@
-// GitHub access for the `github` repo extension and the `github-delivery` extension.
+// GitHub access for the `GitHub` class (./github.ts).
 // - GhApiHost: the real thing, over `gh api` (REST) and git over HTTPS, with a PAT, a bot PAT or a GitHub App identity.
 // - LocalGitHubHost: a fake GitHub for tests and dry runs: bare git remotes on disk, PRs and check runs in a JSON
 //   file, and a CI runner that executes the `run:` steps of .github/workflows/*.yml at the pushed commit.
@@ -80,7 +80,7 @@ export class GhApiHost implements GitHubHost {
 			return body.token;
 		}
 		const t = resolveSecret(id.tokenRef ?? "env:GH_TOKEN");
-		if (!t) throw new Error(`no GitHub token: set ${id.tokenRef ?? "env:GH_TOKEN"} (stages.repo.identity.tokenRef)`);
+		if (!t) throw new Error(`no GitHub token: set ${id.tokenRef ?? "env:GH_TOKEN"} (github.identity.tokenRef)`);
 		return t;
 	}
 

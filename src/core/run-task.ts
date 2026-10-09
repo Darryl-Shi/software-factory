@@ -13,6 +13,8 @@ import {
 } from "@earendil-works/pi-durable";
 import { createEditTool, createWriteTool } from "@earendil-works/pi-durable/tools";
 import { ROLE_TOOLS } from "../agents/tools.ts";
+import type { GitHub } from "../github/github.ts";
+import type { Sandbox } from "../sandbox/sandbox.ts";
 import { BridgeDoc, type BridgeTool, bridgeToolsNotFor, EnvDoc } from "./bridge.ts";
 import { formatFinding, validateReview } from "./findings.ts";
 import { messageContent } from "./messages.ts";
@@ -22,8 +24,7 @@ import { parseDuration } from "./settings.ts";
 import { addCost, sumUsage, type UsageSum } from "./usage.ts";
 import type {
 	CiStatus,
-	DeliveryExtension,
-	EnvironmentExtension,
+	DeliveryContext,
 	EscalationInfo,
 	Finding,
 	FindingResponse,
@@ -31,9 +32,9 @@ import type {
 	Notice,
 	PendingAsk,
 	Question,
-	RepoExtension,
 	ReviewResult,
 	Role,
+	RunCtx,
 	RunState,
 } from "./types.ts";
 
@@ -42,9 +43,8 @@ type Checkpoint = { phase: Phase; n: number };
 type RunInput = { runId: string; start: RunState };
 
 export interface CoreServices {
-	repo(cfg: Record<string, any>): RepoExtension;
-	delivery(cfg: Record<string, any>): DeliveryExtension;
-	environment(cfg: Record<string, any>): EnvironmentExtension;
+	github: GitHub;
+	sandbox: Sandbox;
 	bridge: Extension;
 	/** Resolves when the run's document changes (answers, approvals); never rejects. */
 	changed(runId: string, ms: number): Promise<void>;
@@ -111,12 +111,9 @@ export function createRunTask(svc: CoreServices) {
 		return (d.pinned.config.policy?.approvals ?? []) as Gate[];
 	}
 
-	function stage(d: RunDocState, name: string): Record<string, any> {
-		return d.pinned.config.stages?.[name] ?? {};
-	}
-
-	function opts(d: RunDocState, name: string) {
-		return { runId: d.id, settings: stage(d, name), stages: d.pinned.config.stages ?? {} };
+	/** What `GitHub` and `Sandbox` calls get: the run id and the run's pinned config. */
+	function rc(d: RunDocState): RunCtx {
+		return { runId: d.id, config: d.pinned.config };
 	}
 
 	async function createRoleConversation(rt: TaskRuntime<any, any, any, any>, tx: Tx, d: RunDocState, role: Role): Promise<string> {
@@ -343,7 +340,7 @@ export function createRunTask(svc: CoreServices) {
 				"",
 				d.artifacts.spec?.text ?? "",
 				"",
-				...(stage(d, "delivery").ci?.mode === "required"
+				...(d.pinned.config.ci?.mode === "required"
 					? [`Delivery constraint — CI: required. The delivered commit must pass the repo's CI checks, so the repo must have CI that runs the tests.`]
 					: []),
 				`When the product meets the spec, call report_done (responses: []).`,
@@ -409,11 +406,9 @@ export function createRunTask(svc: CoreServices) {
 		},
 
 		PREPARING: async (rt, c, d) => {
-			const repo = svc.repo(stage(d, "repo"));
-			const ws = await repo.open(d.repo, opts(d, "repo"));
-			const env = svc.environment(stage(d, "environment"));
+			const ws = await svc.github.open(d.repo, rc(d));
 			const envs: RunDocState["envs"] = {};
-			for (const role of ["architect", "builder", "reviewer", "helper"] as Role[]) envs[role] = await env.provision(ws, role, opts(d, "environment"));
+			for (const role of ["architect", "builder", "reviewer", "helper"] as Role[]) envs[role] = await svc.sandbox.provision(ws, role, rc(d));
 			await transition(rt, c, d.id, async (doc, tx): Promise<Phase> => {
 				doc.workspace = ws;
 				doc.envs = envs;
@@ -452,8 +447,7 @@ export function createRunTask(svc: CoreServices) {
 		},
 
 		SPEC_READY: async (rt, c, d) => {
-			const repo = svc.repo(stage(d, "repo"));
-			await repo.writeArtifact(d.workspace!, "docs/spec.md", d.artifacts.spec!.text, `docs: spec v${d.artifacts.spec!.version} (factory run ${d.id})`);
+			await svc.github.writeArtifact(d.workspace!, "docs/spec.md", d.artifacts.spec!.text, `docs: spec v${d.artifacts.spec!.version} (factory run ${d.id})`);
 			await transition(rt, c, d.id, async (doc, tx): Promise<Phase> => {
 				const next = toGateOrNext(doc, "spec", "BUILDING");
 				if (next === "BUILDING") await startBuild(rt, tx, doc);
@@ -491,7 +485,7 @@ export function createRunTask(svc: CoreServices) {
 			if (resp.type === "approve" && gate === "merge") {
 				const pr = d.artifacts.delivery?.pr;
 				if (!pr) throw new Error("merge approved but the delivery has no PR");
-				await svc.repo(stage(d, "repo")).merge(pr, "squash", opts(d, "repo"));
+				await svc.github.merge(pr, "squash", rc(d));
 			}
 			await transition(rt, c, d.id, async (doc, tx): Promise<Phase> => {
 				delete doc.pendingAsk;
@@ -525,7 +519,7 @@ export function createRunTask(svc: CoreServices) {
 			const findings = d.pending.builderFindings ?? [];
 			const ids = findings.filter((f) => f.blocking).map((f) => f.id!);
 			const r = await runAgent(rt, c, d, "builder", conv, key, builderInput(d), ["report_done"], ids);
-			const diff = await svc.repo(stage(d, "repo")).diff(d.workspace!, d.workspace!.baseRef);
+			const diff = await svc.github.diff(d.workspace!, d.workspace!.baseRef);
 			const noProgress =
 				d.counters.buildSeq > 1 && d.pinned.config.policy?.escalateOnNoProgress !== false && diff.fingerprint === d.lastFingerprint;
 			await transition(rt, c, d.id, async (doc, tx): Promise<Phase> => {
@@ -552,7 +546,7 @@ export function createRunTask(svc: CoreServices) {
 		REVIEWING: async (rt, c, d) => {
 			const conv = d.conversations.reviewers.find((x) => x.seq === d.counters.reviewSeq)!.id;
 			const key = `${d.id}:REVIEWING:${d.counters.reviewSeq}`;
-			const diff = await svc.repo(stage(d, "repo")).diff(d.workspace!, d.workspace!.baseRef);
+			const diff = await svc.github.diff(d.workspace!, d.workspace!.baseRef);
 			const r = await runAgent(rt, c, d, "reviewer", conv, key, reviewerInput(d, diff), ["submit_review"]);
 			const checked = validateReview(r.payload);
 			if (!checked.ok) throw new Error(`invalid review reached the core: ${checked.problems.join("; ")}`);
@@ -614,11 +608,10 @@ export function createRunTask(svc: CoreServices) {
 
 		DELIVERING: async (rt, c, d) => {
 			const ws = d.workspace!;
-			const repo = svc.repo(stage(d, "repo"));
 			if (d.lastFingerprint !== undefined) {
 				// A human message can lead the builder to change files after the review (at a gate or an escalation).
 				// Unreviewed changes are never delivered: they go through review first.
-				const now = await repo.diff(ws, ws.baseRef);
+				const now = await svc.github.diff(ws, ws.baseRef);
 				if (now.fingerprint !== d.lastFingerprint) {
 					await transition(rt, c, d.id, async (doc, tx): Promise<Phase> => {
 						doc.lastFingerprint = now.fingerprint;
@@ -631,9 +624,8 @@ export function createRunTask(svc: CoreServices) {
 					return;
 				}
 			}
-			if (ws.newRepo) await repo.create(d.repo, opts(d, "repo"));
-			const delivery = svc.delivery(stage(d, "delivery"));
-			const out = await delivery.deliver(ws, {
+			if (ws.newRepo) await svc.github.create(d.repo, rc(d));
+			const ctx: DeliveryContext = {
 				spec: { kind: "spec", path: "docs/spec.md", version: d.artifacts.spec?.version },
 				specText: d.artifacts.spec?.text ?? "",
 				review: d.lastReview ?? { verdict: "pass", findings: [] },
@@ -641,14 +633,12 @@ export function createRunTask(svc: CoreServices) {
 				advisory: d.advisory,
 				acceptedBlocking: d.acceptedBlocking,
 				mode: ws.newRepo ? "push-main" : "pull-request",
-				runId: d.id,
-				settings: stage(d, "delivery"),
-				stages: d.pinned.config.stages ?? {},
-			});
+			};
+			const out = await svc.github.deliver(ws, ctx, rc(d));
 			await transition(rt, c, d.id, (doc): Phase => {
 				doc.artifacts.delivery = out;
 				notice(doc, { level: "info", text: `${out.kind === "pr" ? "PR" : "Pushed to main"}: ${out.url} @ ${out.sha.slice(0, 12)}`, url: out.url });
-				const mode = stage(doc, "delivery").ci?.mode ?? "if-present";
+				const mode = doc.pinned.config.ci?.mode ?? "if-present";
 				if (mode === "off") return afterCi(doc);
 				doc.ci = { startedAt: svc.now() };
 				return "AWAITING_CI";
@@ -656,21 +646,20 @@ export function createRunTask(svc: CoreServices) {
 		},
 
 		AWAITING_CI: async (rt, c, d) => {
-			const ci = stage(d, "delivery").ci ?? {};
+			const ci = d.pinned.config.ci ?? {};
 			const mode = ci.mode ?? "if-present";
 			const timeout = parseDuration(ci.noChecksTimeout ?? "2m");
 			const names: string[] | undefined = Array.isArray(ci.checks) && ci.checks.length ? ci.checks : undefined;
-			const delivery = svc.delivery(stage(d, "delivery"));
 			const dl = d.artifacts.delivery!;
 			let st: CiStatus;
 			for (;;) {
-				st = await delivery.checks(dl, names, opts(d, "delivery"));
+				st = await svc.github.checks(dl, names, rc(d));
 				if (st.state === "green" || st.state === "red") break;
 				if (st.state === "none" && svc.now() - d.ci!.startedAt >= timeout) break;
 				await rt.sleep(svc.now() + svc.ciPollMs, c);
 			}
-			if (st.state === "none" && mode !== "required" && delivery.annotate)
-				await delivery.annotate(dl, d.workspace!, "No CI checks appeared within ci.noChecksTimeout: the repo has no CI, so CI did not run.", opts(d, "delivery"));
+			if (st.state === "none" && mode !== "required")
+				await svc.github.annotate(dl, d.workspace!, "No CI checks appeared within ci.noChecksTimeout: the repo has no CI, so CI did not run.", rc(d));
 			await transition(rt, c, d.id, (doc): Phase => {
 				doc.ci = { ...doc.ci!, last: st };
 				if (st.state === "none") {
@@ -735,8 +724,7 @@ export function createRunTask(svc: CoreServices) {
 	}
 
 	async function sideEffectsAtEnd(d: RunDocState) {
-		const env = svc.environment(stage(d, "environment"));
-		for (const e of Object.values(d.envs)) if (e) await env.dispose(e.envId).catch((err) => svc.log(`dispose failed: ${err}`));
+		for (const e of Object.values(d.envs)) if (e) await svc.sandbox.dispose(e.envId).catch((err) => svc.log(`dispose failed: ${err}`));
 	}
 
 	async function finalize(rt: RT, c: Context, d: RunDocState) {

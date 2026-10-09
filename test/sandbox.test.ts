@@ -1,4 +1,4 @@
-// local-worktree environment: role-fixed write access, denyRead, network allowlist and credential hiding, enforced by
+// Sandbox: role-fixed write access, denyRead, network allowlist and credential hiding, enforced by
 // @anthropic-ai/sandbox-runtime for processes and by the ExecutionEnv for in-process file tools.
 import { mkdirSync, mkdtempSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -7,7 +7,7 @@ import { BACKGROUND_CONTEXT as c } from "@earendil-works/chord/context";
 import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
 import { beforeAll, describe, expect, test } from "vitest";
 import { git } from "../src/github/git.ts";
-import { localWorktree } from "../src/sandbox/sandbox.ts";
+import { Sandbox } from "../src/sandbox/sandbox.ts";
 import type { Workspace } from "../src/core/types.ts";
 
 const available = process.platform === "linux" && SandboxManager.checkDependencies().errors.length === 0;
@@ -18,15 +18,22 @@ async function exec(env: any, cmd: string) {
 	return { code: r.ok ? r.value.exitCode : -1, out: out + (r.ok ? "" : r.error.message) };
 }
 
-describe.skipIf(!available)("local-worktree sandbox (bubblewrap)", () => {
+describe.skipIf(!available)("Sandbox (bubblewrap)", () => {
 	const dir = mkdtempSync(join(tmpdir(), "sf-sbx-"));
 	const secretDir = join(dir, "secret-home", ".factory");
 	const ws: Workspace = { repo: "me/x", path: join(dir, "wt"), baseRef: "", branch: "main", newRepo: true };
-	const ext = localWorktree({ stateDir: join(dir, "state") });
+	const sandbox = new Sandbox({ stateDir: join(dir, "state") });
+	const workdir = join(dir, "root");
 	const settings = {
-		root: join(dir, "root"),
-		setupScripts: ["scripts/setup.sh"],
-		sandbox: { enabled: true, allowedDomains: ["registry.npmjs.org"], deniedDomains: [], denyRead: [secretDir], extraWrite: [], unixSockets: "auto" },
+		sandbox: {
+			enabled: true,
+			allowedDomains: ["registry.npmjs.org"],
+			deniedDomains: [],
+			denyRead: [secretDir],
+			extraWrite: [],
+			unixSockets: "auto",
+			setupScripts: ["scripts/setup.sh"],
+		},
 	};
 	let builder: any, reviewer: any;
 
@@ -38,10 +45,10 @@ describe.skipIf(!available)("local-worktree sandbox (bubblewrap)", () => {
 		writeFileSync(join(ws.path, "scripts/setup.sh"), "echo setup-ran > .setup-marker\n");
 		await git(ws.path, ["add", "-A"]);
 		await git(ws.path, ["commit", "-qm", "init"]);
-		const b = await ext.provision(ws, "builder", { runId: "r1", settings });
-		const r = await ext.provision(ws, "reviewer", { runId: "r1", settings });
-		builder = ext.env({ conversationId: "c1", envId: b.envId });
-		reviewer = ext.env({ conversationId: "c2", envId: r.envId });
+		const b = await sandbox.provision(ws, "builder", { runId: "r1", config: { workdir, sandbox: settings.sandbox } });
+		const r = await sandbox.provision(ws, "reviewer", { runId: "r1", config: { workdir, sandbox: settings.sandbox } });
+		builder = sandbox.env({ conversationId: "c1", envId: b.envId });
+		reviewer = sandbox.env({ conversationId: "c2", envId: r.envId });
 	});
 
 	test("provision runs the repo's setup script (sandboxed, builder rights)", () => {

@@ -116,33 +116,15 @@ export type SettingField =
 	| { type: "list"; of: SettingField; default?: unknown[]; description: string }
 	| { type: "object"; fields: Record<string, SettingField>; description: string };
 
-export interface Configurable {
-	settings?: { schema: Record<string, SettingField>; validate?(value: unknown): string[] };
-}
-
 export type Scope = { global: true } | { project: string };
 export type SettingSource = "default" | "global" | "project";
 export type EffectiveSettings = Record<string, { value: unknown; source: SettingSource }>;
 
-// ---------------------------------------------------------------- factory extensions (§3.2, §3.3)
-/** Per-call context the core hands to stage extensions: the run's pinned stage settings. */
-export interface StageCallOptions {
+// ---------------------------------------------------------------- GitHub and sandbox calls
+/** Per-call context the core hands to `GitHub` and `Sandbox`: the run id and the run's pinned effective config. */
+export interface RunCtx {
 	runId: string;
-	settings: Record<string, any>;
-	/** All pinned stage settings of the run (e.g. the delivery extension reads the repo identity from `stages.repo`). */
-	stages?: Record<string, any>;
-}
-
-export interface RepoExtension extends Configurable {
-	kind: "repo";
-	name: string;
-	open(ref: RepoRef, opts: StageCallOptions): Promise<Workspace>;
-	create(ref: RepoRef, opts: StageCallOptions): Promise<void>;
-	fork?(ref: RepoRef, opts: StageCallOptions): Promise<RepoRef>;
-	diff(ws: Workspace, base: string, head?: string): Promise<Diff>;
-	merge(pr: PrRef, how: "merge" | "squash" | "rebase", opts: StageCallOptions): Promise<void>;
-	/** Deviation (DEVIATIONS.md): commit a core artifact (docs/spec.md) into the workspace. Idempotent. */
-	writeArtifact(ws: Workspace, path: string, content: string, message: string): Promise<void>;
+	config: Record<string, any>;
 }
 
 export interface DeliveryContext {
@@ -153,30 +135,7 @@ export interface DeliveryContext {
 	advisory: Finding[];
 	acceptedBlocking: Finding[];
 	mode: "push-main" | "pull-request";
-	runId: string;
-	settings: Record<string, any>;
-	stages?: Record<string, any>;
 }
-
-export interface DeliveryExtension extends Configurable {
-	kind: "delivery";
-	name: string;
-	deliver(ws: Workspace, ctx: DeliveryContext): Promise<Delivery>;
-	checks(d: Delivery, names?: string[], opts?: StageCallOptions): Promise<CiStatus>;
-	/** Deviation (DEVIATIONS.md): add a note (e.g. "no CI") to the PR description / delivery note. Idempotent. */
-	annotate?(d: Delivery, ws: Workspace, note: string, opts: StageCallOptions): Promise<void>;
-}
-
-export interface EnvironmentExtension extends Configurable {
-	kind: "environment";
-	name: string;
-	provision(ws: Workspace, role: Role, opts: StageCallOptions): Promise<{ envId: string; cwd: string }>;
-	env(input: { conversationId: string; cwd?: string; envId: string }): import("@earendil-works/pi-durable/env").ExecutionEnv;
-	dispose(envId: string): Promise<void>;
-}
-
-export type FactoryExtension = RepoExtension | DeliveryExtension | EnvironmentExtension;
-export type StageName = "repo" | "delivery" | "environment";
 
 // ---------------------------------------------------------------- projects, runs, events (§3.5, §3.6)
 export interface Project {

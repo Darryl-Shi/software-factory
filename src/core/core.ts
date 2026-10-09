@@ -20,29 +20,27 @@ import {
 } from "@earendil-works/pi-durable";
 import { createEditTool, createWriteTool } from "@earendil-works/pi-durable/tools";
 import { AGENT_EXTENSIONS, ROLE_TOOLS } from "../agents/tools.ts";
+import { type GitHub, githubProblems } from "../github/github.ts";
+import { type Sandbox, sandboxProblems } from "../sandbox/sandbox.ts";
 import { Bridge, BridgeDoc, bridgeToolsNotFor, EnvDoc } from "./bridge.ts";
 import { humanFindings } from "./findings.ts";
 import { DEFAULT_MESSAGE_ROLES, holdMessage, messageContent, messageTarget, parseMessage } from "./messages.ts";
 import { RunDoc, type RunDocState, RunIndex, toView } from "./run-doc.ts";
 import { RunConfigDoc } from "./run-config.ts";
 import { createRunTask } from "./run-task.ts";
-import { ConfigStore, coreSchema, expandHome, hashConfig, isObj, type Obj } from "./settings.ts";
+import { assertNoLegacySections, ConfigStore, coreSchema, expandHome, hashConfig, isObj, type Obj, parseDuration } from "./settings.ts";
 import { addCost, sumUsage, type UsageSum } from "./usage.ts";
 import {
 	type AskId,
 	type AskResponse,
-	type DeliveryExtension,
 	type EffectiveSettings,
-	type EnvironmentExtension,
 	type FactoryCore,
 	FactoryError,
 	type FactoryEvent,
-	type FactoryExtension,
 	type Gate,
 	type HumanFinding,
 	type HumanMessage,
 	type Project,
-	type RepoExtension,
 	type Request,
 	type Role,
 	type RunId,
@@ -64,8 +62,10 @@ export interface CoreOptions {
 	configPath: string;
 	/** pi-ai models (createModels() with providers) — injected platform service (§3.1). */
 	models: Models;
-	/** Factory extensions (layer 2) and the environment extension (layer 3). */
-	extensions: FactoryExtension[];
+	/** GitHub: workspaces, delivery, CI and merges. */
+	github: GitHub;
+	/** The sandbox every role's commands and file tools run in. */
+	sandbox: Sandbox;
 	/** Storage override (tests): "memory", or a sqlite path. Default: the config's `storage`. */
 	storage?: "memory" | { sqlite: string } | { jsonl: string };
 	now?: () => number;
@@ -100,12 +100,12 @@ export class Factory implements FactoryCore {
 
 	// ------------------------------------------------------------------ lifecycle
 	async start(): Promise<void> {
+		assertNoLegacySections(this.opts.configPath);
 		for (const ext of AGENT_EXTENSIONS) this.registry.install(ext);
 		this.registry.install(Bridge);
 		this.runTask = createRunTask({
-			repo: (cfg) => this.ext<RepoExtension>("repo", cfg.use),
-			delivery: (cfg) => this.ext<DeliveryExtension>("delivery", cfg.use),
-			environment: (cfg) => this.ext<EnvironmentExtension>("environment", cfg.use),
+			github: this.opts.github,
+			sandbox: this.opts.sandbox,
 			bridge: Bridge,
 			changed: (runId, ms) => this.changed(runId, ms),
 			now: this.now,
@@ -124,9 +124,7 @@ export class Factory implements FactoryCore {
 				env: async ({ conversationId, cwd, read }, c) => {
 					const b = await read.snapshot(EnvDoc, conversationId, c);
 					if (!b?.envId || !b.runId) return undefined;
-					const run = (await read.snapshot(RunDoc, b.runId, c)) as RunDocState | undefined;
-					const envExt = this.ext<EnvironmentExtension>("environment", run?.pinned.config.stages?.environment?.use);
-					return envExt.env({ conversationId: conversationId as unknown as string, ...(cwd ? { cwd } : {}), envId: b.envId });
+					return this.opts.sandbox.env({ conversationId: conversationId as unknown as string, ...(cwd ? { cwd } : {}), envId: b.envId });
 				},
 				conversationCreated: async (tx, rec) => {
 					// Helpers the builder spawns (Pi's subagent pattern): read-only, the helper role's model, no bridge tools.
@@ -223,13 +221,6 @@ export class Factory implements FactoryCore {
 		mkdirSync(dirname(path), { recursive: true });
 		const { openNodeSqliteStorage } = await import("@earendil-works/pi-durable/storage/sqlite/node");
 		return openNodeSqliteStorage(path);
-	}
-
-	// ------------------------------------------------------------------ extensions
-	private ext<T extends FactoryExtension>(kind: FactoryExtension["kind"], name: string | undefined): T {
-		const found = this.opts.extensions.find((e) => e.kind === kind && (name === undefined || e.name === name));
-		if (!found) throw new FactoryError("not_found", `no ${kind} extension named ${name ?? "(default)"} is installed`);
-		return found as T;
 	}
 
 	// ------------------------------------------------------------------ events
@@ -344,7 +335,7 @@ export class Factory implements FactoryCore {
 			updatedAt: now,
 			pinned: { config: eff, configHash: hashConfig(eff), piVersion: PI_DURABLE_VERSION },
 			counters: { reviewRound: 1, ciFixes: 0, buildSeq: 0, reviewSeq: 0, discussionSeq: 0, askSeq: 0, findingSeq: 0 },
-			caps: { review: Number(eff.policy?.reviewRoundCap ?? 3), ciFix: Number(eff.stages?.delivery?.ci?.fixRounds ?? 2) },
+			caps: { review: Number(eff.policy?.reviewRoundCap ?? 3), ciFix: Number(eff.ci?.fixRounds ?? 2) },
 			loop: "review",
 			envs: {},
 			conversations: { reviewers: [] },
@@ -624,26 +615,7 @@ export class Factory implements FactoryCore {
 
 	// ------------------------------------------------------------------ settings
 	settingsSchema(): Record<string, SettingField> {
-		const schema = coreSchema();
-		const stage = (kind: FactoryExtension["kind"]) => this.opts.extensions.filter((e) => e.kind === kind);
-		const fieldsOf = (exts: FactoryExtension[]) => {
-			const out: Record<string, SettingField> = {};
-			for (const e of exts) for (const [k, f] of Object.entries(e.settings?.schema ?? {})) if (!(k in out)) out[k] = f;
-			return out;
-		};
-		const names = (kind: FactoryExtension["kind"]) => stage(kind).map((e) => e.name);
-		const stages: Record<string, SettingField> = {};
-		for (const kind of ["repo", "delivery", "environment"] as const) {
-			stages[kind] = {
-				type: "object",
-				description: `${kind} stage`,
-				fields: { use: { type: "enum", values: names(kind), default: names(kind)[0] ?? "", description: `${kind} extension` }, ...fieldsOf(stage(kind)) } as Record<string, SettingField>,
-			};
-		}
-		return {
-			...schema,
-			stages: { type: "object", description: "Stage → factory extension + its settings", fields: stages },
-		};
+		return coreSchema();
 	}
 
 	private coreRules(eff: Obj, _scope: Scope): string[] {
@@ -655,16 +627,13 @@ export class Factory implements FactoryCore {
 			if (!provider || rest.length === 0) problems.push(`roles.${role}.model: expected provider/modelId`);
 			else if (!this.opts.models.getModel(provider, rest.join("/"))) problems.push(`roles.${role}.model: ${r.model} is not a model createModels() knows`);
 		}
-		for (const kind of ["repo", "delivery", "environment"] as const) {
-			const st = eff.stages?.[kind];
-			if (!isObj(st)) continue;
-			const uses = Array.isArray(st.use) ? st.use : [st.use];
-			for (const u of uses) {
-				if (u === "none" || u === undefined) continue;
-				const ext = this.opts.extensions.find((e) => e.kind === kind && e.name === u);
-				if (!ext) problems.push(`stages.${kind}.use: ${u} is not installed`);
-				else if (ext.settings?.validate) problems.push(...ext.settings.validate(st).map((p) => `stages.${kind}: ${p}`));
-			}
+		if (isObj(eff.github)) problems.push(...githubProblems(eff.github).map((p) => `github.${p}`));
+		if (isObj(eff.sandbox)) problems.push(...sandboxProblems(eff.sandbox).map((p) => `sandbox.${p}`));
+		if (isObj(eff.ci)) {
+			const t = eff.ci.noChecksTimeout;
+			if (t !== undefined && !(parseDuration(t) >= 0)) problems.push(`ci.noChecksTimeout: "${t}" is not a duration (e.g. 2m, 90s, 500ms)`);
+			const fr = eff.ci.fixRounds;
+			if (fr !== undefined && !Number.isInteger(fr)) problems.push("ci.fixRounds must be a whole number");
 		}
 		const approvals = eff.policy?.approvals ?? [];
 		if (new Set(approvals).size !== approvals.length) problems.push("policy.approvals: duplicate gate");

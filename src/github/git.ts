@@ -1,4 +1,4 @@
-// Git helpers for the factory-side extensions (repo, delivery). These run on the host, outside the sandbox, with
+// Git helpers for the `GitHub` class (./github.ts). These run on the host, outside the sandbox, with
 // repository hooks disabled, so nothing an agent planted in the worktree runs with the core's credentials.
 import { execFile } from "node:child_process";
 

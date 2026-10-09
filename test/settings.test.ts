@@ -21,24 +21,24 @@ describe("settings layering", () => {
 		expect(s["policy.approvals"]).toEqual({ value: [], source: "global" }); // the test config sets approvals: []
 		expect(s["roles.reviewer.model"]).toEqual({ value: "scripted/reviewer", source: "global" });
 		expect(s["roles.reviewer.thinking"]).toEqual({ value: "high", source: "default" });
-		expect(s["stages.delivery.ci.mode"]).toEqual({ value: "if-present", source: "default" });
-		expect(s["stages.delivery.ci.fixRounds"]).toEqual({ value: 2, source: "default" });
-		expect(s["stages.delivery.ci.noChecksTimeout"]).toEqual({ value: "300ms", source: "global" });
-		expect(s["stages.environment.sandbox.allowedDomains"].value).toContain("registry.npmjs.org");
+		expect(s["ci.mode"]).toEqual({ value: "if-present", source: "default" });
+		expect(s["ci.fixRounds"]).toEqual({ value: 2, source: "default" });
+		expect(s["ci.noChecksTimeout"]).toEqual({ value: "300ms", source: "global" });
+		expect(s["sandbox.allowedDomains"].value).toContain("registry.npmjs.org");
 
 		await f.setSetting({ project: "pay" }, "policy.approvals", ["spec", "delivery", "merge"]);
 		await f.setSetting({ project: "pay" }, "roles.reviewer.thinking", "medium");
-		await f.setSetting({ project: "pay" }, "stages.delivery.ci.mode", "required");
+		await f.setSetting({ project: "pay" }, "ci.mode", "required");
 		s = await f.getSettings({ project: "pay" });
 		expect(s["policy.approvals"]).toEqual({ value: ["spec", "delivery", "merge"], source: "project" });
 		expect(s["roles.reviewer.thinking"]).toEqual({ value: "medium", source: "project" });
 		// objects merge key by key: the model is still inherited
 		expect(s["roles.reviewer.model"]).toEqual({ value: "scripted/reviewer", source: "global" });
-		expect(s["stages.delivery.ci.mode"]).toEqual({ value: "required", source: "project" });
-		expect(s["stages.delivery.ci.fixRounds"]).toEqual({ value: 2, source: "default" });
+		expect(s["ci.mode"]).toEqual({ value: "required", source: "project" });
+		expect(s["ci.fixRounds"]).toEqual({ value: 2, source: "default" });
 		// global scope is unaffected by project overrides
 		const g = await f.getSettings(G);
-		expect(g["stages.delivery.ci.mode"].value).toBe("if-present");
+		expect(g["ci.mode"].value).toBe("if-present");
 		expect(g["roles.reviewer.thinking"].value).toBe("high");
 	});
 
@@ -51,9 +51,9 @@ describe("settings layering", () => {
 		await f.setSetting(G, "policy.approvals", ["spec", "delivery"]);
 		expect((await f.getSettings({ project: "a" }))["policy.approvals"]).toEqual({ value: ["spec", "delivery"], source: "global" });
 		expect((await f.getSettings({ project: "b" }))["policy.approvals"]).toEqual({ value: ["merge"], source: "project" });
-		await f.setSetting(G, "stages.environment.sandbox.allowedDomains", ["pypi.org"]);
-		await f.setSetting({ project: "a" }, "stages.environment.sandbox.allowedDomains", ["registry.npmjs.org"]);
-		expect((await f.getSettings({ project: "a" }))["stages.environment.sandbox.allowedDomains"].value).toEqual(["registry.npmjs.org"]);
+		await f.setSetting(G, "sandbox.allowedDomains", ["pypi.org"]);
+		await f.setSetting({ project: "a" }, "sandbox.allowedDomains", ["registry.npmjs.org"]);
+		expect((await f.getSettings({ project: "a" }))["sandbox.allowedDomains"].value).toEqual(["registry.npmjs.org"]);
 	});
 
 	test("unset at project scope goes back to inheriting; empty override maps are pruned", async () => {
@@ -70,7 +70,7 @@ describe("settings layering", () => {
 		expect((await f.getProject("pay")).overrides).toEqual({});
 		// unsetting something the project never overrode is a no-op
 		await f.unsetSetting({ project: "pay" }, "policy.approvals");
-		await f.unsetSetting({ project: "pay" }, "stages.delivery.ci.mode");
+		await f.unsetSetting({ project: "pay" }, "ci.mode");
 		expect(readFileSync(t.configPath, "utf8")).toBe(raw);
 	});
 
@@ -79,7 +79,7 @@ describe("settings layering", () => {
 		const f = t.factory;
 		await f.createProject("todo2", "me/todo2");
 		expect(await t.host.repoExists("me/todo2")).toBe(false);
-		await f.setSetting({ project: "todo2" }, "stages.delivery.ci.mode", "off");
+		await f.setSetting({ project: "todo2" }, "ci.mode", "off");
 		const run = await f.startRun("todo2", { source: "t", title: "x", body: "x" });
 		const v = await f.waitForState(run, (x) => x.state === "DELIVERED");
 		expect(v.history.map((h) => h.to)).not.toContain("AWAITING_CI");
@@ -91,31 +91,31 @@ describe("settings layering", () => {
 		await f.createProject("p", "me/p");
 		const before = readFileSync(t.configPath, "utf8");
 		const bad: [any, string, unknown, RegExp][] = [
-			[G, "stages.delivery.ci.fixRounds", 5, /above the maximum 3/],
-			[{ project: "p" }, "stages.delivery.ci.fixRounds", -1, /below the minimum 0/],
-			[G, "stages.delivery.ci.mode", "sometimes", /expected one of off, if-present, required/],
-			[G, "stages.delivery.ci.noChecksTimeout", "soon", /not a duration/],
+			[G, "ci.fixRounds", 5, /above the maximum 3/],
+			[{ project: "p" }, "ci.fixRounds", -1, /below the minimum 0/],
+			[G, "ci.mode", "sometimes", /expected one of off, if-present, required/],
+			[G, "ci.noChecksTimeout", "soon", /not a duration/],
 			[G, "policy.approvals", ["spec", "deploy"], /expected one of spec, delivery, merge/],
 			[G, "policy.approvals", ["spec", "spec"], /duplicate gate/],
 			[G, "roles.reviewer.model", "openai/no-such-model", /not a model createModels\(\) knows/],
 			[G, "roles.reviewer.thinking", "extreme", /expected one of off, low, medium, high/],
 			[G, "roles.builder.extensions", ["coding"], /unknown setting/],
-			[G, "stages.repo.identity.tokenRef", "ghp_abc123", /secret reference/],
-			[G, "stages.environment.sandbox.extraWrite", ["~"], /home directory/],
-			[G, "stages.environment.sandbox.extraWrite", ["~/.ssh/keys"], /denied secret path/],
+			[G, "github.identity.tokenRef", "ghp_abc123", /secret reference/],
+			[G, "sandbox.extraWrite", ["~"], /home directory/],
+			[G, "sandbox.extraWrite", ["~/.ssh/keys"], /denied secret path/],
 			[{ project: "p" }, "storage.path", "/tmp/x.sqlite", /global only/],
 			[{ project: "p" }, "web.port", 8000, /global only/],
 			[G, "web.port", 70000, /above the maximum 65535/],
 			[G, "policy.nonsense", 1, /unknown setting/],
 			[{ project: "nope" }, "policy.reviewRoundCap", 2, /does not exist/],
-			[G, "stages.repo.identity.kind", "app", /needs identity.appId/],
+			[G, "github.identity.kind", "app", /needs identity.appId/],
 		];
 		for (const [scope, path, value, re] of bad) {
 			await expect(f.setSetting(scope, path, value), `${path}=${JSON.stringify(value)}`).rejects.toThrow(re);
 			expect(readFileSync(t.configPath, "utf8")).toBe(before);
 		}
 		// a valid change still works afterwards
-		await f.setSetting(G, "stages.delivery.ci.fixRounds", 3);
+		await f.setSetting(G, "ci.fixRounds", 3);
 		expect(readFileSync(t.configPath, "utf8")).not.toBe(before);
 	});
 
@@ -124,22 +124,22 @@ describe("settings layering", () => {
 		const f = t.factory;
 		await f.createProject("p", "me/p");
 		// hand-edit an override the validator would reject only in combination
-		await f.setSetting({ project: "p" }, "stages.repo.identity.appId", 1);
+		await f.setSetting({ project: "p" }, "github.identity.appId", 1);
 		const before = readFileSync(t.configPath, "utf8");
-		await expect(f.setSetting(G, "stages.repo.identity.kind", "app")).rejects.toThrow(/project p/);
+		await expect(f.setSetting(G, "github.identity.kind", "app")).rejects.toThrow(/project p/);
 		expect(readFileSync(t.configPath, "utf8")).toBe(before);
 	});
 
-	test("settingsSchema includes the core's and every installed extension's schemas", async () => {
+	test("settingsSchema is the fixed core schema", async () => {
 		t = await makeFactory();
 		const schema = t.factory.settingsSchema();
-		expect(Object.keys(schema)).toEqual(["version", "roles", "policy", "web", "webSearch", "storage", "stages"]);
-		const stages = (schema.stages as any).fields;
-		expect(Object.keys(stages)).toEqual(["repo", "delivery", "environment"]);
-		expect(Object.keys(stages.delivery.fields)).toEqual(["use", "newRepo", "existingRepo", "ci"]);
-		expect(Object.keys(stages.delivery.fields.ci.fields)).toEqual(["mode", "fixRounds", "checks", "noChecksTimeout"]);
-		expect(Object.keys(stages.repo.fields)).toContain("identity");
-		expect(Object.keys(stages.environment.fields.sandbox.fields)).toEqual(["enabled", "allowedDomains", "deniedDomains", "denyRead", "extraWrite", "unixSockets"]);
+		expect(Object.keys(schema)).toEqual(["version", "workdir", "roles", "policy", "github", "ci", "sandbox", "web", "webSearch", "storage"]);
+		expect(Object.keys((schema.ci as any).fields)).toEqual(["mode", "fixRounds", "checks", "noChecksTimeout"]);
+		expect(Object.keys((schema.sandbox as any).fields)).toEqual(["enabled", "allowedDomains", "deniedDomains", "denyRead", "extraWrite", "unixSockets", "setupScripts"]);
+	});
+
+	test("a config with the removed stages/workers sections refuses to start", async () => {
+		await expect(makeFactory({ config: "version: 1\nstages:\n  delivery: { ci: { mode: off } }\n" })).rejects.toThrow(/removed sections \(stages\).*ci\.\*/);
 	});
 
 	test("roles have fixed tool sets", async () => {

@@ -259,7 +259,7 @@ describe("existing repo (incremental), PR delivery, delivery + merge gates", () 
 
 describe("CI modes", () => {
 	test("ci.mode off: finishes at delivery without waiting for CI", async () => {
-		await setup([["stages.delivery.ci.mode", "off"]]);
+		await setup([["ci.mode", "off"]]);
 		const run = await start();
 		const v = await until(t!.factory, run, done);
 		expect(v.state).toBe("DELIVERED");
@@ -267,7 +267,7 @@ describe("CI modes", () => {
 	});
 
 	test("ci.mode required and no checks → ESCALATED (no CI checks) after ci.noChecksTimeout", async () => {
-		await setup([["stages.delivery.ci.mode", "required"], ["stages.delivery.ci.noChecksTimeout", "400ms"]]);
+		await setup([["ci.mode", "required"], ["ci.noChecksTimeout", "400ms"]]);
 		const run = await start();
 		const v = await until(t!.factory, run, inState("ESCALATED", "DELIVERED"));
 		expect(v.state).toBe("ESCALATED");
@@ -278,7 +278,7 @@ describe("CI modes", () => {
 	});
 
 	test("ci.mode if-present and no checks → DELIVERED, noting no CI", async () => {
-		await setup([["stages.delivery.ci.mode", "if-present"]]);
+		await setup([["ci.mode", "if-present"]]);
 		const run = await start();
 		const v = await until(t!.factory, run, done);
 		expect(v.state).toBe("DELIVERED");
@@ -286,7 +286,7 @@ describe("CI modes", () => {
 	});
 
 	test("CI red → same builder fixes → review (counts toward ci.fixRounds) → redeliver → CI green", async () => {
-		await setup([["stages.delivery.ci.mode", "required"]]);
+		await setup([["ci.mode", "required"]]);
 		t!.host.forceChecks("me/p", [{ name: "test", status: "completed", conclusion: "failure", summary: "1 failing" }], [{ name: "test", status: "completed", conclusion: "success" }]);
 		const run = await start();
 		const v = await until(t!.factory, run, done);
@@ -302,7 +302,7 @@ describe("CI modes", () => {
 	});
 
 	test("ci.fixRounds 0: CI red escalates without a fix round", async () => {
-		await setup([["stages.delivery.ci.fixRounds", 0]]);
+		await setup([["ci.fixRounds", 0]]);
 		t!.host.forceChecks("me/p", [{ name: "test", status: "completed", conclusion: "failure" }]);
 		const run = await start();
 		const v = await until(t!.factory, run, inState("ESCALATED", "DELIVERED"));
@@ -312,7 +312,7 @@ describe("CI modes", () => {
 	});
 
 	test("CI red at cap → ESCALATED; accept from AWAITING_CI → DELIVERED (merge gate off)", async () => {
-		await setup([["stages.delivery.ci.fixRounds", 1]]);
+		await setup([["ci.fixRounds", 1]]);
 		const red = [{ name: "test", status: "completed" as const, conclusion: "failure" }];
 		t!.host.forceChecks("me/p", red, red);
 		const run = await start();
@@ -326,7 +326,7 @@ describe("CI modes", () => {
 	});
 
 	test("CI red at cap → more rounds → another CI fix round", async () => {
-		await setup([["stages.delivery.ci.fixRounds", 0]]);
+		await setup([["ci.fixRounds", 0]]);
 		t!.host.forceChecks("me/p", [{ name: "t", status: "completed", conclusion: "failure" }], [{ name: "t", status: "completed", conclusion: "success" }]);
 		const run = await start();
 		let v = await until(t!.factory, run, inState("ESCALATED"));
@@ -338,7 +338,7 @@ describe("CI modes", () => {
 	});
 
 	test("a failing review after a CI fix counts toward ci.fixRounds, not reviewRoundCap", async () => {
-		await setup([["stages.delivery.ci.fixRounds", 1]]);
+		await setup([["ci.fixRounds", 1]]);
 		t!.host.forceChecks("me/p", [{ name: "t", status: "completed", conclusion: "failure" }]);
 		t!.control.reviews = ["pass", "fail"];
 		const run = await start();
@@ -349,7 +349,7 @@ describe("CI modes", () => {
 	});
 
 	test("ci.checks limits the checks that count", async () => {
-		await setup([["stages.delivery.ci.checks", ["test"]], ["stages.delivery.ci.mode", "required"]]);
+		await setup([["ci.checks", ["test"]], ["ci.mode", "required"]]);
 		t!.host.forceChecks("me/p", [
 			{ name: "lint", status: "completed", conclusion: "failure" },
 			{ name: "test", status: "completed", conclusion: "success" },
@@ -361,9 +361,9 @@ describe("CI modes", () => {
 	});
 
 	test("CI from a real workflow in the repo (local CI runner): pending → green", async () => {
-		await setup([["stages.delivery.ci.mode", "required"]]);
+		await setup([["ci.mode", "required"]]);
 		// the builder in this test writes round-N.txt; seed a workflow via the spec artifact path is not possible, so
-		// add one to the workspace before delivery through the repo extension (as a builder would)
+		// add one to the workspace before delivery (as a builder would)
 		const run = await start();
 		await until(t!.factory, run, (x) => x.state === "REVIEWING" || x.state === "DELIVERING" || done(x));
 		const ws = (await t!.factory.getRun(run)).workspace!;
@@ -406,7 +406,7 @@ describe("cancel, failure, retry", () => {
 		expect((await until(t!.factory, run, done)).state).toBe("DELIVERED");
 
 		await t!.factory.setSetting({ project: "p" }, "policy.approvals", []);
-		await t!.factory.setSetting({ project: "p" }, "stages.delivery.ci.noChecksTimeout", "1h");
+		await t!.factory.setSetting({ project: "p" }, "ci.noChecksTimeout", "1h");
 		const run2 = await start();
 		await until(t!.factory, run2, inState("AWAITING_CI"));
 		await t!.factory.cancelRun(run2);
@@ -437,7 +437,7 @@ describe("cancel, failure, retry", () => {
 	});
 
 	test("PREPARING error → FAILED", async () => {
-		await setup([["stages.repo.workdir", "/dev/null/work"]]);
+		await setup([["workdir", "/dev/null/work"]]);
 		const run = await start();
 		const v = await until(t!.factory, run, done);
 		expect(v.state).toBe("FAILED");

@@ -4,10 +4,9 @@ import { join } from "node:path";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { Factory } from "../src/core/core.ts";
 import type { RunView } from "../src/core/types.ts";
-import { githubDelivery } from "../src/github/delivery.ts";
+import { GitHub } from "../src/github/github.ts";
 import { LocalGitHubHost } from "../src/github/host.ts";
-import { githubRepo } from "../src/github/repo.ts";
-import { localWorktree } from "../src/sandbox/sandbox.ts";
+import { Sandbox } from "../src/sandbox/sandbox.ts";
 import { call, calls, humanText, type Script, say, scriptedProvider } from "../src/testing/scripted.ts";
 
 export type ReviewPlan = "pass" | "fail" | "invalid-then-pass" | "pass-advisory";
@@ -157,15 +156,14 @@ export async function makeFactory(opts: { config?: string; storage?: "memory" | 
 		configPath,
 		opts.config ??
 			`version: 1
+workdir: ${dir}/work
 roles:
   architect: { model: scripted/architect }
   builder: { model: scripted/builder }
   helper: { model: scripted/helper }
   reviewer: { model: scripted/reviewer }
-stages:
-  repo: { workdir: ${dir}/work }
-  environment: { root: ${dir}/work, sandbox: { enabled: false } }
-  delivery: { ci: { noChecksTimeout: 300ms } }
+sandbox: { enabled: false }
+ci: { noChecksTimeout: 300ms }
 policy:
   approvals: []
 `,
@@ -177,7 +175,8 @@ policy:
 		const f = new Factory({
 			configPath,
 			models,
-			extensions: [githubRepo(host), githubDelivery(host), localWorktree({ stateDir: join(dir, "state", "environments") })],
+			github: new GitHub(host),
+			sandbox: new Sandbox({ stateDir: join(dir, "state", "environments") }),
 			storage: opts.storage === "sqlite" ? { sqlite: join(dir, "factory.sqlite") } : "memory",
 			ciPollMs: 50,
 			log: (m) => process.env.SF_DEBUG && console.error(m),
