@@ -67,6 +67,10 @@ describe("settings layering", () => {
 		expect(raw).toMatch(/pay:\n\s+repo: acme\/payments/);
 		expect(raw).not.toMatch(/reviewer:\s*\{\}/);
 		expect((await f.getProject("pay")).overrides).toEqual({});
+		// unsetting something the project never overrode is a no-op
+		await f.unsetSetting({ project: "pay" }, "policy.approvals");
+		await f.unsetSetting({ project: "pay" }, "stages.delivery.ci.mode");
+		expect(readFileSync(t.configPath, "utf8")).toBe(raw);
 	});
 
 	test("overrides can be set as soon as the project exists, before its repo does, and apply from the first run", async () => {

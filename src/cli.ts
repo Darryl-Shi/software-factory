@@ -155,7 +155,7 @@ async function main() {
 				return print("retrying");
 			case "settings": {
 				const sub = pos[1];
-				if (!sub) return settingsMenu(client, project);
+				if (!sub) return await settingsMenu(client, project);
 				if (sub === "get") {
 					const eff = await client.call<Record<string, { value: unknown; source: string }>>("getSettings", scope);
 					if (!pos[2]) return print(json ? eff : Object.entries(eff).map(([k, e]) => `${k} = ${JSON.stringify(e.value)}  (${e.source})`).join("\n"));

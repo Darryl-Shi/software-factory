@@ -2,7 +2,7 @@
 // (renders getRun + the active role Conversation incl. the builder's helpers, follows events, answers asks) and a
 // settings menu generated from settingsSchema(). It talks to the process that owns the core over the cli socket.
 import { connect, type Socket } from "node:net";
-import { createInterface, type Interface } from "node:readline";
+import { createInterface } from "node:readline";
 import YAML from "yaml";
 import { expandHome } from "../../core/settings.ts";
 import type { FactoryEvent, RunView, SettingField, TranscriptItem, TranscriptView } from "../../core/types.ts";
@@ -134,15 +134,16 @@ export async function attach(client: Client, run: string, opts: { interactive: b
 		for (const h of tr.helpers) await showConversation(h, indent + "    ");
 	};
 	if (v.conversations.active) await showConversation(v.conversations.active);
-	let rl: Interface | undefined;
+	let rl: ReturnType<typeof lineReader> | undefined;
 	let asking: string | undefined;
 	const terminal = () => ["DELIVERED", "FAILED", "CANCELLED"].includes(v.state);
 	const prompt = async () => {
 		if (!opts.interactive || !v.pendingAsk || asking === v.pendingAsk.id) return;
 		asking = v.pendingAsk.id;
-		rl ??= createInterface({ input: process.stdin, output: process.stdout });
+		rl ??= lineReader("");
 		const ask = v.pendingAsk;
-		const answer = await new Promise<string>((r) => rl!.question(C.yellow(`${renderQuestion(v)}\n> `), r));
+		const answer = await rl.ask(C.yellow(`${renderQuestion(v)}\n> `));
+		if (!answer) return;
 		try {
 			await respond(client, v, answer);
 		} catch (e) {
@@ -193,6 +194,28 @@ export async function respond(client: Client, v: RunView, input: string) {
 	throw new Error('type "accept", "more <N>" or "abort"');
 }
 
+/** Line reader that works for TTYs and piped input alike (lines that arrive before a prompt are queued). */
+export function lineReader(onEof = "q") {
+	const rl = createInterface({ input: process.stdin, terminal: false });
+	const queue: string[] = [];
+	const waiting: ((l: string) => void)[] = [];
+	let closed = false;
+	rl.on("line", (l) => (waiting.length ? waiting.shift()!(l) : queue.push(l)));
+	rl.on("close", () => {
+		closed = true;
+		for (const w of waiting.splice(0)) w(onEof);
+	});
+	return {
+		ask(prompt: string): Promise<string> {
+			process.stdout.write(prompt);
+			if (queue.length) return Promise.resolve(queue.shift()!);
+			if (closed) return Promise.resolve(onEof);
+			return new Promise((r) => waiting.push(r));
+		},
+		close: () => rl.close(),
+	};
+}
+
 // ------------------------------------------------------------------ settings
 export function fieldAt(schema: Record<string, SettingField>, path: string): SettingField | undefined {
 	let fields: Record<string, SettingField> | undefined = schema;
@@ -217,8 +240,8 @@ export function parseValue(field: SettingField | undefined, raw: string): unknow
 export async function settingsMenu(client: Client, project: string | undefined) {
 	const scope = project ? { project } : { global: true };
 	const schema = await client.call<Record<string, SettingField>>("settingsSchema");
-	const rl = createInterface({ input: process.stdin, output: process.stdout });
-	const ask = (q: string) => new Promise<string>((r) => rl.question(q, r));
+	const rl = lineReader();
+	const ask = rl.ask;
 	const groups: [string, string][] = [
 		["policy", "Policy"],
 		["roles", "Roles"],

@@ -285,6 +285,7 @@ export class ConfigStore {
 	unset(scope: Scope, path: string): void {
 		const docPath = this.resolvePath(scope, path);
 		const doc = this.doc.clone();
+		if (!doc.hasIn(docPath)) return; // nothing set at this scope: already inheriting
 		doc.deleteIn(docPath);
 		// prune now-empty parent maps (never the project record itself)
 		const stop = "project" in scope ? 2 : 0;
