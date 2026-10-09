@@ -28,7 +28,6 @@ function factory(args: string[], cwd: string, extraEnv: Record<string, string> =
 	);
 }
 
-// Task 4 merge: switch to top-level workdir/sandbox
 function cfg(dir: string, opts: { port?: number } = {}): string {
 	const path = join(dir, "config.yaml");
 	const q = (s: string) => JSON.stringify(s);
@@ -42,9 +41,8 @@ roles:
   builder: { model: scripted/builder }
   helper: { model: scripted/helper }
   reviewer: { model: scripted/reviewer }
-stages:
-  repo: { workdir: ${q(join(dir, "work"))} }
-  environment: { root: ${q(join(dir, "work"))}, sandbox: { enabled: false } }
+workdir: ${q(join(dir, "work"))}
+sandbox: { enabled: false }
 `,
 	);
 	return path;
@@ -127,6 +125,15 @@ test("a config that fails to load fails serve with exit 1", async () => {
 	const s = await serve();
 	expect(s.code).toBe(1);
 	expect(s.stderr).toMatch(/^error: config .*config\.yaml: /m);
+	expect(s.stderr.trim().split("\n")).toHaveLength(1);
+	expect(existsSync(join(dir, "factory.pid"))).toBe(false);
+});
+
+test("a legacy stages config fails serve with exit 1", async () => {
+	writeFileSync(join(dir, "config.yaml"), "version: 1\nweb: { port: 0 }\nstages:\n  delivery: { ci: { mode: off } }\n");
+	const s = await serve();
+	expect(s.code).toBe(1);
+	expect(s.stderr).toMatch(/removed sections \(stages\)/);
 	expect(s.stderr.trim().split("\n")).toHaveLength(1);
 	expect(existsSync(join(dir, "factory.pid"))).toBe(false);
 });
