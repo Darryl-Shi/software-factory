@@ -2,6 +2,7 @@
 // extension"). It wires the platform services (pi-ai models, storage) into the core through dependency injection,
 // installs the factory extensions, and starts the web server.
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { createServer } from "node:net";
 import { dirname, join } from "node:path";
 import type { Models } from "@earendil-works/pi-ai";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
@@ -49,6 +50,17 @@ export interface FactoryProcess {
 	close(): Promise<void>;
 }
 
+/** Throws startWebServer's message if host:port is taken (listens on it, then closes). */
+function probePort(host: string, port: number): Promise<void> {
+	return new Promise((resolve, reject) => {
+		const server = createServer();
+		server.once("error", (e: NodeJS.ErrnoException) =>
+			reject(e.code === "EADDRINUSE" ? new Error(`web UI: ${host}:${port} is in use (set web.port or pass --port)`) : e),
+		);
+		server.listen(port, host, () => server.close(() => resolve()));
+	});
+}
+
 export async function startFactoryProcess(opts: ProcessOptions = {}): Promise<FactoryProcess> {
 	const configPath = expandHome(opts.configPath ?? process.env.FACTORY_CONFIG ?? DEFAULT_CONFIG);
 	if (!existsSync(configPath)) {
@@ -65,13 +77,17 @@ export async function startFactoryProcess(opts: ProcessOptions = {}): Promise<Fa
 		...(opts.ciPollMs ? { ciPollMs: opts.ciPollMs } : {}),
 		log,
 	});
-	await factory.start();
 	const cfg = factory.config.effective({ global: true }).web;
+	const webHost = String(cfg.host);
+	const webPort = opts.webPort ?? Number(cfg.port);
+	// Fail on a busy port before start() resumes any run; startWebServer below is the real check.
+	if (webPort !== 0) await probePort(webHost, webPort);
+	await factory.start();
 	let web: FactoryProcess["web"];
 	try {
 		web = await startWebServer(factory.as("web"), {
-			host: String(cfg.host),
-			port: opts.webPort ?? Number(cfg.port),
+			host: webHost,
+			port: webPort,
 			tokenFile: join(factoryHome(configPath), "web-token"),
 			log,
 		});
