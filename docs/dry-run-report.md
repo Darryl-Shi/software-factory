@@ -1,10 +1,12 @@
-# Dry run of spec §8 — 2026-10-09T09:32:17.310Z
+# Dry run of spec §8 — 2026-10-09T16:40:16.156Z
 
-Directory: /tmp/sf-dr2. Scripted agents (no model credentials), sandbox ON, fake GitHub with local CI runner, SQLite storage, driven through the `factory` CLI.
+Directory: /home/dshi/tmp-sf/dr6. Scripted agents (no model credentials), sandbox OFF (DRYRUN_SANDBOX=0), fake GitHub with local CI runner, SQLite storage, a daemonized `factory serve` driven through the web HTTP API (`POST /api/op/<op>`, `GET /api/events`).
 
-**50/50 checks passed.**
+Dropped CLI-only checks: none. The terminal attach view check is replaced by the SSE event stream check.
 
-## §8.1 zero-to-MVP: factory run todo --repo me/todo (repo does not exist)
+**54/54 checks passed.**
+
+## §8.1 zero-to-MVP: createProject todo → me/todo and startRun (repo does not exist)
 - ✅ repo did not exist before the run
 - ✅ spec rejection returns the run to the discussion (same architect)
 - ✅ discussion asked two questions, one at a time
@@ -25,20 +27,19 @@ Directory: /tmp/sf-dr2. Scripted agents (no model credentials), sandbox ON, fake
 - ✅ if-present on a repo without CI: finished and noted that there was no CI
 - ✅ cost per role per round recorded in the run Document
 - ✅ helper Conversation spawned by the builder is visible in the transcript view
-- ✅ terminal attach view followed the run to DELIVERED
+- ✅ the SSE event stream reported run.state → DELIVERED
 
 ## §8.4 invalid setting is rejected and the config file is unchanged
-- ✅ factory settings set stages.delivery.ci.fixRounds 5 is rejected
+- ✅ setSetting ci.fixRounds 5 is rejected
 - ✅ config file unchanged
 
-## §8.2 incremental: factory run todo "add due dates and an --overdue filter"
+## §8.2 incremental: startRun todo "add due dates and an --overdue filter"
 - ✅ incremental delivered
 - ✅ the architect grounded the discussion in the repo (read docs/spec.md first)
 - ✅ delivered as a PR on the same repo
 - ✅ human input only for the discussion and the spec approval
 - ✅ the reviewer's own test run passed
 - ✅ PR branch has the due-date feature
-- ✅ agent cannot reach GitHub directly: git push to origin and api.github.com fail inside the sandbox
 - ✅ in-flight run kept its pinned reviewer (scripted/reviewer, high)
 
 ## §8.3 delivery and merge gates on for the project; reject once at each
@@ -72,6 +73,13 @@ Directory: /tmp/sf-dr2. Scripted agents (no model credentials), sandbox ON, fake
 - ✅ CI failure with fixRounds 0 → ESCALATED
 - ✅ no CI fix round was run
 
+## Web UI and its API
+- ✅ the link factory serve printed is the one in web-url (mode 0600)
+- ✅ factory web prints the link
+- ✅ the API refuses requests without the token
+- ✅ with the token it lists every run of the trial
+- ✅ the link sets an HttpOnly, SameSite=Strict session cookie
+- ✅ messages to a finished run are refused with a pointer to a new run (`message` op)
+
 ## §8.5 pass criteria
 - ✅ all runs recorded with cost and round counts
-- ✅ no agent-made ref reached the remotes (only main and factory/<run> branches)

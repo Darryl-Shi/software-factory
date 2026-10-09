@@ -1,25 +1,27 @@
-// Dry trial of spec §8 through the real `factory` CLI: a `factory serve` process (SQLite storage, sandbox ON, a
-// fake GitHub on the local disk with a local CI runner, scripted agents) driven by CLI commands only. Every step
-// names the §8 item it exercises. Writes <dir>/report.md and exits non-zero if a check fails.
+// Dry trial of spec §8 through the web HTTP API: a daemonized `factory serve` (SQLite storage, sandbox ON, a fake
+// GitHub on the local disk with a local CI runner, scripted agents) driven by `POST /api/op/<op>` calls and the
+// `GET /api/events` stream; `factory serve`, `web` and `stop` are the only CLI commands it runs. Every step names the
+// §8 item it exercises. Writes <dir>/report.md and exits non-zero if a check fails.
 //
 //   npm run dry-run                  # fresh dir under /tmp
 //   DRYRUN_DIR=/tmp/x npm run dry-run
 //   DRYRUN_SANDBOX=0 npm run dry-run   # where the sandbox runtime can't run (e.g. no socat on Linux)
-import { type ChildProcess, execFile, spawn } from "node:child_process";
-import { createWriteStream, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { appendFileSync, createWriteStream, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
+import YAML from "yaml";
+import { fieldAt } from "../src/core/settings.ts";
+import { daemonFiles, livePid } from "../src/daemon.ts";
 import { LocalGitHubHost } from "../src/github/host.ts";
-import type { RunView } from "../src/core/types.ts";
+import type { FactoryEvent, RunView, Scope, SettingField, TranscriptView } from "../src/core/types.ts";
 
 const pexec = promisify(execFile);
 const ROOT = resolve(import.meta.dirname, "..");
-const DIR = process.env.DRYRUN_DIR ?? mkdtempSync(join(tmpdir(), "sf-dryrun-"));
+const DIR = resolve(process.env.DRYRUN_DIR ?? mkdtempSync(join(tmpdir(), "sf-dryrun-")));
 mkdirSync(DIR, { recursive: true });
 const CONFIG = join(DIR, "config.yaml");
-// Unix socket paths are limited to ~107 bytes: in a deep directory, use a relative path (commands run in DIR).
-const SOCKET = join(DIR, "factory.sock").length > 100 ? "factory.sock" : join(DIR, "factory.sock");
 const GH = join(DIR, "github");
 const BIN = join(ROOT, "bin/factory");
 const ME = "me";
@@ -36,19 +38,13 @@ roles:
   builder: { model: scripted/builder }
   helper: { model: scripted/helper }
   reviewer: { model: scripted/reviewer }
-stages:
-  interface:
-    socket: ${SOCKET}
-    port: 0
-  repo:
-    workdir: ${join(DIR, "work")}
-  environment:
-    root: ${join(DIR, "work")}
-    sandbox:
-      enabled: ${SANDBOX}
-  delivery:
-    ci:
-      noChecksTimeout: 4s
+workdir: ${join(DIR, "work")}
+sandbox:
+  enabled: ${SANDBOX}
+ci:
+  noChecksTimeout: 4s
+web:
+  port: 0
 `,
 );
 
@@ -69,45 +65,112 @@ function section(s: string) {
 	say(`\n== ${s}`);
 }
 
-let server: ChildProcess | undefined;
-async function serve() {
-	server = spawn(BIN, ["serve", "--config", CONFIG, "--fake-github", GH, "--scripted", "--ci-poll-ms", "200"], {
-		cwd: DIR,
-		env: { ...process.env, DRYRUN_TURN_DELAY_MS: process.env.DRYRUN_TURN_DELAY_MS ?? "250" },
-		stdio: ["ignore", "ignore", "pipe"],
-	});
-	server.stderr!.pipe(createWriteStream(join(DIR, "serve.log"), { flags: "a" }));
-	const t0 = Date.now();
-	for (;;) {
-		try {
-			await factory("project", "list");
-			return;
-		} catch {
-			if (Date.now() - t0 > 30_000) throw new Error("factory serve did not come up; see serve.log");
-			await sleep(200);
-		}
+/** Runs a `factory` CLI command; its stdout and stderr also go to serve.log. */
+async function factory(...args: string[]): Promise<string> {
+	try {
+		const { stdout, stderr } = await pexec(BIN, args, {
+			cwd: DIR,
+			env: { ...process.env, NO_COLOR: "1", DRYRUN_TURN_DELAY_MS: process.env.DRYRUN_TURN_DELAY_MS ?? "250" },
+			maxBuffer: 64 << 20,
+		});
+		appendFileSync(join(DIR, "serve.log"), `$ factory ${args.join(" ")}\n${stdout}${stderr}`);
+		return stdout.trim();
+	} catch (e: any) {
+		appendFileSync(join(DIR, "serve.log"), `$ factory ${args.join(" ")}\n${e.stdout ?? ""}${e.stderr ?? e.message}\n`);
+		throw e;
 	}
-}
-async function kill9() {
-	const s = server!;
-	s.kill("SIGKILL");
-	await new Promise((r) => (s.exitCode !== null ? r(null) : s.once("exit", r)));
 }
 
-async function factory(...args: string[]): Promise<string> {
-	const { stdout } = await pexec(BIN, args, { cwd: DIR, env: { ...process.env, FACTORY_SOCKET: SOCKET, NO_COLOR: "1" }, maxBuffer: 64 << 20 });
-	return stdout.trim();
+/** The web UI link `factory serve` printed; port 0 picks a new port on every start, so it is re-read after each. */
+let link = "";
+const token = () => new URL(link).searchParams.get("token") ?? "";
+const auth = () => ({ authorization: `Bearer ${token()}` });
+
+async function serve() {
+	link = await factory("serve", "--config", CONFIG, "--fake-github", GH, "--scripted", "--ci-poll-ms", "200");
+	if (!/^http:\/\/127\.0\.0\.1:\d+\/\?token=/.test(link)) throw new Error(`factory serve printed no link: ${link}`);
 }
-async function factoryFails(...args: string[]): Promise<string | undefined> {
-	try {
-		await factory(...args);
-		return undefined;
-	} catch (e: any) {
-		return String(e.stderr ?? e.message);
+async function kill9(): Promise<number> {
+	const pid = livePid(CONFIG);
+	if (pid === undefined) throw new Error("no live factory to kill");
+	process.kill(pid, "SIGKILL");
+	for (;;) {
+		try {
+			process.kill(pid, 0);
+		} catch {
+			return pid;
+		}
+		await sleep(50);
 	}
 }
-const status = async (run: string) => JSON.parse(await factory("status", run, "--json")) as RunView;
-const transcript = async (run: string, which: string) => JSON.parse(await factory("transcript", run, which, "--json")) as any;
+
+/** Calls a core operation over the web API; `ok: false` throws its error. */
+async function api<T = any>(op: string, ...args: unknown[]): Promise<T> {
+	const res = await fetch(new URL(`/api/op/${op}`, link), { method: "POST", headers: { "content-type": "application/json", ...auth() }, body: JSON.stringify({ args }) });
+	const body = (await res.json()) as { ok: true; result: T } | { ok: false; error: string; code?: string };
+	if (!body.ok) throw new Error(body.error);
+	return body.result;
+}
+async function apiFails(op: string, ...args: unknown[]): Promise<string | undefined> {
+	try {
+		await api(op, ...args);
+		return undefined;
+	} catch (e: any) {
+		return String(e.message);
+	}
+}
+
+/** Opens `/api/events?run=` and collects its events until `close()`. */
+function events(run: string): { got: FactoryEvent[]; close(): void } {
+	const got: FactoryEvent[] = [];
+	const ctl = new AbortController();
+	(async () => {
+		const res = await fetch(new URL(`/api/events?run=${encodeURIComponent(run)}`, link), { headers: auth(), signal: ctl.signal });
+		if (!res.ok || !res.body) throw new Error(`events: HTTP ${res.status}`);
+		const dec = new TextDecoder();
+		let buf = "";
+		for await (const chunk of res.body) {
+			buf += dec.decode(chunk as Uint8Array, { stream: true });
+			let i: number;
+			while ((i = buf.indexOf("\n\n")) >= 0) {
+				const frame = buf.slice(0, i);
+				buf = buf.slice(i + 2);
+				const data = frame.split("\n").filter((l) => l.startsWith("data: ")).map((l) => l.slice(6)).join("\n");
+				if (data) got.push(JSON.parse(data));
+			}
+		}
+	})().catch((e) => {
+		if (!ctl.signal.aborted) say(`  event stream error: ${e.message}`);
+	});
+	return { got, close: () => ctl.abort() };
+}
+
+const scopeOf = (project?: string): Scope => (project ? { project } : { global: true });
+let schema: Record<string, SettingField> | undefined;
+/** Parses a setting value as YAML according to the schema (as the settings form does), then `setSetting`. */
+async function setSetting(path: string, raw: string, project?: string) {
+	schema ??= await api<Record<string, SettingField>>("settingsSchema");
+	const field = fieldAt(schema, path.split("."));
+	let v: unknown = YAML.parse(raw);
+	if (field && (field.type === "string" || field.type === "secretRef" || field.type === "enum") && typeof v !== "string") v = raw;
+	if (field?.type === "list" && typeof v === "string") v = v.split(",").map((s) => s.trim()).filter(Boolean);
+	await api("setSetting", scopeOf(project), path, v);
+}
+const unsetSetting = (path: string, project?: string) => api("unsetSetting", scopeOf(project), path);
+const startRun = (project: string, title: string, body: string) => api<string>("startRun", project, { source: "web", title, body });
+async function resolveEscalation(run: string, choice: { accept: true } | { abort: true }) {
+	const v = await status(run);
+	if (v.pendingAsk?.question.kind !== "escalation") throw new Error(`${run}: no escalation is pending`);
+	await api("resolveEscalation", run, v.pendingAsk.id, choice);
+}
+
+const status = (run: string) => api<RunView>("getRun", run);
+async function transcript(run: string, which: "architect" | "builder" | "reviewer"): Promise<TranscriptView> {
+	const c = (await status(run)).conversations;
+	const id = which === "reviewer" ? c.reviewers.at(-1)?.id : c[which];
+	if (!id) throw new Error(`${run}: no ${which} conversation yet`);
+	return api<TranscriptView>("getConversation", run, id);
+}
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 async function until(run: string, pred: (v: RunView) => boolean, what: string, ms = 120_000): Promise<RunView> {
@@ -135,11 +198,11 @@ async function drive(run: string, answers: string[], opts: { gates?: (v: RunView
 		if (ask.question.kind === "discussion") {
 			const a = answers.shift() ?? "Your call; keep it simple.";
 			say(`  architect asks: ${ask.question.text}\n  human answers: ${a}`);
-			await factory("answer", run, a);
+			await api("answer", run, ask.id, a);
 		} else if (ask.question.kind === "approval") {
 			if (opts.gates && (await opts.gates(v))) continue;
 			say(`  approve ${ask.question.gate}`);
-			await factory("approve", run, ask.question.gate);
+			await api("approve", run, ask.question.gate);
 		} else return v;
 	}
 }
@@ -161,8 +224,9 @@ async function main() {
 	const host = new LocalGitHubHost(GH); // the driver's view of the fake GitHub (state file + bare remotes)
 
 	// ---------------------------------------------------------------- §8.1 zero-to-MVP
-	section("§8.1 zero-to-MVP: factory run todo --repo me/todo (repo does not exist)");
-	const run1 = JSON.parse(await factory("run", "todo", "--repo", `${ME}/todo`, "--title", "CLI todo tool", "--json", "CLI todo tool: add/list/done/remove, JSON file storage, tests")).run as string;
+	section("§8.1 zero-to-MVP: createProject todo → me/todo and startRun (repo does not exist)");
+	await api("createProject", "todo", `${ME}/todo`);
+	const run1 = await startRun("todo", "CLI todo tool", "CLI todo tool: add/list/done/remove, JSON file storage, tests");
 	say(`  run ${run1}`);
 	check("repo did not exist before the run", !existsSync(join(GH, "remotes", ME, "todo.git")) || !host.state().created.includes(`${ME}/todo`));
 	const answers1 = ["Node.js 22, no third-party dependencies; use the built-in node:test runner.", "Configurable with the TODO_FILE environment variable, default ./todo.json."];
@@ -173,7 +237,7 @@ async function main() {
 			if (pendingKind(v, "approval", "spec") && !rejected) {
 				rejected = true;
 				say("  §8.3 reject the spec once");
-				await factory("reject", run1, "spec", "Default the file to ~/.todo.json and write it atomically.");
+				await api("reject", run1, "spec", "Default the file to ~/.todo.json and write it atomically.");
 				const back = await until(run1, (x) => x.state === "DISCUSSING" || x.state === "SPEC_READY" || (pendingKind(x, "approval", "spec") && (x.artifacts.spec?.version ?? 0) > 1), "back to discussion");
 				check("spec rejection returns the run to the discussion (same architect)", back.history.some((h) => h.from === "AWAITING_APPROVAL" && h.to === "DISCUSSING") && back.conversations.architect === v.conversations.architect);
 				return true;
@@ -190,18 +254,17 @@ async function main() {
 	for (let i = 0; i < 100 && (await transcript(run1, "builder")).items.length < 4; i++) await sleep(50);
 	const before = await status(run1);
 	const trBefore = await transcript(run1, "builder");
-	await kill9();
-	say(`  killed the factory (pid ${server!.pid}) in ${before.state}, round ${before.reviewRound}, builder transcript ${trBefore.items.length} items`);
+	const killed = await kill9();
+	say(`  killed the factory (pid ${killed}) in ${before.state}, round ${before.reviewRound}, builder transcript ${trBefore.items.length} items`);
 	await serve();
 	const after = await status(run1);
 	check("after restart the run is still BUILDING at the same round", after.state === "BUILDING" && after.reviewRound === mid.reviewRound, `${after.state} round ${after.reviewRound}`);
 	check("same builder Conversation after restart", after.conversations.builder === before.conversations.builder);
-	const attachLog = join(DIR, "attach-run1.log");
-	const attachProc = spawn(BIN, ["attach", run1, "--no-input"], { cwd: DIR, env: { ...process.env, FACTORY_SOCKET: SOCKET, NO_COLOR: "1" }, stdio: ["ignore", "pipe", "pipe"] });
-	attachProc.stdout!.pipe(createWriteStream(attachLog));
+	const stream1 = events(run1);
 	v1 = await drive(run1, []);
-	await Promise.race([new Promise((r) => (attachProc.exitCode !== null ? r(null) : attachProc.once("exit", r))), sleep(3000)]);
-	attachProc.kill();
+	const deliveredEvent = () => stream1.got.some((e) => e.type === "run.state" && e.to === "DELIVERED");
+	for (let i = 0; i < 60 && !deliveredEvent(); i++) await sleep(50);
+	stream1.close();
 	check("zero-to-MVP delivered", v1.state === "DELIVERED", v1.failure?.reason);
 	const trB = await transcript(run1, "builder");
 	check("the builder's first input was admitted once (idempotent across the crash)", trB.items.filter((i: any) => i.role === "user" && /^# Build/.test(i.text)).length === 1);
@@ -218,24 +281,24 @@ async function main() {
 	check("if-present on a repo without CI: finished and noted that there was no CI", v1.noCi === true && v1.history.some((h) => h.to === "AWAITING_CI"));
 	check("cost per role per round recorded in the run Document", ["architect", "builder", "reviewer"].every((r) => v1.cost.some((c) => c.role === r)) && v1.cost.filter((c) => c.role === "reviewer").map((c) => c.round).join() === "1,2", JSON.stringify(v1.cost.map((c) => [c.role, c.round])));
 	check("helper Conversation spawned by the builder is visible in the transcript view", trB.helpers.length === 1);
-	const attachOut = readFileSync(attachLog, "utf8");
-	check("terminal attach view followed the run to DELIVERED", /→ DELIVERED/.test(attachOut) && /report_done|submit_review/.test(attachOut));
+	const states1 = stream1.got.flatMap((e) => (e.type === "run.state" ? [e.to] : []));
+	check("the SSE event stream reported run.state → DELIVERED", deliveredEvent(), `run.state events: ${states1.join(" > ") || "(none)"}`);
 
 	// ---------------------------------------------------------------- §8.4 settings checks (invalid value)
 	section("§8.4 invalid setting is rejected and the config file is unchanged");
 	const cfgBefore = readFileSync(CONFIG, "utf8");
-	const err = await factoryFails("settings", "set", "stages.delivery.ci.fixRounds", "5");
-	check("factory settings set stages.delivery.ci.fixRounds 5 is rejected", !!err && /maximum 3/.test(err), err);
+	const err = await apiFails("setSetting", { global: true }, "ci.fixRounds", 5);
+	check("setSetting ci.fixRounds 5 is rejected", !!err && /maximum 3/.test(err), err);
 	check("config file unchanged", readFileSync(CONFIG, "utf8") === cfgBefore);
 
 	// ---------------------------------------------------------------- §8.2 incremental
-	section("§8.2 incremental: factory run todo \"add due dates and an --overdue filter\"");
-	const run2 = await factory("run", "todo", "add due dates and an --overdue filter");
+	section("§8.2 incremental: startRun todo \"add due dates and an --overdue filter\"");
+	const run2 = await startRun("todo", "add due dates and an --overdue filter", "add due dates and an --overdue filter");
 	say(`  run ${run2}`);
 	await until(run2, (x) => x.state !== "RECEIVED", "run started");
 	// §8.4: change the reviewer's model and thinking while run2 is in flight
-	await factory("settings", "set", "roles.reviewer.model", "scripted/reviewer-b");
-	await factory("settings", "set", "roles.reviewer.thinking", "medium");
+	await setSetting("roles.reviewer.model", "scripted/reviewer-b");
+	await setSetting("roles.reviewer.thinking", "medium");
 	const v2 = await drive(run2, ["Yes: plain YYYY-MM-DD calendar dates, compared with today's local date."]);
 	check("incremental delivered", v2.state === "DELIVERED", v2.failure?.reason);
 	check("the architect grounded the discussion in the repo (read docs/spec.md first)", (await transcript(run2, "architect")).items.some((i: any) => i.toolCalls?.some((t: any) => t.name === "read")));
@@ -244,7 +307,7 @@ async function main() {
 	check("the reviewer's own test run passed", await reviewerRanTestsGreen(run2));
 	const prSrc = (await pexec("git", ["--git-dir", join(GH, "remotes", ME, "todo.git"), "show", `${v2.artifacts.delivery!.ref}:src/todo.js`])).stdout;
 	check("PR branch has the due-date feature", /parseDue/.test(prSrc) && /isOverdue/.test(prSrc));
-	const pushTry = (await transcript(run2, "builder")).items.find((i: any) => i.toolResult?.name === "bash" && /PUSH-EXIT/.test(i.toolResult.text))?.toolResult.text ?? "";
+	const pushTry = (await transcript(run2, "builder")).items.find((i: any) => i.toolResult?.name === "bash" && /PUSH-EXIT/.test(i.toolResult.text))?.toolResult?.text ?? "";
 	if (!SANDBOX) say("  (sandbox OFF: the check that agents can't reach GitHub is skipped)");
 	else check("agent cannot reach GitHub directly: git push to origin and api.github.com fail inside the sandbox", /origin\s+\S+todo\.git \(push\)/.test(pushTry) && /PUSH-EXIT=[1-9]/.test(pushTry) && /GITHUB-API-EXIT=[1-9]/.test(pushTry), pushTry.slice(0, 600));
 	say(`  builder's push attempt inside the sandbox:\n${pushTry.trim().split("\n").map((l: string) => `      ${l}`).join("\n")}`);
@@ -252,8 +315,8 @@ async function main() {
 
 	// ---------------------------------------------------------------- §8.3 gate rejections
 	section("§8.3 delivery and merge gates on for the project; reject once at each");
-	await factory("settings", "set", "policy.approvals", "[spec, delivery, merge]", "--project", "todo");
-	const run3 = await factory("run", "todo", "--title", "add a --version flag", "add a --version flag that prints the package version");
+	await setSetting("policy.approvals", "[spec, delivery, merge]", "todo");
+	const run3 = await startRun("todo", "add a --version flag", "add a --version flag that prints the package version");
 	const rejectedGates = new Set<string>();
 	const roundsAt: Record<string, number> = {};
 	const v3 = await drive(run3, [], {
@@ -264,7 +327,7 @@ async function main() {
 			roundsAt[gate] = v.reviewRound;
 			const fb = gate === "delivery" ? "README must show an example of the --version output." : "Mention the --version flag in AGENTS.md.";
 			say(`  reject ${gate}: ${fb}`);
-			await factory("reject", run3, gate, fb);
+			await api("reject", run3, gate, fb);
 			const w = await until(run3, (x) => x.state === "REVIEWING" || x.state === "AWAITING_APPROVAL" && x.pendingAsk?.id !== v.pendingAsk!.id, "after rejection");
 			const tr = await transcript(run3, "builder");
 			const lastIn = tr.items.filter((i: any) => i.role === "user").at(-1)?.text ?? "";
@@ -275,48 +338,48 @@ async function main() {
 	});
 	check("run with both gate rejections delivered (merged)", v3.state === "DELIVERED" && host.state().prs.some((p) => p.head === v3.artifacts.delivery?.ref && p.state === "merged"), v3.failure?.reason);
 	check("both gates were rejected once", rejectedGates.has("delivery") && rejectedGates.has("merge"));
-	const revIns = await Promise.all(v3.conversations.reviewers.map((r) => factory("transcript", run3, r.id, "--json").then((s) => JSON.parse(s))));
+	const revIns = await Promise.all(v3.conversations.reviewers.map((r) => api<TranscriptView>("getConversation", run3, r.id)));
 	check("the next reviewer saw the human finding", revIns.some((tr) => tr.items.some((i: any) => i.role === "user" && /Human findings from a gate rejection/.test(i.text) && /--version output/.test(i.text))));
 	check("next new run's reviewer uses the changed model/thinking (scripted/reviewer-b, medium)", v3.cost.filter((c) => c.role === "reviewer").every((c) => c.model === "scripted/reviewer-b" && c.thinking === "medium"));
-	await factory("settings", "unset", "policy.approvals", "--project", "todo");
+	await unsetSetting("policy.approvals", "todo");
 
 	// ---------------------------------------------------------------- §8.3 CI modes on a repo without CI
 	section("§8.3 ci.mode off: finishes at delivery without waiting for CI");
-	await factory("settings", "set", "stages.delivery.ci.mode", "off", "--project", "todo");
-	const run4 = await factory("run", "todo", "--title", "add a --quiet flag", "add a --quiet flag that suppresses output");
+	await setSetting("ci.mode", "off", "todo");
+	const run4 = await startRun("todo", "add a --quiet flag", "add a --quiet flag that suppresses output");
 	const v4 = await drive(run4, []);
 	check("mode off: DELIVERED without AWAITING_CI", v4.state === "DELIVERED" && !v4.history.some((h) => h.to === "AWAITING_CI"), v4.history.map((h) => h.to).join(">"));
 
 	section("§8.3 ci.mode required on a repo with no CI checks: escalates after ci.noChecksTimeout");
-	await factory("settings", "set", "stages.delivery.ci.mode", "required", "--project", "todo");
-	const run5 = await factory("run", "todo", "--title", "add a --json flag", "add a --json flag to list");
+	await setSetting("ci.mode", "required", "todo");
+	const run5 = await startRun("todo", "add a --json flag", "add a --json flag to list");
 	const t5 = Date.now();
 	const v5 = await drive(run5, []);
 	const waited = v5.history.find((h) => h.to === "ESCALATED")!;
 	check("mode required, no checks: ESCALATED with 'no CI checks'", v5.state === "ESCALATED" && /no CI checks/.test(v5.pendingAsk?.question.kind === "escalation" ? v5.pendingAsk.question.reason : ""), JSON.stringify(v5.pendingAsk));
 	check("escalation came after ci.noChecksTimeout (4s)", !!waited && Date.now() - t5 >= 4000);
-	await factory("escalation", run5, "abort");
+	await resolveEscalation(run5, { abort: true });
 	check("escalation abort → CANCELLED", (await until(run5, (x) => x.state === "CANCELLED", "cancel")).state === "CANCELLED");
-	await factory("settings", "unset", "stages.delivery.ci.mode", "--project", "todo");
+	await unsetSetting("ci.mode", "todo");
 
 	// ---------------------------------------------------------------- §8.3 round cap
 	section("§8.3 hit the review round cap: escalates; accept delivers with the findings on record");
-	await factory("settings", "set", "roles.reviewer.model", "scripted/reviewer-strict", "--project", "todo");
-	await factory("settings", "set", "policy.reviewRoundCap", "2", "--project", "todo");
-	const run6 = await factory("run", "todo", "--title", "add a --color flag", "add a --color flag");
+	await setSetting("roles.reviewer.model", "scripted/reviewer-strict", "todo");
+	await setSetting("policy.reviewRoundCap", "2", "todo");
+	const run6 = await startRun("todo", "add a --color flag", "add a --color flag");
 	const v6 = await drive(run6, []);
 	check("round cap reached → ESCALATED after 2 review rounds", v6.state === "ESCALATED" && v6.reviewRound === 2 && /round cap/.test((v6.pendingAsk?.question as any)?.reason ?? ""));
-	await factory("escalation", run6, "accept");
+	await resolveEscalation(run6, { accept: true });
 	const v6b = await until(run6, (x) => ["DELIVERED", "FAILED", "CANCELLED"].includes(x.state), "delivery after accept");
 	check("accept → delivered with known findings", v6b.state === "DELIVERED");
-	await factory("settings", "unset", "roles.reviewer.model", "--project", "todo");
-	await factory("settings", "unset", "policy.reviewRoundCap", "--project", "todo");
+	await unsetSetting("roles.reviewer.model", "todo");
+	await unsetSetting("policy.reviewRoundCap", "todo");
 
 	// ---------------------------------------------------------------- §8.3 todo2: CI required on a new repo
 	section("§8.3 todo2: new repo, ci.mode required set before the repo exists; builder ships CI");
-	await factory("project", "create", "todo2", "--repo", `${ME}/todo2`);
-	await factory("settings", "set", "stages.delivery.ci.mode", "required", "--project", "todo2");
-	const run7 = await factory("run", "todo2", "--title", "CLI todo tool", "CLI todo tool: add/list/done/remove, JSON file storage, tests");
+	await api("createProject", "todo2", `${ME}/todo2`);
+	await setSetting("ci.mode", "required", "todo2");
+	const run7 = await startRun("todo2", "CLI todo tool", "CLI todo tool: add/list/done/remove, JSON file storage, tests");
 	const v7 = await drive(run7, ["Node.js, no dependencies, node:test.", "TODO_FILE env var, default ./todo.json."]);
 	check("todo2 delivered", v7.state === "DELIVERED", v7.failure?.reason);
 	const c7 = await cloneMain(`${ME}/todo2`);
@@ -326,35 +389,31 @@ async function main() {
 	check("the run waited for and passed CI on the pushed commit on main", v7.history.some((h) => h.to === "AWAITING_CI") && ck7.length > 0 && ck7.every((c) => c.conclusion === "success") && !v7.noCi, JSON.stringify(ck7));
 
 	section("§8.3 ci.fixRounds 0 and a forced CI failure: escalates without a fix round");
-	await factory("settings", "set", "stages.delivery.ci.fixRounds", "0", "--project", "todo2");
+	await setSetting("ci.fixRounds", "0", "todo2");
 	host.forceChecks(`${ME}/todo2`, [{ name: "test", status: "completed", conclusion: "failure", output: "1 failing: forced failure" } as any]);
-	const run8 = await factory("run", "todo2", "--title", "add a --version flag", "add a --version flag");
+	const run8 = await startRun("todo2", "add a --version flag", "add a --version flag");
 	const v8 = await drive(run8, []);
 	const b8 = await transcript(run8, "builder");
 	check("CI failure with fixRounds 0 → ESCALATED", v8.state === "ESCALATED" && /CI failed/.test((v8.pendingAsk?.question as any)?.reason ?? ""), JSON.stringify(v8.pendingAsk));
 	check("no CI fix round was run", v8.ciFixes === 0 && !b8.items.some((i: any) => i.role === "user" && /CI fix/.test(i.text)));
-	await factory("escalation", run8, "abort");
+	await resolveEscalation(run8, { abort: true });
 	await until(run8, (x) => x.state === "CANCELLED", "cancel");
 
-	// ---------------------------------------------------------------- the web UI that ships by default
-	section("Web UI (default interface extension)");
-	const runs = JSON.parse(await factory("runs", "--json")) as RunView[];
-	const urlFile = join(DIR, "web-url");
-	const link = existsSync(urlFile) ? readFileSync(urlFile, "utf8").trim() : "";
-	check("factory serve started the web UI and wrote its link (mode 0600)", /^http:\/\/127\.0\.0\.1:\d+\/\?token=/.test(link) && (statSync(urlFile).mode & 0o777) === 0o600, link ? undefined : "no web-url file");
-	if (link) {
-		check("factory web prints the link", (await factory("web", "--config", CONFIG)) === link);
-		const base = new URL(link);
-		const post = (op: string, args: unknown[], auth = true) =>
-			fetch(new URL(`/api/op/${op}`, base), { method: "POST", headers: { "content-type": "application/json", ...(auth ? { authorization: `Bearer ${base.searchParams.get("token")}` } : {}) }, body: JSON.stringify({ args }) });
-		check("the API refuses requests without the token", (await post("listRuns", [], false)).status === 401);
-		const listed = (await (await post("listRuns", [])).json()) as { ok: boolean; result: RunView[] };
-		check("with the token it lists the same runs as the CLI", listed.ok && listed.result.map((r) => r.id).sort().join() === runs.map((r) => r.id).sort().join());
-		const page = await fetch(new URL(`/?token=${base.searchParams.get("token")}`, base), { redirect: "manual" });
-		check("the link sets an HttpOnly, SameSite=Strict session cookie", page.status === 303 && /HttpOnly; SameSite=Strict/.test(page.headers.get("set-cookie") ?? ""));
-		const err = await factoryFails("message", run1, "thanks!");
-		check("messages to a finished run are refused with a pointer to a new run (CLI `message`)", !!err && /start a new run/.test(err), err);
-	}
+	// ---------------------------------------------------------------- the web UI and its API
+	section("Web UI and its API");
+	const urlFile = daemonFiles(CONFIG).url;
+	const written = existsSync(urlFile) ? readFileSync(urlFile, "utf8").trim() : "";
+	check("the link factory serve printed is the one in web-url (mode 0600)", written === link && (statSync(urlFile).mode & 0o777) === 0o600, written ? `${written} vs ${link}` : "no web-url file");
+	check("factory web prints the link", (await factory("web", "--config", CONFIG)) === link);
+	const noToken = await fetch(new URL("/api/op/listRuns", link), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ args: [] }) });
+	check("the API refuses requests without the token", noToken.status === 401);
+	const runs = await api<RunView[]>("listRuns");
+	const started = [run1, run2, run3, run4, run5, run6, run7, run8];
+	check("with the token it lists every run of the trial", runs.map((r) => r.id).sort().join() === started.sort().join(), runs.map((r) => r.id).join());
+	const page = await fetch(new URL(`/?token=${token()}`, link), { redirect: "manual" });
+	check("the link sets an HttpOnly, SameSite=Strict session cookie", page.status === 303 && /HttpOnly; SameSite=Strict/.test(page.headers.get("set-cookie") ?? ""));
+	const msgErr = await apiFails("message", run1, "thanks!");
+	check("messages to a finished run are refused with a pointer to a new run (`message` op)", !!msgErr && /start a new run/.test(msgErr), msgErr);
 
 	// ---------------------------------------------------------------- pass criteria summary
 	section("§8.5 pass criteria");
@@ -369,12 +428,14 @@ main()
 		check(`trial aborted: ${e.message}`, false, e.stack);
 	})
 	.finally(async () => {
-		if (server && server.exitCode === null) server.kill("SIGTERM");
+		await factory("stop", "--config", CONFIG).catch((e) => say(`factory stop failed: ${e.stderr ?? e.message}`));
 		const failed = checks.filter((c) => !c.ok);
 		const md = [
 			`# Dry run of spec §8 — ${new Date().toISOString()}`,
 			"",
-			`Directory: ${DIR}. Scripted agents (no model credentials), sandbox ${SANDBOX ? "ON" : "OFF (DRYRUN_SANDBOX=0)"}, fake GitHub with local CI runner, SQLite storage, driven through the \`factory\` CLI.`,
+			`Directory: ${DIR}. Scripted agents (no model credentials), sandbox ${SANDBOX ? "ON" : "OFF (DRYRUN_SANDBOX=0)"}, fake GitHub with local CI runner, SQLite storage, a daemonized \`factory serve\` driven through the web HTTP API (\`POST /api/op/<op>\`, \`GET /api/events\`).`,
+			"",
+			"Dropped CLI-only checks: none. The terminal attach view check is replaced by the SSE event stream check.",
 			"",
 			`**${checks.length - failed.length}/${checks.length} checks passed.**`,
 			"",
