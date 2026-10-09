@@ -98,16 +98,6 @@ export interface PrRef {
 export type Delivery = { kind: "repo" | "pr"; url: string; ref: string; sha: string; pr?: PrRef };
 export type CiStatus = { state: "none" | "pending" | "green" | "red"; failures?: string[]; checks?: { name: string; state: string }[] };
 
-export interface RunUpdate {
-	status: "started" | "progress" | "done" | "failed" | "cancelled";
-	state: RunState;
-	url?: string;
-	message?: string;
-	advisory?: Finding[];
-	acceptedBlocking?: Finding[];
-	noCi?: boolean;
-}
-
 export interface Notice {
 	at: number;
 	level: "info" | "warn" | "error";
@@ -135,25 +125,6 @@ export type SettingSource = "default" | "global" | "project";
 export type EffectiveSettings = Record<string, { value: unknown; source: SettingSource }>;
 
 // ---------------------------------------------------------------- factory extensions (§3.2, §3.3)
-export interface FactoryCoreRef {
-	/** Name of the extension (used for Request.source, stage `use`). */
-	name: string;
-}
-
-export interface IntakeExtension extends Configurable {
-	kind: "intake";
-	name: string;
-	pull(): Promise<Omit<Request, "id">[]>;
-	subscribe?(onRequest: (r: Omit<Request, "id">) => void): Unsubscribe;
-	writeBack(req: Request, update: RunUpdate): Promise<void>;
-}
-
-export interface InterfaceExtension extends Configurable {
-	kind: "interface";
-	name: string;
-	start(core: FactoryCore): Promise<{ stop(): Promise<void> }>;
-}
-
 /** Per-call context the core hands to stage extensions: the run's pinned stage settings. */
 export interface StageCallOptions {
 	runId: string;
@@ -204,8 +175,8 @@ export interface EnvironmentExtension extends Configurable {
 	dispose(envId: string): Promise<void>;
 }
 
-export type FactoryExtension = IntakeExtension | InterfaceExtension | RepoExtension | DeliveryExtension | EnvironmentExtension;
-export type StageName = "intake" | "interface" | "repo" | "delivery" | "environment";
+export type FactoryExtension = RepoExtension | DeliveryExtension | EnvironmentExtension;
+export type StageName = "repo" | "delivery" | "environment";
 
 // ---------------------------------------------------------------- projects, runs, events (§3.5, §3.6)
 export interface Project {

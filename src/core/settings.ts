@@ -25,7 +25,7 @@ export function resolveSecret(ref: string | undefined): string | undefined {
 	return undefined; // store: references need a secret-store integration (not in v1)
 }
 
-// ---------------------------------------------------------------- core schema (policy + roles; storage is global-only)
+// ---------------------------------------------------------------- core schema (policy + roles; web and storage are global-only)
 const thinking: SettingField = { type: "enum", values: ["off", "low", "medium", "high"], description: "Thinking level" };
 function roleField(model: string, level: string, extensions: string[], description: string): SettingField {
 	return {
@@ -72,6 +72,14 @@ export function coreSchema(): Record<string, SettingField> {
 				},
 			},
 		},
+		web: {
+			type: "object",
+			description: "Web UI (global only)",
+			fields: {
+				host: { type: "string", default: "127.0.0.1", description: "Address the web UI listens on (keep it on localhost)" },
+				port: { type: "number", default: 7317, min: 0, max: 65535, description: "Port of the web UI (0 picks a free port)" },
+			},
+		},
 		storage: {
 			type: "object",
 			description: "Harness storage (global only)",
@@ -83,7 +91,7 @@ export function coreSchema(): Record<string, SettingField> {
 	};
 }
 
-export const GLOBAL_ONLY = ["storage", "version"];
+export const GLOBAL_ONLY = ["storage", "version", "web"];
 export const PROJECT_ONLY = ["repo"];
 
 // ---------------------------------------------------------------- schema helpers

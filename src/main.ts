@@ -1,19 +1,18 @@
 // The factory process: the one process that owns the storage and the core (spec §3.6 "Transport belongs to the
 // extension"). It wires the platform services (pi-ai models, storage) into the core through dependency injection,
-// installs the factory extensions and the worker extensions, and starts the configured interface extensions.
+// installs the factory extensions and the worker extensions, and starts the web server.
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Models } from "@earendil-works/pi-ai";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import { Factory } from "./core/core.ts";
 import { expandHome } from "./core/settings.ts";
-import type { FactoryExtension } from "./core/types.ts";
 import { DEFAULT_WORKER_EXTENSIONS, DEFAULT_WORKER_SETTINGS } from "./agents/tools.ts";
 import { githubDelivery } from "./github/delivery.ts";
 import { GhApiHost, type GitHubHost, LocalGitHubHost } from "./github/host.ts";
 import { githubRepo } from "./github/repo.ts";
 import { localWorktree } from "./sandbox/sandbox.ts";
-import { webInterface } from "./web/server.ts";
+import { startWebServer } from "./web/server.ts";
 
 export interface ProcessOptions {
 	configPath?: string;
@@ -21,11 +20,10 @@ export interface ProcessOptions {
 	fakeGithub?: string;
 	/** Register the scripted dry-run agents as provider "scripted" (no credentials needed). */
 	scripted?: boolean;
-	/** Port of the web interface (overrides stages.interface.port; 0 picks a free port). */
+	/** Port of the web UI (overrides web.port; 0 picks a free port). */
 	webPort?: number;
 	ciPollMs?: number;
 	log?: (m: string) => void;
-	extraExtensions?: FactoryExtension[];
 }
 
 export const DEFAULT_CONFIG = "~/.factory/config.yaml";
@@ -45,7 +43,15 @@ export async function createModels(scripted: boolean): Promise<Models> {
 	return models;
 }
 
-export async function startFactoryProcess(opts: ProcessOptions = {}) {
+export interface FactoryProcess {
+	factory: Factory;
+	host: GitHubHost;
+	web: { url: string; stop(): Promise<void> };
+	/** Stops the web server, then the factory. */
+	close(): Promise<void>;
+}
+
+export async function startFactoryProcess(opts: ProcessOptions = {}): Promise<FactoryProcess> {
 	const configPath = expandHome(opts.configPath ?? process.env.FACTORY_CONFIG ?? DEFAULT_CONFIG);
 	if (!existsSync(configPath)) {
 		mkdirSync(dirname(configPath), { recursive: true });
@@ -60,8 +66,6 @@ export async function startFactoryProcess(opts: ProcessOptions = {}) {
 			githubRepo(host),
 			githubDelivery(host),
 			localWorktree({ stateDir: join(factoryHome(configPath), "environments") }),
-			webInterface({ tokenFile: join(factoryHome(configPath), "web-token"), ...(opts.webPort !== undefined ? { port: opts.webPort } : {}), log }),
-			...(opts.extraExtensions ?? []),
 		],
 		workerExtensions: DEFAULT_WORKER_EXTENSIONS,
 		workerSettings: DEFAULT_WORKER_SETTINGS,
@@ -69,6 +73,29 @@ export async function startFactoryProcess(opts: ProcessOptions = {}) {
 		log,
 	});
 	await factory.start();
-	await factory.startInterfaces();
-	return { factory, host };
+	const cfg = factory.config.effective({ global: true }).web;
+	let web: FactoryProcess["web"];
+	try {
+		web = await startWebServer(factory.as("web"), {
+			host: String(cfg.host),
+			port: opts.webPort ?? Number(cfg.port),
+			tokenFile: join(factoryHome(configPath), "web-token"),
+			log,
+		});
+	} catch (e) {
+		await factory.close().catch(() => {});
+		throw e;
+	}
+	return {
+		factory,
+		host,
+		web,
+		async close() {
+			try {
+				await web.stop();
+			} finally {
+				await factory.close();
+			}
+		},
+	};
 }

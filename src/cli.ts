@@ -17,7 +17,7 @@ const print = (v: unknown) => console.log(typeof v === "string" ? v : JSON.strin
 
 const HELP = `factory — software factory on Pi Durable
 
-  factory serve [--config ~/.factory/config.yaml] [--fake-github dir] [--scripted]
+  factory serve [--config ~/.factory/config.yaml] [--port n] [--fake-github dir] [--scripted]
   factory doctor [--config path]
   factory web [--config path]                    print the web UI link (with its access token)
 `;
@@ -27,15 +27,19 @@ async function main() {
 	if (!cmd || flags.help) return print(HELP);
 	if (cmd === "serve") {
 		const { startFactoryProcess } = await import("./main.ts");
-		const { factory } = await startFactoryProcess({
+		const webPort = typeof flags.port === "string" ? (/^\d+$/.test(flags.port) ? Number(flags.port) : NaN) : undefined;
+		if (webPort !== undefined && !(webPort >= 0 && webPort <= 65535))
+			throw new Error(`--port: expected a port number from 0 to 65535, got ${flags.port}`);
+		const proc = await startFactoryProcess({
 			...(typeof flags.config === "string" ? { configPath: flags.config } : {}),
+			...(webPort !== undefined ? { webPort } : {}),
 			...(typeof flags["fake-github"] === "string" ? { fakeGithub: flags["fake-github"] } : {}),
 			...(typeof flags["ci-poll-ms"] === "string" ? { ciPollMs: Number(flags["ci-poll-ms"]) } : {}),
 			scripted: !!flags.scripted || process.env.FACTORY_SCRIPTED === "1",
 		});
-		console.error(`[factory] serving (pid ${process.pid}); config ${factory.config.path}`);
+		console.error(`[factory] serving (pid ${process.pid}); config ${proc.factory.config.path}`);
 		const stop = async () => {
-			await factory.close().catch(() => {});
+			await proc.close().catch(() => {});
 			process.exit(0);
 		};
 		process.on("SIGINT", stop);
@@ -49,7 +53,7 @@ async function main() {
 		const { expandHome } = await import("./core/settings.ts");
 		const { DEFAULT_CONFIG } = await import("./main.ts");
 		const file = join(dirname(expandHome(typeof flags.config === "string" ? flags.config : (process.env.FACTORY_CONFIG ?? DEFAULT_CONFIG))), "web-url");
-		if (!existsSync(file)) throw new Error("the web UI isn't running: start `factory serve` (stages.interface.use must include web)");
+		if (!existsSync(file)) throw new Error("the factory isn't running: start it with `factory serve`");
 		return print(read(file, "utf8").trim());
 	}
 	throw new Error(`unknown command ${cmd}\n\n${HELP}`);

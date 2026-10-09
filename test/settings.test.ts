@@ -103,6 +103,8 @@ describe("settings layering", () => {
 			[G, "stages.environment.sandbox.extraWrite", ["~"], /home directory/],
 			[G, "stages.environment.sandbox.extraWrite", ["~/.ssh/keys"], /denied secret path/],
 			[{ project: "p" }, "storage.path", "/tmp/x.sqlite", /global only/],
+			[{ project: "p" }, "web.port", 8000, /global only/],
+			[G, "web.port", 70000, /above the maximum 65535/],
 			[G, "policy.nonsense", 1, /unknown setting/],
 			[{ project: "nope" }, "policy.reviewRoundCap", 2, /does not exist/],
 			[G, "stages.repo.identity.kind", "app", /needs identity.appId/],
@@ -130,9 +132,9 @@ describe("settings layering", () => {
 	test("settingsSchema includes the core's and every installed extension's schemas", async () => {
 		t = await makeFactory();
 		const schema = t.factory.settingsSchema();
-		expect(Object.keys(schema)).toEqual(["version", "roles", "policy", "storage", "stages", "workers"]);
+		expect(Object.keys(schema)).toEqual(["version", "roles", "policy", "web", "storage", "stages", "workers"]);
 		const stages = (schema.stages as any).fields;
-		expect(Object.keys(stages)).toEqual(["intake", "interface", "repo", "delivery", "environment"]);
+		expect(Object.keys(stages)).toEqual(["repo", "delivery", "environment"]);
 		expect(Object.keys(stages.delivery.fields)).toEqual(["use", "newRepo", "existingRepo", "ci"]);
 		expect(Object.keys(stages.delivery.fields.ci.fields)).toEqual(["mode", "fixRounds", "checks", "noChecksTimeout"]);
 		expect(Object.keys(stages.repo.fields)).toContain("identity");

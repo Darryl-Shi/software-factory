@@ -41,8 +41,6 @@ import {
 	type Gate,
 	type HumanFinding,
 	type HumanMessage,
-	type IntakeExtension,
-	type InterfaceExtension,
 	type Project,
 	type RepoExtension,
 	type Request,
@@ -92,8 +90,6 @@ export class Factory implements FactoryCore {
 	private cache = new Map<string, RunDocState>();
 	private convIndex = new Map<string, { run: string; role: Role }>();
 	private convThrottle = new Map<string, NodeJS.Timeout>();
-	private interfaces: { stop(): Promise<void> }[] = [];
-	private intakeStops: (() => void)[] = [];
 	private ctx: Context = BACKGROUND_CONTEXT;
 	private now: () => number;
 	private log: (msg: string) => void;
@@ -114,7 +110,6 @@ export class Factory implements FactoryCore {
 			repo: (cfg) => this.ext<RepoExtension>("repo", cfg.use),
 			delivery: (cfg) => this.ext<DeliveryExtension>("delivery", cfg.use),
 			environment: (cfg) => this.ext<EnvironmentExtension>("environment", cfg.use),
-			intake: (cfg) => (cfg.use && cfg.use !== "none" ? this.ext<IntakeExtension>("intake", cfg.use) : undefined),
 			workerExtensions: (role, names) => this.workerExtensionsFor(role, names),
 			bridge: Bridge,
 			changed: (runId, ms) => this.changed(runId, ms),
@@ -189,27 +184,7 @@ export class Factory implements FactoryCore {
 				this.log(`run ${run.id} was pinned to pi-durable ${run.pinned.piVersion}; this process runs ${PI_DURABLE_VERSION}`);
 	}
 
-	/** Start the configured interface extensions and intakes. The core never calls an interface by name. */
-	async startInterfaces(): Promise<void> {
-		const eff = this.config.effective({ global: true });
-		for (const name of (eff.stages?.interface?.use ?? []) as string[]) {
-			const ext = this.ext<InterfaceExtension>("interface", name);
-			this.interfaces.push(await ext.start(this.as(ext.name)));
-		}
-		const intakeName = eff.stages?.intake?.use;
-		if (intakeName && intakeName !== "none") {
-			const intake = this.ext<IntakeExtension>("intake", intakeName);
-			const take = (r: Omit<Request, "id">) =>
-				void this.startRun(r.project, { ...r, source: intake.name, meta: { ...(r.meta ?? {}), intake: intake.name } }).catch((e) => this.log(`intake: ${e}`));
-			if (intake.subscribe) this.intakeStops.push(intake.subscribe(take));
-			const timer = setInterval(() => void intake.pull().then((rs) => rs.forEach(take)).catch((e) => this.log(`intake pull: ${e}`)), 30_000);
-			this.intakeStops.push(() => clearInterval(timer));
-		}
-	}
-
 	async close(): Promise<void> {
-		for (const s of this.intakeStops) s();
-		for (const i of this.interfaces) await i.stop().catch(() => {});
 		for (const t of this.convThrottle.values()) clearTimeout(t);
 		await this.harness.close(this.ctx);
 	}
@@ -674,21 +649,7 @@ export class Factory implements FactoryCore {
 			return out;
 		};
 		const names = (kind: FactoryExtension["kind"]) => stage(kind).map((e) => e.name);
-		const stages: Record<string, SettingField> = {
-			intake: {
-				type: "object",
-				description: "Where requests come from",
-				fields: { use: { type: "enum", values: ["none", ...names("intake")], default: "none", description: "Intake extension" }, ...fieldsOf(stage("intake")) },
-			},
-			interface: {
-				type: "object",
-				description: "How humans reach the factory",
-				fields: {
-					use: { type: "list", of: { type: "enum", values: names("interface"), description: "interface" }, default: names("interface"), description: "Interface extensions" },
-					...fieldsOf(stage("interface")),
-				},
-			},
-		};
+		const stages: Record<string, SettingField> = {};
 		for (const kind of ["repo", "delivery", "environment"] as const) {
 			stages[kind] = {
 				type: "object",
@@ -723,7 +684,7 @@ export class Factory implements FactoryCore {
 			else if (!this.opts.models.getModel(provider, rest.join("/"))) problems.push(`roles.${role}.model: ${r.model} is not a model createModels() knows`);
 			for (const n of (r.extensions ?? []) as string[]) if (!installed.has(n)) problems.push(`roles.${role}.extensions: ${n} is not an installed worker extension`);
 		}
-		for (const kind of ["intake", "repo", "delivery", "environment", "interface"] as const) {
+		for (const kind of ["repo", "delivery", "environment"] as const) {
 			const st = eff.stages?.[kind];
 			if (!isObj(st)) continue;
 			const uses = Array.isArray(st.use) ? st.use : [st.use];

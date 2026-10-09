@@ -1,12 +1,14 @@
-// Interface extension `web` (spec §3.6 transport): token and cookie auth, Host/Origin/content-type checks, the
+// The web server (spec §3.6 transport): token and cookie auth, Host/Origin/content-type checks, the
 // operation allowlist and error codes, the event stream, the token file, a busy port, and the static UI.
+import { once } from "node:events";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { createServer, request } from "node:http";
+import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { Script } from "node:vm";
 import { afterEach, describe, expect, test } from "vitest";
 import type { FactoryEvent } from "../src/core/types.ts";
-import { loadToken, webInterface } from "../src/web/server.ts";
+import { loadToken, startWebServer } from "../src/web/server.ts";
 import { inState, makeFactory, type TestEnv, until } from "./helpers.ts";
 
 let t: TestEnv | undefined;
@@ -24,11 +26,10 @@ async function serve(opts: { port?: number } = {}) {
 	t ??= await makeFactory();
 	const logs: string[] = [];
 	const tokenFile = join(t.dir, "home", "web-token");
-	const web = await webInterface({ tokenFile, port: opts.port ?? 0, log: (m) => logs.push(m) }).start(t.factory.as("web"));
-	const { url, stop } = web as { url?: string; stop(): Promise<void> };
+	const { url, stop } = await startWebServer(t.factory.as("web"), { host: "127.0.0.1", port: opts.port ?? 0, tokenFile, log: (m) => logs.push(m) });
 	stops.push(stop);
-	const u = url ? new URL(url) : undefined;
-	return { url, stop, logs, tokenFile, token: u?.searchParams.get("token") ?? "", port: u ? Number(u.port) : 0 };
+	const u = new URL(url);
+	return { url, stop, logs, tokenFile, token: u.searchParams.get("token") ?? "", port: Number(u.port) };
 }
 
 interface Res {
@@ -99,18 +100,13 @@ describe("access", () => {
 		expect(second.token).toBe(first.token);
 	});
 
-	test("a busy port leaves the factory running without the web UI", async () => {
-		const blocker = createServer();
-		await new Promise<void>((r) => blocker.listen(0, "127.0.0.1", () => r()));
-		const port = (blocker.address() as { port: number }).port;
-		try {
-			const { url, logs } = await serve({ port });
-			expect(url).toBeUndefined();
-			expect(logs.join("\n")).toContain("in use");
-			expect(await t!.factory.listProjects()).toEqual([]);
-		} finally {
-			blocker.close();
-		}
+	test("a busy port is an error, not a silent no-UI start", async () => {
+		const blocker = createServer().listen(0, "127.0.0.1");
+		await once(blocker, "listening");
+		const port = (blocker.address() as AddressInfo).port;
+		t = await makeFactory();
+		await expect(startWebServer(t.factory.as("web"), { host: "127.0.0.1", port })).rejects.toThrow(`127.0.0.1:${port} is in use`);
+		blocker.close();
 	});
 });
 
@@ -133,7 +129,7 @@ describe("operations and events", () => {
 		expect(bad.status).toBe(400);
 		const schema = JSON.parse((await op(port, token, "settingsSchema")).body).result;
 		expect(Object.keys(schema)).toContain("workers");
-		expect(webInterface().settings!.schema).toMatchObject({ host: { default: "127.0.0.1" }, port: { type: "number", default: 7317 } });
+		expect(schema.web.fields).toMatchObject({ host: { default: "127.0.0.1" }, port: { type: "number", default: 7317 } });
 	});
 
 	test("the event stream carries core events; runs started over HTTP are attributed to `web`", async () => {

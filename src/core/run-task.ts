@@ -27,7 +27,6 @@ import type {
 	Finding,
 	FindingResponse,
 	Gate,
-	IntakeExtension,
 	Notice,
 	PendingAsk,
 	Question,
@@ -35,7 +34,6 @@ import type {
 	ReviewResult,
 	Role,
 	RunState,
-	RunUpdate,
 } from "./types.ts";
 
 type Phase = RunState | "FINAL";
@@ -46,7 +44,6 @@ export interface CoreServices {
 	repo(cfg: Record<string, any>): RepoExtension;
 	delivery(cfg: Record<string, any>): DeliveryExtension;
 	environment(cfg: Record<string, any>): EnvironmentExtension;
-	intake(cfg: Record<string, any>): IntakeExtension | undefined;
 	/** Worker extensions (Pi Durable extensions) for a role, from the run's pinned role config. */
 	workerExtensions(role: Role, names: string[]): Extension[];
 	bridge: Extension;
@@ -418,8 +415,6 @@ export function createRunTask(svc: CoreServices) {
 			const env = svc.environment(stage(d, "environment"));
 			const envs: RunDocState["envs"] = {};
 			for (const role of ["architect", "builder", "reviewer", "helper"] as Role[]) envs[role] = await env.provision(ws, role, opts(d, "environment"));
-			const intake = svc.intake(stage(d, "intake"));
-			if (intake && d.request.meta?.intake) await intake.writeBack(d.request, { status: "started", state: "PREPARING" });
 			await transition(rt, c, d.id, async (doc, tx): Promise<Phase> => {
 				doc.workspace = ws;
 				doc.envs = envs;
@@ -741,17 +736,6 @@ export function createRunTask(svc: CoreServices) {
 	}
 
 	async function sideEffectsAtEnd(d: RunDocState) {
-		const intake = svc.intake(stage(d, "intake"));
-		const update: RunUpdate = {
-			status: d.state === "DELIVERED" ? "done" : d.state === "FAILED" ? "failed" : "cancelled",
-			state: d.state,
-			...(d.artifacts.delivery?.url ? { url: d.artifacts.delivery.url } : {}),
-			advisory: d.advisory,
-			acceptedBlocking: d.acceptedBlocking,
-			...(d.noCi ? { noCi: true } : {}),
-			...(d.failure ? { message: d.failure.reason } : {}),
-		};
-		if (intake && d.request.meta?.intake) await intake.writeBack(d.request, update).catch((e) => svc.log(`writeBack failed: ${e}`));
 		const env = svc.environment(stage(d, "environment"));
 		for (const e of Object.values(d.envs)) if (e) await env.dispose(e.envId).catch((err) => svc.log(`dispose failed: ${err}`));
 	}
