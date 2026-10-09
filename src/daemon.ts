@@ -1,7 +1,7 @@
 // `factory serve` as a daemon: the detached factory process and the files it keeps next to the config file
 // (factory.pid, factory.log, web-url). Every path here derives from an absolute config path.
 import { spawn } from "node:child_process";
-import { closeSync, existsSync, fstatSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 export function daemonFiles(configPath: string): { pid: string; log: string; url: string } {
@@ -9,21 +9,29 @@ export function daemonFiles(configPath: string): { pid: string; log: string; url
 	return { pid: join(home, "factory.pid"), log: join(home, "factory.log"), url: join(home, "web-url") };
 }
 
-function isAlive(pid: number): boolean {
+/** Whether pid is a live `factory serve` process of ours. A pid file left by a SIGKILL or a reboot can name a pid
+ * that now belongs to an unrelated process: on Linux its command line must name src/cli.ts and `serve`. */
+function isFactory(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
-		return true;
-	} catch (e) {
-		return (e as NodeJS.ErrnoException).code === "EPERM";
+	} catch {
+		return false; // ESRCH, or EPERM: another user's process, so not ours
+	}
+	if (!existsSync("/proc/self/cmdline")) return true; // no /proc: liveness is all we can check
+	try {
+		const args = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0");
+		return args.some((a) => a.endsWith("src/cli.ts")) && args.includes("serve");
+	} catch {
+		return false;
 	}
 }
 
-/** The pid of the running factory, or undefined. A pid file whose process is gone is deleted. */
+/** The pid of the running factory, or undefined. A pid file that doesn't name a running factory is deleted. */
 export function livePid(configPath: string): number | undefined {
 	const file = daemonFiles(configPath).pid;
 	if (!existsSync(file)) return undefined;
 	const pid = Number(readFileSync(file, "utf8").trim());
-	if (Number.isInteger(pid) && pid > 0 && isAlive(pid)) return pid;
+	if (Number.isInteger(pid) && pid > 0 && isFactory(pid)) return pid;
 	rmSync(file, { force: true });
 	return undefined;
 }
@@ -57,6 +65,7 @@ export async function startDaemon(configPath: string, serveArgs: string[], timeo
 	const files = daemonFiles(configPath);
 	rmSync(files.url, { force: true }); // left behind by a factory that was killed; no factory runs now
 	const [cmd, pre] = factoryCommand();
+	mkdirSync(dirname(files.log), { recursive: true }); // first run: the config directory may not exist yet
 	const out = openSync(files.log, "a", 0o600); // the log carries the web UI link with its token
 	const logStart = fstatSync(out).size;
 	let child;
@@ -92,7 +101,7 @@ export async function stopDaemon(configPath: string, timeoutMs = 10_000): Promis
 		process.kill(pid, "SIGTERM");
 	} catch {}
 	const deadline = Date.now() + timeoutMs;
-	while (isAlive(pid)) {
+	while (isFactory(pid)) {
 		if (Date.now() >= deadline) throw new Error(`factory (pid ${pid}) did not stop within ${timeoutMs / 1000}s`);
 		await sleep(100);
 	}

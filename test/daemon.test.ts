@@ -16,8 +16,8 @@ interface Result {
 }
 
 /** Runs `bin/factory`; never throws. */
-function factory(args: string[], cwd: string): Promise<Result> {
-	const env = { ...process.env };
+function factory(args: string[], cwd: string, extraEnv: Record<string, string> = {}): Promise<Result> {
+	const env = { ...process.env, ...extraEnv };
 	delete env.FACTORY_CONFIG;
 	delete env.FACTORY_SCRIPTED;
 	return new Promise((resolve) =>
@@ -66,7 +66,7 @@ beforeEach(() => {
 	dir = mkdtempSync(join(tmpdir(), "sf-daemon-"));
 });
 afterEach(async () => {
-	await factory(["stop", "--config", join(dir, "config.yaml")], tmpdir());
+	for (const config of [join(dir, "config.yaml"), join(dir, ".factory", "config.yaml")]) await factory(["stop", "--config", config], tmpdir());
 	rmSync(dir, { recursive: true, force: true });
 });
 
@@ -154,6 +154,37 @@ test("a stale pid file is cleaned up", async () => {
 	const second = readPid(dir);
 	expect(second).not.toBe(first);
 	expect(alive(second)).toBe(true);
+});
+
+test("a pid file naming an unrelated live process is stale", async () => {
+	cfg(dir);
+	// The test runner is alive but isn't a factory: stop must not signal it.
+	writeFileSync(join(dir, "factory.pid"), `${process.pid}\n`);
+	const stop = await factory(["stop", "--config", "config.yaml"], dir);
+	expect(stop.code).toBe(0);
+	expect(stop.stdout.trim()).toBe("not running");
+	expect(existsSync(join(dir, "factory.pid"))).toBe(false);
+	// Nor does it keep serve from starting.
+	writeFileSync(join(dir, "factory.pid"), `${process.pid}\n`);
+	const s = await serve();
+	expect(s.code).toBe(0);
+	const pid = readPid(dir);
+	expect(pid).not.toBe(process.pid);
+	expect(alive(pid)).toBe(true);
+});
+
+test("first serve on a fresh install creates the config directory", async () => {
+	// HOME points into the temp dir, so the default ~/.factory/config.yaml (and its storage) live there.
+	const home = { HOME: dir };
+	const config = join(dir, ".factory", "config.yaml");
+	expect(existsSync(join(dir, ".factory"))).toBe(false);
+	const s = await factory(["serve", "--scripted", "--port", "0"], dir, home);
+	expect(s.stderr).toBe("");
+	expect(s.code).toBe(0);
+	expect(s.stdout).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/\?token=/m);
+	expect(existsSync(config)).toBe(true);
+	expect(existsSync(join(dir, ".factory", "factory.pid"))).toBe(true);
+	expect((await factory(["stop"], tmpdir(), home)).stdout.trim()).toBe("stopped");
 });
 
 test("stop/status/web with nothing running", async () => {
