@@ -102,7 +102,7 @@ leaves open, and the places where the code still differs from it.
     - **Spec:** every stage (intake, interface, repo, delivery, environment) is an extension selected by `stages.<kind>.use`, and each role's worker extensions are chosen in its settings (§3.2, §3.3, §5, §6).
     - **Built:** the core calls a `GitHub` class and a `Sandbox` class directly; the web UI is the only interface; each role has a fixed tool set; settings live at `workdir`, `github.*`, `ci.*`, `sandbox.*`, `web.*` and `webSearch.*`. `factory serve` runs in the background, and `stop`, `status`, `web` and `doctor` are the only other commands.
     - **Why:** every stage had exactly one implementation, so the pluggability added contracts, lookups, schema merging and docs without buying anything.
-    - *(Since then, `factory setup` was added as a further command; see 36.)*
+    - *(Since then, `factory setup` was added as a further command; see 36–42.)*
 
 ## AQ testing and helpers that write (§2, §3.7, §9, §9.1 — added after the fixed architecture)
 
@@ -119,6 +119,30 @@ leaves open, and the places where the code still differs from it.
 
 36. **pi-coding-agent as the model host.** The factory now depends on `@earendil-works/pi-coding-agent@1.1.0` (pinned; it depends on the same `pi-ai ^1.1.0`, so there is one copy of pi-ai).
     - **Spec:** the core receives `createModels()` with pi-ai's providers "straight from Pi" (§3), and a role's `model` is one that `createModels()` knows (§6).
-    - **Why:** pi-durable takes a pi-ai `Models` object and has no extension or package loader. Provider packages, `models.json` endpoints and stored logins (API key or OAuth, with locking and refresh in `auth.json`) are pi-coding-agent's: its `DefaultPackageManager` installs packages, its resource loader runs their extensions, and its `ModelRuntime` combines all of them into one `Models`. Using it avoids reimplementing that, and keeps the formats `pi` users know.
     - **Built:** `createModelHost` (`src/models/host.ts`) runs pi-coding-agent's services over `<factory home>/pi`, with that directory as `cwd` too, so nothing is read from `~/.pi/agent` or from a `.pi/` directory where `serve` starts. `Factory` receives the `ModelRuntime` as its `Models` and is otherwise unchanged. Only what extensions register as **providers and virtual models** is used; their tools, commands, flags and event hooks attach to pi-coding-agent sessions, which the factory never creates, and each role's tool set stays fixed (27).
+    - **Why:** pi-durable takes a pi-ai `Models` object and has no extension or package loader. Provider packages, `models.json` endpoints and stored logins (API key or OAuth, with locking and refresh in `auth.json`) are pi-coding-agent's: its `DefaultPackageManager` installs packages, its resource loader runs their extensions, and its `ModelRuntime` combines all of them into one `Models`. Using it avoids reimplementing that, and keeps the formats `pi` users know.
     - **Cost:** extensions are loaded and **run in-process**, outside the sandbox, with access to the factory's credentials. `factory setup` shows a warning and asks before it installs a package. Extension load errors are diagnostics (`serve` logs them, `doctor` warns), never a failed start. New packages and `models.json` changes need a restart; credentials apply live.
+37. **A failed login offers Retry / Skip, not Save anyway.**
+    - **Spec:** a check that fails, a failed login included, always offers Retry / Save anyway / Skip (§3.4, §5).
+    - **Built:** a failed login, and a failed save of a compatible endpoint's key, offer **Retry** / **Skip**. A missing `gh` in the `github` section does too. Failed verifications (`GET /user`, missing token scopes, the App token, boat, the Parallel test search, the endpoint test call) offer all three.
+    - **Why:** a login that failed stored nothing, so there is nothing to save anyway.
+38. **A rejected setting is not asked again, except in `roles`.**
+    - **Spec:** when validation rejects a value, setup shows the message and prompts again; the file is unchanged (§3.3, §5).
+    - **Built:** `roles` offers **Retry**, which asks again for the roles the error names, or **Skip**. `github` puts back the secrets it just stored, shows the error with `fix the problem (e.g. factory setup roles), then run factory setup github`, and returns; the wizard goes on to the next section. `prereqs`, `qa` and `search` show the error and return. The config file is unchanged in every case.
+    - **Why:** the config is validated as a whole, so outside `roles` a rejection is about another setting (for example a role model pi doesn't know); asking the same question again can't fix it.
+39. **A package install shows no spinner.**
+    - **Spec:** `packages.install(source)` with a progress spinner (§3.4).
+    - **Built:** setup prints a plain `Installing <source>…` line, and npm's and git's output streams to the terminal.
+    - **Why:** pi runs npm and git with the terminal inherited, so their output would garble a spinner's animation.
+40. **Package removal and re-installs.**
+    - **Spec:** removing a package is refused while a role uses a provider it supplied; a package that registers no provider is offered for removal (§3.4).
+    - **Built:** setup records the providers each package it installs adds, in `pi/factory-packages.json`, and the in-use refusal applies to those. A package installed another way gets a confirm instead: `setup can't tell which providers <source> supplies; remove it anyway?` (default No). Installing the same package at another version or ref replaces it (pi's own behaviour); setup then warns about providers it no longer supplies and never offers removal. Removal is offered only for a new source that registers no provider.
+    - **Why:** pi doesn't record which providers a package registered, and removing the replaced package would bypass the in-use refusal.
+41. **Additions to the wizard** (none relax the spec):
+    - **Credentials the service won't see.** Before installing the service, setup lists the credentials the factory would read from the environment (`env:` refs that resolve, providers whose key pi reads from an env var), since the unit or plist sets only `PATH`, and asks `Install the service anyway?` (default Yes). The `Keep env:…` options in `github`, `qa` and `search` carry the hint `not seen by a service`.
+    - **The outro.** The spec ends with the link "if the service is running, else `next: factory serve`" (§3.1). Setup shows the link whenever the factory runs and has written it, and `the service is starting; factory web prints the link` when the service is active but has not written it yet.
+    - **Endpoint keys.** Adding a compatible endpoint first deletes a credential left under its id, and removing one deletes its key from `auth.json` unless a provider with that id remains (a built-in or package provider the entry overrode).
+42. **The sandbox re-exposes the environment's own paths inside the factory home.**
+    - **Spec:** the sandbox always denies the factory home (`dirname(configPath)`) (§2.3).
+    - **Built:** it still denies the whole home, but re-exposes the environment's own worktree, git directory, scratch dir and `extraWrite` paths when they lie inside it. `secrets.json`, `pi/`, `web-token`, `web-url`, `factory.log`, `factory.sqlite*`, `environments/` and `qa-vms/` are denied regardless.
+    - **Why:** a `workdir` inside the factory home (a custom `--config` layout, or the dry run) otherwise hid the agents' own worktrees from them.
