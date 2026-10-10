@@ -98,7 +98,9 @@ Both live in the factory home, the config file's directory (`~/.factory` by defa
 - The sandbox always denies the factory home, wherever `--config` points. Inside it, it re-exposes only the
   environment's own worktree, git directory, scratch dir and `extraWrite` paths (a `workdir` placed in the home), and
   denies the secret and state entries regardless: `secrets.json`, `pi/` (with `auth.json`), `web-token`, `web-url`,
-  `factory.log`, `factory.sqlite*`, `environments/` and `qa-vms/`. No agent can read a credential stored there.
+  `factory.log`, `factory.sqlite*`, `environments/` and `qa-vms/`, plus the `storage.path` database wherever it
+  lives. No write root may reach the home or the database from outside: such a root is dropped, so no agent can read
+  or rewrite a credential, the config or an environment record stored there.
 
 ## The setup wizard
 
