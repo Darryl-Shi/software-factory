@@ -1,5 +1,6 @@
 // Layered settings (spec §5, §6): default → global → project, validate on save, file unchanged on rejection.
 import { readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import { ROLE_TOOLS } from "../src/agents/tools.ts";
 import { ConfigStore } from "../src/core/settings.ts";
@@ -104,6 +105,10 @@ describe("settings layering", () => {
 			[G, "github.identity.tokenRef", "ghp_abc123", /secret reference/],
 			[G, "sandbox.extraWrite", ["~"], /home directory/],
 			[G, "sandbox.extraWrite", ["~/.ssh/keys"], /denied secret path/],
+			// the factory home is the config's directory: an extraWrite at, inside or around it is refused
+			[G, "sandbox.extraWrite", [dirname(t.configPath)], /factory home/],
+			[G, "sandbox.extraWrite", [join(dirname(t.configPath), "cache")], /factory home/],
+			[G, "sandbox.extraWrite", [dirname(dirname(t.configPath))], /factory home/],
 			[{ project: "p" }, "storage.path", "/tmp/x.sqlite", /global only/],
 			[{ project: "p" }, "web.port", 8000, /global only/],
 			[G, "web.port", 70000, /above the maximum 65535/],

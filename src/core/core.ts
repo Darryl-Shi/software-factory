@@ -692,7 +692,7 @@ export class Factory implements FactoryCore {
 		}
 		if (isObj(eff.boat)) problems.push(...boatProblems(eff.boat).map((p) => `boat.${p}`));
 		if (isObj(eff.github)) problems.push(...githubProblems(eff.github).map((p) => `github.${p}`));
-		if (isObj(eff.sandbox)) problems.push(...sandboxProblems(eff.sandbox).map((p) => `sandbox.${p}`));
+		if (isObj(eff.sandbox)) problems.push(...sandboxProblems(eff.sandbox, dirname(this.opts.configPath)).map((p) => `sandbox.${p}`));
 		if (isObj(eff.ci)) {
 			const t = eff.ci.noChecksTimeout;
 			if (t !== undefined && !(parseDuration(t) >= 0)) problems.push(`ci.noChecksTimeout: "${t}" is not a duration (e.g. 2m, 90s, 500ms)`);

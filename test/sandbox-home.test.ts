@@ -3,7 +3,7 @@
 // so a workdir inside the home (the dry run's layout) stays readable. The most specific rule wins, as in the sandbox
 // runtime: a denyRead entry inside an allowed root is still denied. Hermetic: the sandbox runtime is stubbed and the
 // policy handed to it is inspected.
-import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT as c } from "@earendil-works/chord/context";
@@ -14,28 +14,36 @@ import { Sandbox } from "../src/sandbox/sandbox.ts";
 const PRIVATE = ["secrets.json", "secrets.json.123.tmp", "pi/auth.json", "web-token", "web-url", "factory.log", "factory.sqlite", "factory.sqlite-wal", "factory.sqlite-shm", "environments/x.json", "qa-vms/y.json", "config.yaml"];
 
 function layout(enabled: boolean, over: { denyRead?: string[]; extraWrite?: string[]; role?: string; storage?: string } = {}) {
-	const home = realpathSync(mkdtempSync(join(tmpdir(), "sf-home-")));
+	// The home sits in a directory of its own (<outer>), so a root can contain it without being the system temp dir.
+	const outer = realpathSync(mkdtempSync(join(tmpdir(), "sf-home-")));
+	const home = join(outer, "fh");
 	const stateDir = join(home, "environments");
 	const worktree = join(home, "work", "runs", "r1");
+	const gitDir = join(worktree, ".git");
 	const scratch = join(home, "work", "scratch", "r1-reviewer");
-	for (const d of [stateDir, worktree, scratch, join(home, "pi"), join(home, "qa-vms")]) mkdirSync(d, { recursive: true });
+	for (const d of [stateDir, worktree, scratch, join(home, "pi"), join(home, "qa-vms"), join(gitDir, "hooks"), join(gitDir, "objects")]) mkdirSync(d, { recursive: true });
 	for (const f of PRIVATE) writeFileSync(join(home, f), "SECRET");
+	writeFileSync(join(gitDir, "config"), "[core]\n");
 	writeFileSync(join(worktree, "AGENTS.md"), "# agents\n");
 	writeFileSync(join(worktree, ".env"), "TOKEN=x\n");
+	const sub = (p: string) => p.replace("<home>", home).replace("<outer>", outer);
 	const rec = {
 		envId: "r1-reviewer",
 		role: over.role ?? "reviewer",
 		worktree,
 		cwd: worktree,
+		gitCommonDir: gitDir,
 		scratch,
-		sandbox: { enabled, allowedDomains: [], deniedDomains: [], denyRead: (over.denyRead ?? []).map((p) => p.replace("<home>", home)), extraWrite: (over.extraWrite ?? []).map((p) => p.replace("<home>", home)), unixSockets: "block" },
-		...(over.storage ? { storage: over.storage } : {}),
+		sandbox: { enabled, allowedDomains: [], deniedDomains: [], denyRead: (over.denyRead ?? []).map(sub), extraWrite: (over.extraWrite ?? []).map(sub), unixSockets: "block" },
+		...(over.storage ? { storage: sub(over.storage) } : {}),
 	};
 	writeFileSync(join(stateDir, "r1-reviewer.json"), JSON.stringify(rec));
 	const sandbox = new Sandbox({ stateDir });
 	const env = sandbox.env({ conversationId: "c", envId: "r1-reviewer" });
-	return { home, worktree, scratch, env, sandbox };
+	return { outer, home, worktree, gitDir, scratch, env, sandbox };
 }
+
+const write = async (env: any, p: string) => (await env.writeFile(p, "PWNED", c)) as { ok: boolean; error?: Error };
 
 function stubRuntime() {
 	vi.spyOn(SandboxManager, "checkDependencies").mockReturnValue({ errors: [], warnings: [] } as any);
@@ -88,6 +96,32 @@ describe("factory home inside the sandbox", () => {
 		expect(await read(env, join(home, "cache", "f"))).toBe(true);
 	});
 
+	test("file tools: a write root that contains the home makes neither the home nor the storage writable; the env's own roots stay writable", async () => {
+		const { outer, home, worktree, gitDir, scratch, env } = layout(false, { role: "builder", extraWrite: ["<outer>", "<home>/cache"], storage: "<outer>/db/f.sqlite" });
+		const db = join(outer, "db", "f.sqlite");
+		mkdirSync(join(outer, "db"));
+		writeFileSync(db, "DB");
+		mkdirSync(join(home, "cache"));
+		// the reviewer's spike: config.yaml and the environment record that holds the env's own sandbox policy
+		for (const f of ["config.yaml", "environments/r1-reviewer.json", "environments/x.json", "secrets.json", "pi/auth.json", "anything-new"]) {
+			const r = await write(env, join(home, f));
+			expect(r.ok, f).toBe(false);
+			expect(String(r.error?.message), f).toMatch(/is denied/);
+		}
+		expect(readFileSync(join(home, "config.yaml"), "utf8")).toBe("SECRET");
+		expect(JSON.parse(readFileSync(join(home, "environments", "r1-reviewer.json"), "utf8")).envId).toBe("r1-reviewer");
+		expect(((await env.renameFile(join(worktree, "AGENTS.md"), join(home, "config.yaml"), c)) as any).ok).toBe(false);
+		for (const s of ["", "-wal", "-journal"]) expect((await write(env, db + s)).ok, s).toBe(false);
+		expect(existsSync(`${db}-journal`)).toBe(false);
+		expect(readFileSync(db, "utf8")).toBe("DB");
+		// the root that contains the home is dropped as a whole (sandbox-runtime cannot re-allow a root inside a write deny)
+		expect((await write(env, join(outer, "elsewhere"))).ok).toBe(false);
+		// the env's own roots inside the home stay writable
+		for (const p of [join(worktree, "x.txt"), join(gitDir, "objects", "o"), join(scratch, "s.txt"), join(home, "cache", "c.txt")]) expect((await write(env, p)).ok, p).toBe(true);
+		// and the git dir's hooks and config stay read-only
+		for (const p of [join(gitDir, "hooks", "pre-commit"), join(gitDir, "config")]) expect((await write(env, p)).ok, p).toBe(false);
+	});
+
 	test("the storage path from the run's config (and its -wal/-shm/-journal) is denied wherever it lives", async () => {
 		const elsewhere = realpathSync(mkdtempSync(join(tmpdir(), "sf-store-")));
 		const db = join(elsewhere, "f.sqlite");
@@ -138,5 +172,20 @@ describe("factory home inside the sandbox", () => {
 			expect(fs.allowRead).not.toContain(p);
 			expect(fs.allowWrite).not.toContain(p);
 		}
+	});
+
+	test("commands: a write root that contains the home or the storage is dropped; private entries and storage are write-denied", async () => {
+		const wrap = stubRuntime();
+		const { outer, home, worktree, gitDir, scratch, env } = layout(true, { role: "builder", extraWrite: ["<outer>", "<outer>/db"], storage: "<outer>/db/f.sqlite" });
+		const db = join(outer, "db", "f.sqlite");
+		await env.exec("true", undefined, c);
+		const fs = (wrap.mock.calls.at(-1)![2] as any).filesystem as { allowWrite: string[]; denyWrite: string[] };
+		expect(fs.allowWrite).toEqual(expect.arrayContaining([worktree, gitDir, scratch]));
+		for (const p of [outer, join(outer, "db")]) expect(fs.allowWrite).not.toContain(p);
+		// no write root at or around the home or the storage: the runtime lets a write deny win over any root inside it
+		const around = (p: string, r: string) => p === r || p.startsWith(`${r}/`);
+		for (const r of fs.allowWrite) for (const p of [home, db]) expect(around(p, r), `${r} contains ${p}`).toBe(false);
+		expect(fs.denyWrite).toEqual(expect.arrayContaining([join(gitDir, "hooks"), join(gitDir, "config"), join(home, "secrets.json"), join(home, "environments"), join(home, "pi"), db, `${db}-wal`, `${db}-journal`]));
+		expect(fs.denyWrite).not.toContain(home);
 	});
 });
