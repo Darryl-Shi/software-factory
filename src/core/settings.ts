@@ -1,7 +1,7 @@
 // Layered settings over the config file (spec §5, §6): schema default → global → project.
 // Settings are a view over the config file, not a second store. Validate on save; invalid → file unchanged.
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname } from "node:path";
 import YAML from "yaml";
@@ -355,14 +355,26 @@ function inheritHelper(eff: Obj): Obj {
 export type RuleCheck = (effective: Obj, scope: Scope) => string[];
 
 export class ConfigStore {
-	private doc: YAML.Document;
+	private doc!: YAML.Document;
+	/** The file's identity when `doc` was read (or written): another writer (setup, a second store) changes it. */
+	private loadedStamp: string | undefined;
 
 	constructor(
 		readonly path: string,
 		private schemaFn: () => Record<string, SettingField>,
 		private extraRules: RuleCheck = () => [],
 	) {
-		this.doc = this.load();
+		this.reload();
+	}
+
+	/** mtime, size and inode of the file; undefined when it does not exist. */
+	private stamp(): string | undefined {
+		try {
+			const s = statSync(this.path);
+			return `${s.mtimeMs}:${s.size}:${s.ino}`;
+		} catch {
+			return undefined;
+		}
 	}
 
 	private load(): YAML.Document {
@@ -373,10 +385,26 @@ export class ConfigStore {
 	}
 
 	reload(): void {
+		const stamp = this.stamp(); // before reading: a write in between only causes one more reload
 		this.doc = this.load();
+		this.loadedStamp = stamp;
+	}
+
+	/**
+	 * Re-read the file if it changed since it was read. Writes (`strict`) throw when the changed file does not parse, so
+	 * they never clobber it; reads keep the last good document and retry on the next call.
+	 */
+	private refresh(strict: boolean): void {
+		if (this.stamp() === this.loadedStamp) return;
+		try {
+			this.reload();
+		} catch (e) {
+			if (strict) throw e;
+		}
 	}
 
 	raw(): Obj {
+		this.refresh(false);
 		const v = this.doc.toJS() ?? {};
 		return isObj(v) ? v : {};
 	}
@@ -427,6 +455,7 @@ export class ConfigStore {
 	}
 
 	createProject(name: string, repo: string): Project {
+		this.refresh(true);
 		if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) throw new FactoryError("invalid", `invalid project name: ${name}`);
 		if (!/^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/.test(repo)) throw new FactoryError("invalid", `invalid repo binding (expected owner/name): ${repo}`);
 		const existing = this.projects().find((x) => x.name === name);
@@ -452,6 +481,7 @@ export class ConfigStore {
 	}
 
 	set(scope: Scope, path: string, value: unknown): void {
+		this.refresh(true);
 		const docPath = this.resolvePath(scope, path);
 		const field = fieldAt(this.schema(), path.split("."))!;
 		const problems = validateValue(field, value, path);
@@ -462,6 +492,7 @@ export class ConfigStore {
 	}
 
 	unset(scope: Scope, path: string): void {
+		this.refresh(true);
 		const docPath = this.resolvePath(scope, path);
 		const doc = this.doc.clone();
 		if (!doc.hasIn(docPath)) return; // nothing set at this scope: already inheriting
@@ -515,5 +546,6 @@ export class ConfigStore {
 		writeFileSync(tmp, String(doc));
 		renameSync(tmp, this.path);
 		this.doc = doc;
+		this.loadedStamp = this.stamp();
 	}
 }
