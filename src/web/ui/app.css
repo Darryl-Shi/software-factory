@@ -11,7 +11,7 @@
   --code-bg: #f5f7fa; --scrim: rgba(14, 20, 28, .42);
   --shadow: 0 1px 0 rgba(22, 32, 43, .05), 0 1px 3px rgba(22, 32, 43, .09);
   --shadow-lift: 0 8px 28px rgba(22, 32, 43, .16), 0 2px 6px rgba(22, 32, 43, .08);
-  --r-arch: #7a4fc4; --r-build: #2153cf; --r-help: #4f7f95; --r-rev: #b4532a; --r-core: #59636f;
+  --r-arch: #7a4fc4; --r-build: #2153cf; --r-help: #4f7f95; --r-rev: #b4532a; --r-qa: #2f8a5b; --r-core: #59636f;
   --f-display: "Archivo", "Helvetica Neue", Arial, sans-serif;
   --f-body: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
   --f-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
@@ -30,7 +30,7 @@
     --code-bg: #0f151d; --scrim: rgba(0, 0, 0, .6);
     --shadow: 0 1px 0 rgba(0, 0, 0, .3), 0 1px 3px rgba(0, 0, 0, .4);
     --shadow-lift: 0 10px 30px rgba(0, 0, 0, .55), 0 2px 6px rgba(0, 0, 0, .4);
-    --r-arch: #b593f0; --r-build: #7aa2ff; --r-help: #8fb8c9; --r-rev: #f0956b; --r-core: #9aa5b3;
+    --r-arch: #b593f0; --r-build: #7aa2ff; --r-help: #8fb8c9; --r-rev: #f0956b; --r-qa: #6fcf9b; --r-core: #9aa5b3;
     --sheet: #121821; --rail: #0d1219; --hairline: #222b38; --glass: rgba(6, 9, 14, .6);
     --shadow-soft: 0 1px 2px rgba(0, 0, 0, .3), 0 8px 28px rgba(0, 0, 0, .45);
     color-scheme: dark;
@@ -46,7 +46,7 @@
   --code-bg: #0f151d; --scrim: rgba(0, 0, 0, .6);
   --shadow: 0 1px 0 rgba(0, 0, 0, .3), 0 1px 3px rgba(0, 0, 0, .4);
   --shadow-lift: 0 10px 30px rgba(0, 0, 0, .55), 0 2px 6px rgba(0, 0, 0, .4);
-  --r-arch: #b593f0; --r-build: #7aa2ff; --r-help: #8fb8c9; --r-rev: #f0956b; --r-core: #9aa5b3;
+  --r-arch: #b593f0; --r-build: #7aa2ff; --r-help: #8fb8c9; --r-rev: #f0956b; --r-qa: #6fcf9b; --r-core: #9aa5b3;
   --sheet: #121821; --rail: #0d1219; --hairline: #222b38; --glass: rgba(6, 9, 14, .6);
   --shadow-soft: 0 1px 2px rgba(0, 0, 0, .3), 0 8px 28px rgba(0, 0, 0, .45);
   color-scheme: dark;
@@ -143,7 +143,7 @@ select.proj { border: 1px solid var(--line-strong); background: var(--surface); 
 
 .avatar { width: 22px; height: 22px; border-radius: 50%; display: inline-grid; place-items: center; font: 700 10px/1 var(--f-display); color: var(--surface); flex: none; position: relative; }
 .avatar.architect { background: var(--r-arch); } .avatar.builder { background: var(--r-build); }
-.avatar.helper { background: var(--r-help); } .avatar.reviewer { background: var(--r-rev); }
+.avatar.helper { background: var(--r-help); } .avatar.reviewer { background: var(--r-rev); } .avatar.qa { background: var(--r-qa); }
 .avatar.core { background: var(--r-core); }
 .avatar.live::after { content: ""; position: absolute; inset: -3px; border-radius: 50%; border: 2px solid currentColor; color: var(--ok); animation: pulse 1.6s ease-out infinite; }
 @keyframes pulse { 0% { opacity: .9; transform: scale(.85); } 100% { opacity: 0; transform: scale(1.35); } }
@@ -500,3 +500,8 @@ table.cost tr.total td { font-weight: 600; border-bottom: 0; }
 .loc .mono { overflow-wrap: anywhere; }
 .empty-board { grid-column: 1 / -1; margin: 40px auto; max-width: 420px; text-align: center; color: var(--fg-3); }
 .empty-board b { display: block; color: var(--fg); font: 600 16px/1.3 var(--f-display); margin-bottom: 6px; }
+
+/* QA screenshots: thumbnails in findings and in the QA agent's computer steps */
+.shots { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+.shots a { display: grid; gap: 2px; text-decoration: none; }
+.shots img { width: 120px; max-height: 90px; object-fit: cover; border: 1px solid var(--line, #ccc); border-radius: 6px; background: var(--bg-2, #f4f4f4); }

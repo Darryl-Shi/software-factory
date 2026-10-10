@@ -143,6 +143,7 @@ function roleOf(r, cid) {
   if (same(cid, c.architect)) return "architect";
   if (same(cid, c.builder)) return "builder";
   if (c.reviewers.some((x) => same(x.id, cid))) return "reviewer";
+  if ((c.qa ?? []).some((x) => same(x.id, cid))) return "qa";
   return "helper";
 }
 const activeRole = (r) => roleOf(r, r.conversations.active);
@@ -154,8 +155,14 @@ function convLive(cid) {
   return Date.now() - (ui.touched.get(String(cid)) ?? 0) < 8000;
 }
 const runLive = (r) => !TERMINAL.includes(r.state) && convLive(r.conversations.active);
-const ROLE_LETTER = { architect: "A", builder: "B", helper: "H", reviewer: "R" };
-const avatar = (role, live) => `<span class="avatar ${role}${live ? " live" : ""}" title="${cap1(role)}${live ? " (working)" : ""}">${ROLE_LETTER[role] ?? "F"}</span>`;
+const ROLE_LETTER = { architect: "A", builder: "B", helper: "H", reviewer: "R", qa: "Q" };
+const ROLE_NAME = { qa: "QA" };
+const roleName = (role) => ROLE_NAME[role] ?? cap1(role);
+const avatar = (role, live) => `<span class="avatar ${role}${live ? " live" : ""}" title="${roleName(role)}${live ? " (working)" : ""}">${ROLE_LETTER[role] ?? "F"}</span>`;
+// QA screenshots: served by the web server from the run's artifacts (cookie-authenticated GET)
+const shotUrl = (run, id) => `/api/runs/${encodeURIComponent(run)}/screenshots/${encodeURIComponent(id)}`;
+const shotsHtml = (run, ids) => (ids?.length ? `<div class="shots">${ids.map((id) => `<a href="${esc(shotUrl(run, id))}" target="_blank" rel="noopener noreferrer" title="Screenshot ${esc(id)}"><img src="${esc(shotUrl(run, id))}" alt="Screenshot ${esc(id)}" loading="lazy"><span class="meta mono">${esc(id)}</span></a>`).join("")}</div>` : "");
+const QA_LABEL = { ran: "QA ran", off: "QA off", skipped: "QA skipped · nothing to launch", unavailable: "QA unavailable" };
 function turnText(q) {
   if (q.kind === "discussion") return "Your turn · question";
   if (q.kind === "approval") return `Your turn · ${q.gate}`;
@@ -179,6 +186,7 @@ function cardHtml(r) {
   const pa = pending(r), role = activeRole(r), live = role && runLive(r);
   const chips = [];
   if (r.conversations.reviewers.length > 0) chips.push(`<span class="rchip${r.reviewRound >= r.caps.review && r.state !== "DELIVERED" ? " hot" : ""}" title="Review round ${r.reviewRound} of ${r.caps.review}">R${r.reviewRound}/${r.caps.review}</span>`);
+  if (r.qaStatus && r.qaStatus !== "off") chips.push(`<span class="rchip${r.qaStatus === "unavailable" ? " hot" : ""}" title="${esc(QA_LABEL[r.qaStatus] ?? r.qaStatus)}">QA ${r.qaStatus === "ran" ? "✓" : r.qaStatus === "skipped" ? "–" : "!"}</span>`);
   if (r.ciFixes > 0 || r.state === "AWAITING_CI") chips.push(`<span class="rchip" title="CI fix rounds used">CI ${r.ciFixes}/${r.caps.ciFix}</span>`);
   const flag = r.state === "ESCALATED" ? `<span class="flag">▲ ${r.escalation?.cap === "ciFix" ? "CI fix cap hit" : r.escalation?.cap === "review" ? "Review cap hit" : "Needs a decision"}</span>` : "";
   const cls = ["card", pa ? "turn" : "", r.state === "ESCALATED" ? "esc" : "", r.state === "FAILED" || r.state === "CANCELLED" ? "closed" : ""].join(" ");
@@ -407,7 +415,7 @@ async function openRun(id, fromEl) {
   try { history.replaceState(null, "", `#run=${encodeURIComponent(id)}`); } catch {}
   $("#dock").hidden = true; $("#dock").innerHTML = ""; $("#composer").innerHTML = "";
   ui.tx.clear();
-  const convs = [r.conversations.architect, r.conversations.builder, ...r.conversations.reviewers.map((x) => x.id)].filter((x) => x != null);
+  const convs = [r.conversations.architect, r.conversations.builder, ...r.conversations.reviewers.map((x) => x.id), ...(r.conversations.qa ?? []).map((x) => x.id)].filter((x) => x != null);
   ui.thread = r.conversations.active ?? convs.at(-1) ?? "timeline";
   const rv = $("#runview"), bd = $("#rv-backdrop");
   setDetails(preferDetails()); showJump(false);
@@ -489,7 +497,8 @@ function renderThreads(r) {
   rows.push(`<div class="rail-label">Conversations</div>`);
   if (c.architect != null) row(c.architect, "architect", "Architect");
   if (c.builder != null) { row(c.builder, "builder", "Builder"); (ui.tx.get(String(c.builder))?.helpers ?? []).forEach((h, i) => row(h, "helper", `Helper ${i + 1}`, true)); }
-  c.reviewers.forEach((x) => row(x.id, "reviewer", `Reviewer · review ${x.seq}`));
+  const qaBySeq = new Map((c.qa ?? []).map((x) => [x.seq, x.id]));
+  c.reviewers.forEach((x) => { row(x.id, "reviewer", `Reviewer · review ${x.seq}`); if (qaBySeq.has(x.seq)) row(qaBySeq.get(x.seq), "qa", `QA · review ${x.seq}`, true); });
   if (c.architect == null) rows.push(`<p class="hint" style="padding:4px 10px;margin:0">Conversations appear as each role starts.</p>`);
   const a = ago(r.createdAt);
   rows.push(`<div class="rail-foot"><span><b>${esc(r.project)}</b> · ${esc(r.repo)}</span><span>Opened ${a === "now" ? "just now" : `${a} ago`} from ${esc(r.request.source)}</span></div>`);
@@ -511,13 +520,13 @@ function stepHtml(call, res, t, r) {
   const det = res?.details ? `<span class="mono">${esc(JSON.stringify(res.details))}</span>` : "";
   return `<details data-key="${esc(call.id)}"${ui.expanded.has(call.id) ? " open" : ""}><summary>${ico}<span class="s-name">${esc(call.name)}</span><span class="s-args">${esc(argSummary(call.args))}</span>${more}</summary>
     <div class="s-panel"><div class="s-sec"><div class="s-sec-h"><span>Input</span><button type="button" class="copy" data-copy>Copy</button></div><pre>${esc(JSON.stringify(call.args, null, 2))}</pre></div>
-    ${res ? `<div class="s-sec"><div class="s-sec-h"><span>Output</span>${det}<button type="button" class="copy" data-copy>Copy</button></div><pre class="${res.isError ? "err" : ""}">${linkify(esc(res.text))}</pre></div>` : ""}</div></details>`;
+    ${res ? `<div class="s-sec"><div class="s-sec-h"><span>Output</span>${det}<button type="button" class="copy" data-copy>Copy</button></div><pre class="${res.isError ? "err" : ""}">${linkify(esc(res.text))}</pre>${call.name === "computer" && !res.isError ? shotsHtml(r.id, [...String(res.text).matchAll(/Screenshot (r\d+-s\d+)/g)].map((m) => m[1])) : ""}</div>` : ""}</div></details>`;
 }
 function factoryCard(it, role) {
   const text = it.text ?? "";
   const human = /^The human rejected|source: human|from the human at/.test(text);
   const long = text.length > 420 || text.split("\n").length > 9, k = `more:${it.entryId}`, open = ui.expanded.has(k);
-  return `<div class="f-card${human ? " human" : ""}"><div class="f-head">${role === "helper" ? avatar("builder", false) : `<span class="avatar core">F</span>`}<b>${role === "helper" ? "Builder" : "Factory"}</b> → ${cap1(role)}${human ? " · carries your feedback" : ""}</div>
+  return `<div class="f-card${human ? " human" : ""}"><div class="f-head">${role === "helper" ? avatar("builder", false) : `<span class="avatar core">F</span>`}<b>${role === "helper" ? "Builder" : "Factory"}</b> → ${roleName(role)}${human ? " · carries your feedback" : ""}</div>
     <div class="f-body${long && !open ? " clamp" : ""}">${md(text)}</div>${long ? `<button type="button" class="f-more" data-more="${esc(k)}">${open ? "Show less" : "Show more"}</button>` : ""}</div>`;
 }
 const youBubble = (text, meta) => `<div class="you-bubble">${md(text)}</div><div class="you-meta">${meta}</div>`;
@@ -537,7 +546,7 @@ function blocksFor(r, t) {
     if (it.role === "user") { out.push({ k: it.entryId, html: factoryCard(it, role) }); last = "factory"; continue; }
     if (it.role === "tool") { if (!calls.has(it.toolResult?.callId)) out.push({ k: it.entryId, cls: "indent", html: `<pre>${linkify(esc(it.toolResult?.text ?? ""))}</pre>` }); continue; }
     if (!it.text && !(it.toolCalls ?? []).length) continue;
-    if (last !== "agent") out.push({ k: `${it.entryId}:h`, html: `<div class="speaker">${avatar(role, false)}<b>${cap1(role)}</b></div>` });
+    if (last !== "agent") out.push({ k: `${it.entryId}:h`, html: `<div class="speaker">${avatar(role, false)}<b>${roleName(role)}</b></div>` });
     last = "agent";
     if (it.text) out.push({ k: `${it.entryId}:t`, cls: "indent", html: `<div class="a-text">${md(it.text)}</div>`, stream: true });
     for (const c of it.toolCalls ?? []) { const res = results.get(c.id); if (!res) openCall = true; out.push({ k: `${it.entryId}:${c.id}`, cls: "indent step", html: stepHtml(c, res, t, r) }); }
@@ -552,7 +561,7 @@ function blocksFor(r, t) {
     shown.add(m.id);
     out.push({ k: `msg:${m.id}`, cls: "you queued", html: youBubble(m.text, `${viaText(m.by)} · queued until the ${role} finishes its current step`) });
   }
-  if (t.busy && !openCall) out.push({ k: "__working", html: `<div class="working"><span class="dots"><i></i><i></i><i></i></span><span class="shimmer">${cap1(role)} is working</span></div>` });
+  if (t.busy && !openCall) out.push({ k: "__working", html: `<div class="working"><span class="dots"><i></i><i></i><i></i></span><span class="shimmer">${roleName(role)} is working</span></div>` });
   if (!out.length) out.push({ k: "__empty", html: `<p class="hint">Nothing here yet.</p>` });
   return out;
 }
@@ -629,7 +638,7 @@ function renderTranscript(r, t, first) {
   const role = t.role ?? roleOf(r, t.conversationId) ?? "helper", model = modelOf(r, t.conversationId, role);
   const asking = role === "architect" && pending(r)?.question.kind === "discussion";
   const [st, cls] = t.busy ? [`<span class="spin"></span> Working`, "live"] : asking ? ["Waiting for you", "wait"] : [same(r.conversations.active, t.conversationId) && !TERMINAL.includes(r.state) ? "Idle" : "Finished", ""];
-  $("#conv-head").innerHTML = `${avatar(role, t.busy)}<span class="who">${cap1(role)}</span>${model ? `<span class="chip-model">${esc(model)}</span>` : ""}<span class="conv-status ${cls}">${st}</span>`;
+  $("#conv-head").innerHTML = `${avatar(role, t.busy)}<span class="who">${roleName(role)}</span>${model ? `<span class="chip-model">${esc(model)}</span>` : ""}<span class="conv-status ${cls}">${st}</span>`;
   const tx = $("#tx");
   if (first || ui.txConv !== String(t.conversationId)) { tx.replaceChildren(); ui.txConv = String(t.conversationId); first = true; }
   settleScroll(first, patch(tx, blocksFor(r, t), !first));
@@ -674,7 +683,7 @@ function updateComposerLive(r) {
   const done = new Set((t?.items ?? []).filter((i) => i.toolResult).map((i) => i.toolResult.callId));
   const tool = (t?.items ?? []).flatMap((i) => i.toolCalls ?? []).filter((c) => !done.has(c.id)).at(-1)?.name;
   const pa = pending(r), gate = pa && pa.question.kind !== "discussion";
-  line.innerHTML = busy ? `<span class="shimmer">${cap1(role)} is ${tool ? `running ${esc(tool)}` : "working"}</span>`
+  line.innerHTML = busy ? `<span class="shimmer">${roleName(role)} is ${tool ? `running ${esc(tool)}` : "working"}</span>`
     : LIVE_STAGE[r.state] ? `<span class="shimmer">${LIVE_STAGE[r.state]}</span>`
     : gate ? `<span style="color:var(--turn)">Waiting for your decision on the card above</span>` : `${cap1(role ?? "factory")} is between steps`;
   const tg = chatTarget(r), hint = $("#c-hint");
@@ -785,7 +794,7 @@ function dockApproval(dock, r, g, info) {
   const ws = r.workspace, art = pending(r).question.artifact ?? {};
   const where = g === "delivery" ? `<div class="loc"><span class="lbl">Review the changes in the workspace before you approve</span><span class="mono" id="dk-path">${esc(art.path ?? ws?.path ?? "")}</span>${ws ? `<span class="meta">branch <span class="mono">${esc(ws.branch)}</span> · base <span class="mono">${esc(String(ws.baseRef).slice(0, 12))}</span></span>` : ""}</div>` : "";
   const body = g === "spec" ? `<div class="c-preview">${md((sp?.text ?? "").split("\n").slice(0, 14).join("\n"))}</div>`
-    : where + (adv.length ? `<div class="c-list">${adv.map((x) => `<div class="c-item"><span class="sev">${esc(x.severity)}</span><span>${inline(x.description)}</span></div>`).join("")}</div>` : "");
+    : where + (r.qaStatus ? `<div class="meta">${esc(QA_LABEL[r.qaStatus] ?? r.qaStatus)}</div>` : "") + (adv.length ? `<div class="c-list">${adv.map((x) => `<div class="c-item"><span class="sev">${esc(x.severity)}</span><span>${x.source === "qa" ? "<b>QA</b> · " : ""}${inline(x.description)}${shotsHtml(r.id, x.screenshots)}</span></div>`).join("")}</div>` : "");
   const url = g === "merge" ? d?.url : art.url;
   const link = g === "spec" ? `<button type="button" class="btn ghost" data-open-spec>Read full spec</button>`
     : url ? `<a class="btn ghost" href="${esc(url)}" target="_blank" rel="noopener noreferrer">${g === "merge" ? "Open PR" : "View changes"} ${ICON.ext}</a>`
@@ -828,7 +837,8 @@ function dockEscalation(dock, r, pa, info) {
   const fs = r.escalation?.findings ?? [];
   dock.innerHTML = `<div class="dock-card ${info.cls}">${dockHead(info)}
     <div class="c-q" style="font-size:14.5px">${esc(pa.question.reason)}</div>
-    ${fs.length ? `<div class="c-list">${fs.map((x) => `<div class="c-item"><span class="sev block">${esc(x.id ?? x.severity)}</span><span>${inline(x.description)}</span></div>`).join("")}</div>` : ""}
+    ${r.qaStatus ? `<div class="meta">${esc(QA_LABEL[r.qaStatus] ?? r.qaStatus)}</div>` : ""}
+    ${fs.length ? `<div class="c-list">${fs.map((x) => `<div class="c-item"><span class="sev block">${esc(x.id ?? x.severity)}</span><span>${x.source === "qa" ? "<b>QA</b> · " : ""}${inline(x.description)}${shotsHtml(r.id, x.screenshots)}</span></div>`).join("")}</div>` : ""}
     <div class="tiles" role="radiogroup" aria-label="Decision">
       <div class="tile" role="radio" tabindex="0" data-choice="accept" aria-checked="false"><b>Accept as is</b><span>Deliver now. Open findings go into the delivery description.</span></div>
       <div class="tile" role="radio" tabindex="0" data-choice="more" aria-checked="false"><b>Grant more rounds</b><span>Resume the same builder with the findings and your messages.</span>
@@ -874,17 +884,17 @@ function renderDetails(r) {
   const { idx, name, cls } = stageInfo(r), allDone = r.state === "DELIVERED", terminal = TERMINAL.includes(r.state);
   const pipe = PIPELINE.map(([, n], i) => `<div class="pstep${allDone || i < idx ? " done" : i === idx ? ` now ${cls}` : ""}"><span class="pd"></span><span>${n}${i === idx && !allDone ? ` <span class="meta">· ${esc(r.state)}${r.gate ? ` (${esc(r.gate)})` : ""}</span>` : ""}</span></div>`).join("");
   const ci = r.notices.filter((n) => /^CI |No CI checks/.test(n.text)).at(-1), d = r.artifacts.delivery;
-  const findings = r.findingsLog.map((e) => `<div class="round-h">${e.kind === "human" ? `Your feedback · round ${e.round}` : e.kind === "ci" ? `CI failure · round ${e.round}` : `Review round ${e.round} · ${e.findings.some((x) => x.blocking) ? "fail" : "pass"}`}</div>
+  const findings = r.findingsLog.map((e) => `<div class="round-h">${e.kind === "human" ? `Your feedback · round ${e.round}` : e.kind === "ci" ? `CI failure · round ${e.round}` : e.kind === "qa" ? `QA · round ${e.round} · ${e.findings.some((x) => x.blocking) ? "fail" : "pass"}` : `Review round ${e.round} · ${e.findings.some((x) => x.blocking) ? "fail" : "pass"}`}</div>
     ${e.findings.map((x) => { const resp = e.responses?.find((y) => y.findingId === x.id); return `<div class="finding${x.blocking ? " blocking" : ""}">
       <div class="f-top"><span class="key">${esc(x.id ?? "")}</span><span class="sev${x.blocking ? " block" : ""}">${x.blocking ? "blocking" : "advisory"}</span><span class="sev">${esc(x.severity)}</span>${x.specRef ? `<span class="meta">${esc(x.specRef)}</span>` : ""}</div>
-      <div>${inline(x.description)}</div>${x.evidence ? `<details><summary class="meta">Evidence</summary><pre>${esc(x.evidence)}</pre></details>` : ""}
+      <div>${inline(x.description)}</div>${x.evidence ? `<details><summary class="meta">Evidence</summary><pre>${esc(x.evidence)}</pre></details>` : ""}${shotsHtml(r.id, x.screenshots)}
       ${resp ? `<div class="f-resp">${resp.status === "fixed" ? "✓ Fixed by the builder" : `Won't fix · ${esc(resp.reason ?? "")}`}</div>` : ""}</div>`; }).join("")}`).join("");
   const byRole = {};
   r.cost.forEach((c) => { const k = `${c.role}:${c.round}:${c.trigger ?? ""}`; byRole[k] ??= { role: c.role, round: c.round, trigger: c.trigger, tokens: 0, usd: 0 }; byRole[k].tokens += c.totalTokens || 0; byRole[k].usd += c.usd || 0; });
   const ktok = (n) => (n >= 10000 ? `${(n / 1000).toFixed(0)}k` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
-  const costRows = Object.values(byRole).map((c) => `<tr><td>${cap1(c.role)}${c.trigger === "message" ? ` <span class="meta" title="Turns your messages started">· replies</span>` : ""}</td><td class="n">${c.round}</td><td class="n">${ktok(c.tokens)}</td><td class="n">${money(c.usd)}</td></tr>`).join("");
+  const costRows = Object.values(byRole).map((c) => `<tr><td>${roleName(c.role)}${c.trigger === "message" ? ` <span class="meta" title="Turns your messages started">· replies</span>` : ""}</td><td class="n">${c.round}</td><td class="n">${ktok(c.tokens)}</td><td class="n">${money(c.usd)}</td></tr>`).join("");
   $("#rv-details-inner").innerHTML = `
-    <div class="kpis"><div class="kpi"><span class="k">Stage</span><span class="v">${allDone ? "Done" : name}</span></div><div class="kpi"><span class="k">Review</span><span class="v">${r.conversations.reviewers.length ? `${r.reviewRound}/${r.caps.review}` : "—"}</span></div><div class="kpi"><span class="k">Cost</span><span class="v">${money(totalUsd(r))}</span></div></div>
+    <div class="kpis"><div class="kpi"><span class="k">Stage</span><span class="v">${allDone ? "Done" : name}</span></div><div class="kpi"><span class="k">Review</span><span class="v">${r.conversations.reviewers.length ? `${r.reviewRound}/${r.caps.review}` : "—"}</span></div>${r.qaStatus ? `<div class="kpi"><span class="k">AQ testing</span><span class="v" title="${esc(QA_LABEL[r.qaStatus] ?? r.qaStatus)}">${esc(cap1(r.qaStatus))}</span></div>` : ""}<div class="kpi"><span class="k">Cost</span><span class="v">${money(totalUsd(r))}</span></div></div>
     <section class="d-sec"><h4>Progress</h4><div class="pipeline">${pipe}</div></section>
     ${r.request.body ? `<section class="d-sec"><h4>Request</h4><div class="f-body">${md(r.request.body)}</div></section>` : ""}
     <section class="d-sec"><h4>Artifacts</h4><div style="display:grid;gap:8px;font-size:13px">
@@ -926,7 +936,7 @@ function groupOf(path) {
   return a === "roles" && path.split(".").length > 2 ? `${a}.${b}` : a;
 }
 const GROUP_NAME = (g) => { const [a, b] = g.split("."); return b ? `${cap1(a)} · ${b}` : cap1(a); };
-const GROUP_ORDER = ["policy", "roles", "github", "ci", "sandbox", "webSearch", "web", "workdir", "storage"];
+const GROUP_ORDER = ["policy", "roles", "github", "ci", "sandbox", "qa", "boat", "webSearch", "web", "workdir", "storage"];
 async function renderSettings() {
   const scope = ui.setScope === "global" ? { global: true } : { project: ui.setScope };
   let eff;

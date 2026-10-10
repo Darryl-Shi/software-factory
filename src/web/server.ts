@@ -2,6 +2,7 @@
 // and events (spec §3.6); the core knows nothing about it.
 //   POST /api/op/<op>   { args: [...] } → { ok, result } | { ok: false, error, code }   (the CORE_OPS allowlist)
 //   GET  /api/events?run=&project=      server-sent events from core.subscribe
+//   GET  /api/runs/<run>/screenshots/<id> a QA screenshot (core.getScreenshot), as image/png
 //   GET  /, /app.js, /app.css            the UI (static files, no build step)
 // Access needs a token: `factory serve` prints a link carrying it, and the first visit swaps it for an HttpOnly,
 // SameSite=Strict cookie. The server binds to localhost by default and rejects foreign Host and Origin headers.
@@ -99,6 +100,17 @@ export async function startWebServer(core: FactoryCore, opts: WebOptions): Promi
 			const file = STATIC[url.pathname];
 			if (req.method === "GET" && file) return send(res, 200, readFileSync(join(UI_DIR, file[0]), "utf8"), file[1]);
 			if (req.method === "GET" && url.pathname === "/api/events") return events(req, res, url);
+			const shot = /^\/api\/runs\/([A-Za-z0-9._-]+)\/screenshots\/([A-Za-z0-9._-]+)$/.exec(url.pathname);
+			if (req.method === "GET" && shot) {
+				try {
+					const { mime, bytes } = await core.getScreenshot(shot[1]!, shot[2]!);
+					res.writeHead(200, { "content-type": mime, "cache-control": "private, max-age=86400", "x-content-type-options": "nosniff", "content-security-policy": "default-src 'none'" });
+					return res.end(Buffer.from(bytes));
+				} catch (e: any) {
+					const code = e?.code as FactoryError["code"] | undefined;
+					return json(res, (code && STATUS[code]) ?? 500, { ok: false, error: e?.message ?? String(e), ...(code ? { code } : {}) });
+				}
+			}
 			const op = /^\/api\/op\/([A-Za-z]+)$/.exec(url.pathname)?.[1];
 			if (op !== undefined) {
 				if (req.method !== "POST") return json(res, 405, { ok: false, error: "use POST" });
@@ -113,7 +125,9 @@ export async function startWebServer(core: FactoryCore, opts: WebOptions): Promi
 					return json(res, 400, { ok: false, error: e instanceof Error ? e.message : "invalid JSON" });
 				}
 				try {
-					const result = await (core as any)[op](...args);
+					let result = await (core as any)[op](...args);
+					// bytes (getScreenshot) travel as base64 in JSON; the GET route serves them raw
+					if (result && result.bytes instanceof Uint8Array) result = { ...result, bytes: Buffer.from(result.bytes).toString("base64") };
 					return json(res, 200, { ok: true, result: result ?? null });
 				} catch (e: any) {
 					const code = e?.code as FactoryError["code"] | undefined;
