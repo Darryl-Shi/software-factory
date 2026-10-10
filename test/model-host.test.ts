@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -60,7 +60,7 @@ describe("model host", () => {
 		const host = await createModelHost({ factoryHome });
 		await host.packages.installAndPersist(resolve("test/fixtures/broken-package"));
 		const fresh = await createModelHost({ factoryHome });
-		expect(fresh.diagnostics.some((d) => d.message.includes("fixture boom"))).toBe(true);
+		expect(fresh.diagnostics.some((d) => d.type === "error" && d.message.includes("fixture boom"))).toBe(true);
 		expect(fresh.models.getModel("anthropic", "claude-opus-5-5")).toBeDefined();
 	});
 
@@ -118,5 +118,17 @@ describe("model host", () => {
 		const host = await createModelHost({ factoryHome, scripted: true });
 		const id = Object.keys(DRY_RUN_SCRIPTS)[0]!;
 		expect(host.models.getModel("scripted", id)).toBeDefined();
+		// The host is settled: no background refresh re-creates files once the home is removed.
+		rmSync(factoryHome, { recursive: true, force: true });
+		await new Promise((r) => setTimeout(r, 300));
+		expect(existsSync(factoryHome)).toBe(false);
+	});
+
+	it("an existing agentDir is tightened to 0700", async () => {
+		const factoryHome = tempHome();
+		mkdirSync(agentDirOf(factoryHome), { recursive: true, mode: 0o755 });
+		chmodSync(agentDirOf(factoryHome), 0o755);
+		const host = await createModelHost({ factoryHome });
+		expect(statSync(host.agentDir).mode & 0o777).toBe(0o700);
 	});
 });
