@@ -18,13 +18,13 @@ const print = (v: unknown) => console.log(typeof v === "string" ? v : JSON.strin
 
 const HELP = `factory — software factory on Pi Durable
 
-  factory serve [--config p] [--port n] [--fake-github dir] [--scripted] [--ci-poll-ms n] [--foreground]
+  factory serve [--config p] [--port n] [--fake-github dir] [--fake-boat dir] [--scripted] [--ci-poll-ms n] [--foreground]
   factory stop [--config p]
   factory status [--config p]
   factory web [--config p]          print the web UI's link
   factory doctor [--config p]
 `;
-const SERVE_FLAGS = ["config", "port", "fake-github", "scripted", "ci-poll-ms", "foreground", "help"];
+const SERVE_FLAGS = ["config", "port", "fake-github", "fake-boat", "scripted", "ci-poll-ms", "foreground", "help"];
 
 /** The config file's absolute path: --config, else $FACTORY_CONFIG, else ~/.factory/config.yaml. */
 async function configPath(): Promise<string> {
@@ -81,6 +81,7 @@ async function serve() {
 		const args = [
 			...(webPort !== undefined ? ["--port", String(webPort)] : []),
 			...(typeof flags["fake-github"] === "string" ? ["--fake-github", resolve(expandHome(flags["fake-github"]))] : []),
+			...(typeof flags["fake-boat"] === "string" ? ["--fake-boat", resolve(expandHome(flags["fake-boat"]))] : []),
 			...(flags.scripted ? ["--scripted"] : []),
 			...(typeof flags["ci-poll-ms"] === "string" ? ["--ci-poll-ms", flags["ci-poll-ms"]] : []),
 		];
@@ -94,6 +95,7 @@ async function serve() {
 			configPath: config,
 			...(webPort !== undefined ? { webPort } : {}),
 			...(typeof flags["fake-github"] === "string" ? { fakeGithub: flags["fake-github"] } : {}),
+			...(typeof flags["fake-boat"] === "string" ? { fakeBoat: flags["fake-boat"] } : {}),
 			...(typeof flags["ci-poll-ms"] === "string" ? { ciPollMs: Number(flags["ci-poll-ms"]) } : {}),
 			scripted: !!flags.scripted || process.env.FACTORY_SCRIPTED === "1",
 		});
@@ -114,7 +116,7 @@ async function serve() {
 
 async function doctor() {
 	const { Factory } = await import("./core/core.ts");
-	const { createModels, DEFAULT_CONFIG, factoryHome } = await import("./main.ts");
+	const { createBoat, createModels, DEFAULT_CONFIG, factoryHome } = await import("./main.ts");
 	const { SandboxManager } = await import("@anthropic-ai/sandbox-runtime");
 	const { assertNoLegacySections, expandHome } = await import("./core/settings.ts");
 	const { GitHub } = await import("./github/github.ts");
@@ -129,6 +131,7 @@ async function doctor() {
 		models,
 		github: new GitHub(new GhApiHost()),
 		sandbox: new Sandbox({ stateDir: join(factoryHome(configPath), "environments") }),
+		boat: createBoat(configPath),
 	});
 	const eff = existsSync(configPath) ? f.config.effective({ global: true }) : f.config.effective({ global: true }, { version: 1 });
 	const line = (ok: boolean | "warn", s: string) => console.log(`${ok === true ? "ok  " : ok === "warn" ? "warn" : "FAIL"}  ${s}`);
@@ -140,7 +143,11 @@ async function doctor() {
 			line(false, e instanceof Error ? e.message : String(e));
 		}
 	}
-	for (const role of ["architect", "builder", "helper", "reviewer"]) {
+	const raw = existsSync(configPath) ? f.config.raw() : {};
+	const helperSet = raw.roles?.helper?.model !== undefined || Object.values((raw.projects ?? {}) as Record<string, any>).some((p) => p?.roles?.helper?.model !== undefined);
+	for (const role of ["architect", "builder", "helper", "reviewer", "qa"]) {
+		// roles.helper.model unset = the builder's model, already checked
+		if (role === "helper" && !helperSet) continue;
 		const ref = String(eff.roles[role].model);
 		const [p, ...rest] = ref.split("/");
 		const known = !!models.getModel(p!, rest.join("/"));
@@ -152,6 +159,30 @@ async function doctor() {
 	const id = eff.github.identity ?? {};
 	const tokenOk = id.kind === "app" ? !!resolveSecret(id.privateKeyRef) : !!resolveSecret(id.tokenRef ?? "env:GH_TOKEN");
 	line(tokenOk ? true : "warn", `GitHub identity (${id.kind ?? "pat"}): ${tokenOk ? "credential found" : `no credential at ${id.kind === "app" ? id.privateKeyRef : (id.tokenRef ?? "env:GH_TOKEN")}`}`);
+	// AQ testing: a FAIL for every scope where QA is on and the boat key does not resolve; a warn if boat's limits call fails
+	const scopes: { label: string; eff: any }[] = [{ label: "global", eff }];
+	if (existsSync(configPath)) for (const p of f.config.projects()) scopes.push({ label: `project ${p.name}`, eff: f.config.effective({ project: p.name }) });
+	const checkedRefs = new Set<string>();
+	for (const s of scopes) {
+		if (s.eff.qa?.enabled !== true) {
+			line(true, `AQ testing (${s.label}): off`);
+			continue;
+		}
+		const ref = String(s.eff.boat?.apiKey ?? "env:BOAT_API_KEY");
+		if (!resolveSecret(ref)) {
+			line(false, `AQ testing (${s.label}): qa.enabled is on but boat.apiKey (${ref}) does not resolve; set the key or qa.enabled: false`);
+			continue;
+		}
+		line(true, `AQ testing (${s.label}): boat key found (${ref})`);
+		if (checkedRefs.has(ref)) continue;
+		checkedRefs.add(ref);
+		try {
+			await createBoat(configPath).limits(ref);
+			line(true, `boat.dev API reachable with ${ref}`);
+		} catch (e) {
+			line("warn", `boat.dev limits call failed with ${ref}: ${e instanceof Error ? e.message : e}`);
+		}
+	}
 	const { run } = await import("./github/git.ts");
 	line((await run("gh", ["--version"])).code === 0 ? true : false, "gh CLI installed");
 }

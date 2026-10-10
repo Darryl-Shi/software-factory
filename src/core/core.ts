@@ -1,8 +1,8 @@
 // The factory core (spec §3.6, §4): model-free, interface-agnostic. Holds the state machine (a Pi Durable Task), the
 // agent bridge, projects, layered settings and durable pending asks. Exposes operations and events; knows no interface.
 import { createRequire } from "node:module";
-import { mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import type { Context } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { Models } from "@earendil-works/pi-ai";
@@ -18,8 +18,8 @@ import {
 	type Submission,
 	UsageDoc,
 } from "@earendil-works/pi-durable";
-import { createEditTool, createWriteTool } from "@earendil-works/pi-durable/tools";
 import { AGENT_EXTENSIONS, ROLE_TOOLS } from "../agents/tools.ts";
+import { type Boat, boatProblems } from "../boat/boat.ts";
 import { type GitHub, githubProblems } from "../github/github.ts";
 import { type Sandbox, sandboxProblems } from "../sandbox/sandbox.ts";
 import { Bridge, BridgeDoc, bridgeToolsNotFor, EnvDoc } from "./bridge.ts";
@@ -64,8 +64,12 @@ export interface CoreOptions {
 	models: Models;
 	/** GitHub: workspaces, delivery, CI and merges. */
 	github: GitHub;
-	/** The sandbox every role's commands and file tools run in. */
+	/** The sandbox every role's commands and file tools run in (the QA agent excepted). */
 	sandbox: Sandbox;
+	/** boat.dev VMs for AQ testing (§3.7). */
+	boat: Boat;
+	/** Run artifacts (QA screenshots); default: `artifacts` next to the config file (under ~/.factory, hidden from every sandbox). */
+	artifactsDir?: string;
 	/** Storage override (tests): "memory", or a sqlite path. Default: the config's `storage`. */
 	storage?: "memory" | { sqlite: string } | { jsonl: string };
 	now?: () => number;
@@ -106,6 +110,9 @@ export class Factory implements FactoryCore {
 		this.runTask = createRunTask({
 			github: this.opts.github,
 			sandbox: this.opts.sandbox,
+			boat: this.opts.boat,
+			artifactsDir: this.artifactsDir,
+			acceptsImages: (ref) => this.acceptsImages(ref),
 			bridge: Bridge,
 			changed: (runId, ms) => this.changed(runId, ms),
 			now: this.now,
@@ -124,22 +131,27 @@ export class Factory implements FactoryCore {
 				env: async ({ conversationId, cwd, read }, c) => {
 					const b = await read.snapshot(EnvDoc, conversationId, c);
 					if (!b?.envId || !b.runId) return undefined;
+					if (b.role === "qa") return this.opts.boat.env({ envId: b.envId, ...(cwd ? { cwd } : {}) });
 					return this.opts.sandbox.env({ conversationId: conversationId as unknown as string, ...(cwd ? { cwd } : {}), envId: b.envId });
 				},
 				conversationCreated: async (tx, rec) => {
-					// Helpers the builder spawns (Pi's subagent pattern): read-only, the helper role's model, no bridge tools.
+					// Helpers the builder spawns (Pi's subagent pattern): they write code in the builder's environment (same
+					// worktree, same write rules), with roles.helper's model and thinking (unset = the builder's); no subagent,
+					// no bridge tools.
 					if (!rec.owner) return;
 					const parent = await tx.doc(EnvDoc, rec.owner.conversationId);
 					if (parent.role !== "builder" || !parent.runId) return;
 					const run = (await tx.doc(RunDoc, parent.runId, null as never)) as unknown as RunDocState;
-					const cfg = run.pinned.config.roles?.helper ?? {};
-					const helperEnv = run.envs.helper ?? run.envs.builder;
-					const [provider, ...rest] = String(cfg.model ?? "").split("/");
+					const roles = run.pinned.config.roles ?? {};
+					const model = roles.helper?.model ?? roles.builder?.model;
+					const thinking = roles.helper?.thinking ?? roles.builder?.thinking;
+					const helperEnv = run.envs.builder;
+					const [provider, ...rest] = String(model ?? "").split("/");
 					await configure(tx, rec.id, {
 						model: { provider: provider!, modelId: rest.join("/") },
-						thinkingLevel: (cfg.thinking ?? "medium") as any,
+						thinkingLevel: (thinking ?? "medium") as any,
 						extensions: [...ROLE_TOOLS.helper, Bridge],
-						tools: { remove: [...bridgeToolsNotFor("helper"), createWriteTool(), createEditTool()] as any },
+						tools: { remove: bridgeToolsNotFor("helper") as any },
 						...(helperEnv ? { cwd: helperEnv.cwd } : {}),
 					});
 					const e = await tx.doc(EnvDoc, rec.id);
@@ -172,9 +184,48 @@ export class Factory implements FactoryCore {
 			}
 		});
 		this.harness.resume();
+		void this.sweepQaVms();
 		for (const run of this.cache.values())
 			if (!TERMINAL_STATES.includes(run.state) && run.pinned.piVersion !== PI_DURABLE_VERSION)
 				this.log(`run ${run.id} was pinned to pi-durable ${run.pinned.piVersion}; this process runs ${PI_DURABLE_VERSION}`);
+	}
+
+	private get artifactsDir(): string {
+		return this.opts.artifactsDir ?? join(dirname(this.opts.configPath), "artifacts");
+	}
+
+	private acceptsImages(ref: string): boolean {
+		const [provider, ...rest] = ref.split("/");
+		const m = provider ? (this.opts.models.getModel(provider, rest.join("/")) as { input?: string[] } | undefined) : undefined;
+		return !!m?.input?.includes("image");
+	}
+
+	/**
+	 * Startup sweep (§3.7): delete QA VMs named factory-<runId>-<seq> whose run is not in REVIEWING for that review
+	 * (orphans of a crash, or of a factory that was down while the ttl ran out). One pass per boat key reference in use.
+	 */
+	private async sweepQaVms(): Promise<string[]> {
+		try {
+			const refs = new Set<string>();
+			for (const scope of [{ global: true } as Scope, ...this.config.projects().map((p) => ({ project: p.name }))]) {
+				const eff = this.config.effective(scope);
+				if (eff.qa?.enabled) refs.add(String(eff.boat?.apiKey ?? "env:BOAT_API_KEY"));
+			}
+			for (const run of this.cache.values()) if (run.pinned.config.boat?.apiKey) refs.add(String(run.pinned.config.boat.apiKey));
+			const keep = (runId: string, seq: number) => {
+				const run = this.cache.get(runId);
+				return !!run && run.state === "REVIEWING" && run.counters.reviewSeq === seq;
+			};
+			return await this.opts.boat.sweep([...refs], keep, this.log);
+		} catch (e) {
+			this.log(`QA VM sweep failed: ${e instanceof Error ? e.message : e}`);
+			return [];
+		}
+	}
+
+	/** Test hook: run the startup sweep again. */
+	sweepForTests(): Promise<string[]> {
+		return this.sweepQaVms();
 	}
 
 	async close(): Promise<void> {
@@ -237,6 +288,7 @@ export class Factory implements FactoryCore {
 		if (d.conversations.architect) this.convIndex.set(d.conversations.architect, { run: d.id, role: "architect" });
 		if (d.conversations.builder) this.convIndex.set(d.conversations.builder, { run: d.id, role: "builder" });
 		for (const r of d.conversations.reviewers) this.convIndex.set(r.id, { run: d.id, role: "reviewer" });
+		for (const r of d.conversations.qa ?? []) this.convIndex.set(r.id, { run: d.id, role: "qa" });
 	}
 
 	private onRunChange(v: RunDocState) {
@@ -390,7 +442,9 @@ export class Factory implements FactoryCore {
 		const d = await this.doc(run);
 		// Ids may come back as strings in the JSON from the web UI; the harness's ids are numeric.
 		const conversationId = (/^\d+$/.test(String(conversationIdIn)) ? Number(conversationIdIn) : conversationIdIn) as unknown as string;
-		const known = new Set([d.conversations.architect, d.conversations.builder, ...d.conversations.reviewers.map((r) => r.id)].filter(Boolean).map(String));
+		const known = new Set(
+			[d.conversations.architect, d.conversations.builder, ...d.conversations.reviewers.map((r) => r.id), ...(d.conversations.qa ?? []).map((r) => r.id)].filter((x) => x !== undefined).map(String),
+		);
 		const mapped = this.convIndex.get(conversationId) ?? this.convIndex.get(String(conversationId) as never);
 		if (!known.has(String(conversationId)) && mapped?.run !== run) {
 			const env = await this.harness.snapshot(EnvDoc, conversationId as never, this.ctx);
@@ -449,7 +503,7 @@ export class Factory implements FactoryCore {
 		});
 		for (const slot of Object.values((live?.tools ?? {}) as Record<string, any>)) {
 			const child = slot?.details?.conversationId;
-			if (typeof child === "string") helpers.add(child);
+			if (typeof child === "string" || typeof child === "number") helpers.add(child as unknown as string);
 		}
 		const busy = !!live && (live.generation !== undefined || Object.keys(live.tools ?? {}).length > 0);
 		const role = this.convIndex.get(conversationId)?.role;
@@ -613,6 +667,14 @@ export class Factory implements FactoryCore {
 		}, this.ctx);
 	}
 
+	async getScreenshot(run: RunId, id: string): Promise<{ mime: string; bytes: Uint8Array }> {
+		await this.doc(run); // not_found
+		if (typeof id !== "string" || !/^r\d+-s\d+$/.test(id)) throw new FactoryError("invalid", `invalid screenshot id ${String(id)}`);
+		const file = join(this.artifactsDir, run, "screenshots", `${id}.png`);
+		if (!existsSync(file)) throw new FactoryError("not_found", `run ${run} has no screenshot ${id}`);
+		return { mime: "image/png", bytes: readFileSync(file) };
+	}
+
 	// ------------------------------------------------------------------ settings
 	settingsSchema(): Record<string, SettingField> {
 		return coreSchema();
@@ -620,13 +682,15 @@ export class Factory implements FactoryCore {
 
 	private coreRules(eff: Obj, _scope: Scope): string[] {
 		const problems: string[] = [];
-		for (const role of ["architect", "builder", "helper", "reviewer"] as Role[]) {
+		for (const role of ["architect", "builder", "helper", "reviewer", "qa"] as Role[]) {
 			const r = eff.roles?.[role];
-			if (!isObj(r)) continue;
+			if (!isObj(r) || r.model === undefined) continue;
 			const [provider, ...rest] = String(r.model ?? "").split("/");
 			if (!provider || rest.length === 0) problems.push(`roles.${role}.model: expected provider/modelId`);
 			else if (!this.opts.models.getModel(provider, rest.join("/"))) problems.push(`roles.${role}.model: ${r.model} is not a model createModels() knows`);
+			else if (role === "qa" && !this.acceptsImages(String(r.model))) problems.push(`roles.qa.model: ${r.model} does not accept image input (the QA agent works from screenshots)`);
 		}
+		if (isObj(eff.boat)) problems.push(...boatProblems(eff.boat).map((p) => `boat.${p}`));
 		if (isObj(eff.github)) problems.push(...githubProblems(eff.github).map((p) => `github.${p}`));
 		if (isObj(eff.sandbox)) problems.push(...sandboxProblems(eff.sandbox).map((p) => `sandbox.${p}`));
 		if (isObj(eff.ci)) {

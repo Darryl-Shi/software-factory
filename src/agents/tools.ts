@@ -16,8 +16,12 @@ import {
 	UsageDoc,
 } from "@earendil-works/pi-durable";
 import { createBashTool, createEditTool, createReadTool, createWriteTool } from "@earendil-works/pi-durable/tools";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { ScreenshotsDoc } from "../core/bridge.ts";
+import { runConfigOf } from "../core/run-config.ts";
 import type { Role } from "../core/types.ts";
-import { RoleArchitect, RoleBuilder, RoleHelper, RoleReviewer } from "./prompts.ts";
+import { RoleArchitect, RoleBuilder, RoleHelper, RoleQa, RoleReviewer } from "./prompts.ts";
 import { WebSearch } from "./web-search.ts";
 
 export const Coding = defineExtension({ name: "coding", tools: [createReadTool(), createWriteTool(), createEditTool(), createBashTool()] });
@@ -40,14 +44,14 @@ export const Subagent: Extension = defineExtension({
 		defineTool({
 			name: "subagent",
 			description:
-				"Delegate a self-contained READ/ANALYSIS task (search, code reading, running tests, a second opinion) to a helper and get its condensed answer. Helpers cannot write files; you stay the single writer.",
-			parameters: Type.Object({ task: Type.String({ description: "What the helper should find out; ask for a short summary" }) }),
+				"Delegate a task to a helper, writing code included: it works in your workspace with read, write, edit, bash, run_tests and web_search, and returns a short summary of what it did. Call several at once to have parts built in parallel; keep their tasks apart. Helpers leave changes uncommitted unless you tell them otherwise. Check what they actually changed (git status, git diff) and run the tests before report_done.",
+			parameters: Type.Object({ task: Type.String({ description: "The task: what to build or find out, which files it owns, and to end with a short summary of what it changed" }) }),
 			replay: "safe",
 			execute: async (args, api, c) => {
 				const child = await api.commit(async (tx) => {
 					const existing = (await tx.scanConversations({ ownerTaskId: api.taskId }, 1)).items[0];
 					if (existing !== undefined) return existing.id;
-					// The host's conversationCreated hook gives the child the helper role (model, read-only env).
+					// The host's conversationCreated hook gives the child the helper role (its model, the builder's environment).
 					const created = await tx.createConversation({ ownership: { kind: "task", taskId: api.taskId } });
 					// A host hook (the factory's conversationCreated) may already have given the helper an explicit,
 					// subagent-free extension list; only fall back to "inherit minus subagent" when it did not.
@@ -132,13 +136,84 @@ export const Browser = defineExtension({
 	],
 });
 
-/** The fixed tool set of each role: its role prompt first, then its tools. */
+// ------------------------------------------------------------------ computer (the QA agent's desktop, through boat's Cua Driver)
+export const COMPUTER_ACTIONS = [
+	"list_apps",
+	"list_windows",
+	"get_window_state",
+	"click",
+	"type_text",
+	"press_key",
+	"scroll",
+	"launch_app",
+	"browser_navigate",
+	"browser_click",
+	"browser_type",
+	"get_browser_state",
+] as const;
+
+const shq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+
+export const Computer = defineExtension({
+	name: "computer",
+	tools: [
+		defineTool({
+			name: "computer",
+			description:
+				"Drive the VM's desktop and Chrome through the Cua Driver (`cua-driver call <action> <args>`): list_apps, list_windows, get_window_state ({pid, window_id}: a screenshot of ONE window plus its accessibility tree), click, type_text, press_key, scroll, launch_app, browser_navigate ({url}), browser_click, browser_type, get_browser_state. Every screenshot is shown to you and stored under an id (e.g. r1-s3); cite those ids in submit_qa findings.",
+			parameters: Type.Object({
+				action: Type.Union(COMPUTER_ACTIONS.map((a) => Type.Literal(a)) as any, { description: "The Cua Driver tool to call" }),
+				args: Type.Optional(Type.Record(Type.String(), Type.Unknown(), { description: "The tool's JSON arguments, e.g. {pid, window_id} or {url}" })),
+			}),
+			execute: async (args, api, c) => {
+				if (!api.env) throw new Error("No execution environment is configured");
+				const cfg = await runConfigOf(api as any, c);
+				const json = JSON.stringify(args.args ?? {});
+				const shot = "$HOME/.factory-shot.png";
+				const script = `F=${shot}; rm -f "$F"; cua-driver call ${shq(String(args.action))} ${shq(json)} --screenshot-out-file "$F"; code=$?; if [ -s "$F" ]; then echo; echo "__SHOT=$F"; fi; exit $code`;
+				let out = "";
+				const r = await api.env.exec(script, { onOutput: (t) => (out += t) }, c);
+				if (!r.ok) throw r.error;
+				const m = /__SHOT=(.+)\s*$/m.exec(out);
+				const text = out.replace(/\n?__SHOT=.+\s*$/m, "").slice(-20_000);
+				const content: ({ type: "text"; text: string } | { type: "image"; data: string; mimeType: string })[] = [];
+				if (m && cfg.qa && cfg.runId) {
+					const bytes = await api.env.readBinaryFile(m[1]!.trim(), c);
+					if (bytes.ok) {
+						const id = await api.commit(async (tx) => {
+							const doc = await tx.doc(ScreenshotsDoc, api.conversationId);
+							const next = `r${cfg.qa!.seq}-s${doc.ids.length + 1}`;
+							// stored outside every sandbox and VM before the id is recorded, so a cited id always has its file
+							const dir = join(cfg.qa!.artifactsDir, cfg.runId!, "screenshots");
+							mkdirSync(dir, { recursive: true });
+							writeFileSync(join(dir, `${next}.png`), bytes.value);
+							doc.ids.push(next);
+							return next;
+						}, c);
+						content.push({ type: "text", text: `${text}\n[exit code ${r.value.exitCode}] Screenshot ${id} (cite it in submit_qa findings as screenshots: ["${id}"])` });
+						content.push({ type: "image", data: Buffer.from(bytes.value).toString("base64"), mimeType: "image/png" });
+						return { content, details: { exitCode: r.value.exitCode, screenshot: id }, ...(r.value.exitCode !== 0 ? { isError: true } : {}) } as any;
+					}
+				}
+				content.push({ type: "text", text: `${text}\n[exit code ${r.value.exitCode}]` });
+				return { content, details: { exitCode: r.value.exitCode }, ...(r.value.exitCode !== 0 ? { isError: true } : {}) } as any;
+			},
+		}),
+	],
+});
+
+/** The fixed tool set of each role (spec §3.3): its role prompt first, then its tools. Not a setting. */
 export const ROLE_TOOLS: Record<Role, Extension[]> = {
 	architect: [RoleArchitect, CodingReadonly, WebSearch],
 	builder: [RoleBuilder, Coding, Subagent, TestRunner, WebSearch],
-	helper: [RoleHelper, CodingReadonly, WebSearch],
-	reviewer: [RoleReviewer, CodingReadonly, TestRunner, Browser, WebSearch],
+	// helpers write code in the builder's environment; no subagent (they spawn no helpers) and no bridge tools
+	helper: [RoleHelper, Coding, TestRunner, WebSearch],
+	reviewer: [RoleReviewer, CodingReadonly, TestRunner, WebSearch],
+	qa: [RoleQa, CodingReadonly, Computer, WebSearch],
 };
 
-/** Every distinct agent extension, installed into the registry so persisted Conversations resolve them on resume. */
-export const AGENT_EXTENSIONS: Extension[] = [...new Set(Object.values(ROLE_TOOLS).flat())];
+/**
+ * Every distinct agent extension, installed into the registry so persisted Conversations resolve them on resume.
+ * `Browser` is in no role's set any more; it stays registered for reviewer Conversations of runs started before.
+ */
+export const AGENT_EXTENSIONS: Extension[] = [...new Set([...Object.values(ROLE_TOOLS).flat(), Browser])];

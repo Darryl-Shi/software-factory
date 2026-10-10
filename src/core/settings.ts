@@ -43,16 +43,18 @@ const identity: SettingField = {
 };
 
 const thinking: SettingField = { type: "enum", values: ["off", "low", "medium", "high"], description: "Thinking level" };
-function roleField(model: string, level: string, description: string): SettingField {
+function roleField(model: string | undefined, level: string | undefined, description: string): SettingField {
 	return {
 		type: "object",
 		description,
 		fields: {
-			model: { type: "string", default: model, description: "provider/modelId known to createModels()" },
-			thinking: { ...thinking, default: level } as SettingField,
+			model: { type: "string", ...(model ? { default: model } : {}), description: model ? "provider/modelId known to createModels()" : "provider/modelId known to createModels() (unset = the builder's)" },
+			thinking: { ...thinking, ...(level ? { default: level } : {}), ...(level ? {} : { description: "Thinking level (unset = the builder's)" }) } as SettingField,
 		},
 	};
 }
+
+export const BOAT_SIZES = ["small", "default", "large"] as const;
 
 export function coreSchema(): Record<string, SettingField> {
 	return {
@@ -63,9 +65,10 @@ export function coreSchema(): Record<string, SettingField> {
 			description: "Role → model and thinking level",
 			fields: {
 				architect: roleField("anthropic/claude-opus-5-5", "high", "Architect: discussion and spec"),
-				builder: roleField("anthropic/claude-opus-5-5", "high", "Builder: the single writer"),
-				helper: roleField("anthropic/claude-sonnet-5-5", "medium", "Helpers the builder spawns (read/analysis only)"),
-				reviewer: roleField("openai/gpt-6-sol", "high", "Reviewer: whole product vs spec"),
+				builder: roleField("anthropic/claude-opus-5-5", "high", "Builder: the one accountable build role"),
+				helper: roleField(undefined, undefined, "Helpers the builder spawns; they write code (unset = the builder's)"),
+				reviewer: roleField("openai/gpt-6-sol", "high", "Reviewer: whole product vs spec, tests, code quality and security"),
+				qa: roleField("anthropic/claude-sonnet-5-5", "medium", "QA agent: uses the product in a boat.dev VM (AQ testing); the model must accept images"),
 			},
 		},
 		policy: {
@@ -131,6 +134,28 @@ export function coreSchema(): Record<string, SettingField> {
 					of: { type: "string", description: "path" },
 					default: ["scripts/setup.sh", "setup.sh", "bin/setup"],
 					description: "The first of these that exists in the worktree runs at provision (sandboxed, builder rights)",
+				},
+			},
+		},
+		qa: {
+			type: "object",
+			description: "AQ testing: a QA agent uses the product in a boat.dev VM, in parallel with the review",
+			fields: {
+				enabled: { type: "boolean", default: true, description: "Run AQ testing (needs boat.apiKey); turn off for a product without a UI or code that must stay on this machine" },
+			},
+		},
+		boat: {
+			type: "object",
+			description: "The boat.dev VM AQ testing runs in",
+			fields: {
+				apiKey: { type: "secretRef", default: "env:BOAT_API_KEY", description: "boat.dev API key (a reference, never the key)" },
+				size: { type: "enum", values: [...BOAT_SIZES], default: "default", description: "VM size: small, default (4 vCPU / 8 GB) or large" },
+				ttl: { type: "string", default: "1h", description: "Backstop: boat stops the VM after this long (10m to 24h)" },
+				runScripts: {
+					type: "list",
+					of: { type: "string", description: "path" },
+					default: ["scripts/run.sh", "bin/run"],
+					description: "The first of these that exists starts the product in the VM; none = nothing to launch (QA skipped)",
 				},
 			},
 		},
@@ -309,6 +334,15 @@ export function parseDuration(v: unknown): number {
 	return n * (unit === "ms" ? 1 : unit === "s" ? 1000 : unit === "m" ? 60_000 : 3_600_000);
 }
 
+/** `roles.helper.{model, thinking}` unset (at every layer) = the builder's effective value. */
+function inheritHelper(eff: Obj): Obj {
+	if (!isObj(eff.roles)) return eff;
+	const helper = isObj(eff.roles.helper) ? eff.roles.helper : {};
+	const builder = isObj(eff.roles.builder) ? eff.roles.builder : {};
+	eff.roles.helper = { ...helper, ...(helper.model === undefined && builder.model !== undefined ? { model: builder.model } : {}), ...(helper.thinking === undefined && builder.thinking !== undefined ? { thinking: builder.thinking } : {}) };
+	return eff;
+}
+
 // ---------------------------------------------------------------- the config store
 export type RuleCheck = (effective: Obj, scope: Scope) => string[];
 
@@ -348,11 +382,11 @@ export class ConfigStore {
 		const defaults = defaultsOf(this.schema());
 		const { projects: _p, ...top } = raw;
 		const global = deepMerge(defaults, top) as Obj;
-		if ("global" in scope) return global;
+		if ("global" in scope) return inheritHelper(global);
 		const proj = raw.projects?.[scope.project];
 		if (!isObj(proj)) throw new FactoryError("not_found", `project ${scope.project} does not exist`);
 		const { repo: _r, ...over } = proj;
-		return deepMerge(global, over) as Obj;
+		return inheritHelper(deepMerge(global, over) as Obj);
 	}
 
 	getSettings(scope: Scope): EffectiveSettings {
