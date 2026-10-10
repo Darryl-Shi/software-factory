@@ -90,6 +90,12 @@ describe("setup wizard", () => {
 		expect(ui.shown.at(-1)).toEqual({ kind: "outro", message: "factory is running: http://127.0.0.1:7777/?token=x" });
 	});
 
+	test("outro says the service is starting when it is installed and active but the factory is not up yet", async () => {
+		const { ctx, ui } = testContext({ answers: [false], doctor: async () => [] });
+		expect(await runSetup(ctx, undefined, fakeSteps([], { service: { state: "ok" } }))).toBe(0);
+		expect(ui.shown.at(-1)).toEqual({ kind: "outro", message: "the service is starting; factory web prints the link" });
+	});
+
 	test("ok steps ask to reconfigure and default to skip", async () => {
 		const { ctx, ui } = testContext({ answers: [false], doctor: async () => [] });
 		const calls: string[] = [];
