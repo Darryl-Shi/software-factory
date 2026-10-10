@@ -39,6 +39,13 @@ type EnvRecord = {
 	credentials?: { envVars: string[]; files: string[] };
 };
 
+/**
+ * The factory home's entries that hold secrets or the factory's state, denied to every role whatever denyRead says. The rest
+ * of the home stays readable: the workdir (agents' worktrees and scratch dirs) may live inside it. config.yaml holds only
+ * refs and stays readable. web-url and factory.log carry the web UI's token link; pi/ is the model agentDir (auth.json).
+ */
+export const FACTORY_HOME_PRIVATE = ["secrets.json", "pi", "web-token", "web-url", "factory.log", "factory.sqlite", "factory.sqlite-wal", "factory.sqlite-shm", "factory.sqlite-journal", "environments", "qa-vms"];
+
 const shellQuote = (argv: readonly string[]) => argv.map((a) => `'${a.replace(/'/g, `'\\''`)}'`).join(" ");
 const within = (p: string, root: string) => p === root || p.startsWith(root.endsWith(sep) ? root : root + sep);
 
@@ -224,8 +231,11 @@ export class Sandbox {
 	}
 
 	private policy(rec: EnvRecord) {
-		// The factory home (parent of stateDir) holds secrets.json; deny it whatever denyRead says.
-		const deny = [...rec.sandbox.denyRead.map(expandHome), ...(rec.credentials?.files ?? []), dirname(this.stateDir)].map((p) => real(p));
+		// The factory home (parent of stateDir) holds secrets.json and the factory's state; deny those entries (and the
+		// environment records themselves) whatever denyRead says, but not the whole home, which may contain the workdir.
+		const home = dirname(this.stateDir);
+		const homePrivate = [this.stateDir, ...FACTORY_HOME_PRIVATE.map((n) => join(home, n))];
+		const deny = [...new Set([...rec.sandbox.denyRead.map(expandHome), ...(rec.credentials?.files ?? []), ...homePrivate].map((p) => real(p)))];
 		const builder = rec.role === "builder";
 		const writeRoots = [rec.scratch, ...(builder ? [rec.worktree, ...(rec.gitCommonDir ? [rec.gitCommonDir] : []), ...rec.sandbox.extraWrite.map(expandHome)] : [])].map(real);
 		const denyWrite = builder && rec.gitCommonDir ? [join(rec.gitCommonDir, "hooks"), join(rec.gitCommonDir, "config")].map(real) : [];

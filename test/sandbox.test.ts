@@ -22,7 +22,7 @@ describe.skipIf(!available)("Sandbox (bubblewrap)", () => {
 	const dir = mkdtempSync(join(tmpdir(), "sf-sbx-"));
 	const secretDir = join(dir, "secret-home", ".factory");
 	const ws: Workspace = { repo: "me/x", path: join(dir, "wt"), baseRef: "", branch: "main", newRepo: true };
-	const sandbox = new Sandbox({ stateDir: join(dir, "state", "environments") }); // the factory home (dir/state) is denied
+	const sandbox = new Sandbox({ stateDir: join(dir, "state") }); // the factory home is dir: the worktree and workdir live in it
 	const workdir = join(dir, "root");
 	const settings = {
 		sandbox: {
@@ -41,6 +41,9 @@ describe.skipIf(!available)("Sandbox (bubblewrap)", () => {
 		mkdirSync(join(ws.path, "scripts"), { recursive: true });
 		mkdirSync(secretDir, { recursive: true });
 		writeFileSync(join(secretDir, "token"), "SECRET");
+		mkdirSync(join(dir, "pi"), { recursive: true });
+		writeFileSync(join(dir, "secrets.json"), "HOME_SECRET");
+		writeFileSync(join(dir, "pi", "auth.json"), "HOME_SECRET");
 		await git(ws.path, ["init", "-q", "-b", "main"]);
 		writeFileSync(join(ws.path, "scripts/setup.sh"), "echo setup-ran > .setup-marker\n");
 		await git(ws.path, ["add", "-A"]);
@@ -78,6 +81,15 @@ describe.skipIf(!available)("Sandbox (bubblewrap)", () => {
 		expect(r.out).not.toContain("SECRET");
 		const f = await reviewer.readTextFile(join(secretDir, "token"), c);
 		expect(f.ok).toBe(false);
+	});
+
+	test("the factory home's secrets are hidden from commands and file tools; the worktree inside the home is not", async () => {
+		for (const f of [join(dir, "secrets.json"), join(dir, "pi", "auth.json")]) {
+			expect((await exec(reviewer, `cat ${f}`)).out).not.toContain("HOME_SECRET");
+			expect((await reviewer.readTextFile(f, c)).ok).toBe(false);
+		}
+		expect((await exec(reviewer, "cat scripts/setup.sh")).out).toContain("setup-ran");
+		expect((await reviewer.readTextFile(join(ws.path, "scripts/setup.sh"), c)).ok).toBe(true);
 	});
 
 	test("credentials in the factory's environment are not visible inside the sandbox", async () => {
