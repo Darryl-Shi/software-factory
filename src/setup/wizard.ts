@@ -6,7 +6,7 @@ import { daemonFiles } from "../daemon.ts";
 import { formatDoctorLine } from "../doctor.ts";
 import { SECTIONS, type SetupContext, type Step, type StepStatus } from "./context.ts";
 import { STEPS } from "./steps/index.ts";
-import { SetupCancelled } from "./ui.ts";
+import { CANCEL_MESSAGE, SetupCancelled } from "./ui.ts";
 
 const ICON: Record<StepStatus["state"], string> = { ok: "✔", warn: "⚠", missing: "✖" };
 
@@ -121,7 +121,7 @@ export async function runSetup(ctx: SetupContext, section?: string, steps: Step[
 		return 0;
 	} catch (e) {
 		if (e instanceof SetupCancelled) {
-			ui.log.warn("setup cancelled; completed sections were saved");
+			ui.log.warn(CANCEL_MESSAGE);
 			return 130;
 		}
 		ui.log.error(message(e));
