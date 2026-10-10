@@ -1,7 +1,8 @@
 // Setup wizard (spec §3.1): sections in order, reconfigure prompts, cancel keeps completed sections, restart offer.
 import { readFileSync, writeFileSync } from "node:fs";
+import { secretsPath } from "../src/secrets/store.ts";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { resolveSecret, setDefaultSecretStore } from "../src/core/settings.ts";
 import { daemonFiles } from "../src/daemon.ts";
 import { runCommand, SECTIONS, type SectionName, type SetupContext, type Step, type StepStatus } from "../src/setup/context.ts";
@@ -144,6 +145,91 @@ describe("setup wizard", () => {
 		const { ctx, daemon } = testContext({ answers: [true], daemonPid: 4242 });
 		expect(await runSetup(ctx, "models", fakeSteps([], { models: { run: async (c) => void (c.needsRestart = true) } }))).toBe(0);
 		expect(daemon.restarts).toBe(1);
+	});
+
+	test("a declined restart is not offered again until a later step needs one; the outro reminds", async () => {
+		const { ctx, ui, daemon, home } = testContext({ answers: [false, false], daemonPid: 4242, doctor: async () => [] });
+		writeFileSync(daemonFiles(join(home, "config.yaml")).url, "http://u\n");
+		const needs = { run: async (c: SetupContext) => void (c.needsRestart = true) };
+		expect(await runSetup(ctx, undefined, fakeSteps([], { models: needs, search: needs }))).toBe(0);
+		expect(daemon.restarts).toBe(0);
+		expect(ui.shown.filter((s) => s.kind === "confirm")).toHaveLength(2); // after models and after search, not after roles/qa
+		expect(ui.shown.at(-1)).toEqual({ kind: "outro", message: "factory is running: http://u\nrestart the factory to load the new providers" });
+	});
+
+	test("a restart that succeeds later clears the reminder", async () => {
+		const { ctx, ui, daemon } = testContext({ answers: [false, true], daemonPid: 4242, doctor: async () => [] });
+		const needs = { run: async (c: SetupContext) => void (c.needsRestart = true) };
+		expect(await runSetup(ctx, undefined, fakeSteps([], { models: needs, search: needs }))).toBe(0);
+		expect(daemon.restarts).toBe(1);
+		expect(ui.shown.at(-1)).toEqual({ kind: "outro", message: "next: factory serve" });
+	});
+
+	for (const [platform, manual] of [
+		["linux", "systemctl --user restart software-factory"],
+		["darwin", "factory stop && factory serve"],
+	] as const) {
+		test(`a failed restart shows the error and the manual command (${platform}), then setup continues`, async () => {
+			const { ctx, ui } = testContext({ answers: [true], daemonPid: 4242, platform, doctor: async () => [] });
+			ctx.daemon.restart = async () => {
+				throw new Error("Failed to restart software-factory.service: Unit not found.");
+			};
+			const calls: string[] = [];
+			expect(await runSetup(ctx, undefined, fakeSteps(calls, { models: { run: async (c) => void (c.needsRestart = true) } }))).toBe(0);
+			expect(calls).toEqual([...SECTIONS]);
+			expect(ui.shown).toContainEqual({ kind: "log.error", message: "restart failed: Failed to restart software-factory.service: Unit not found." });
+			expect(ui.shown).toContainEqual({ kind: "log.info", message: `restart it yourself: ${manual}` });
+			expect(ui.shown.at(-1)!.message).toContain("restart the factory to load the new providers");
+		});
+	}
+
+	test("a step error is prefixed with the step title and returns 1", async () => {
+		const { ctx, ui } = testContext({ answers: [], doctor: async () => [] });
+		const steps = fakeSteps([], { github: { run: async () => Promise.reject(new Error("boom")) } });
+		expect(await runSetup(ctx, undefined, steps)).toBe(1);
+		expect(ui.shown.at(-1)).toEqual({ kind: "log.error", message: "T-github: boom" });
+		expect(await runSetup(ctx, "github", steps)).toBe(1);
+		expect(ui.shown.at(-1)).toEqual({ kind: "log.error", message: "T-github: boom" });
+	});
+
+	for (const section of [undefined, "github"]) {
+		test(`secrets.json with mode 0644 refuses before any prompt (${section ?? "all sections"})`, async () => {
+			const { ctx, ui, home } = testContext({ answers: [true, true] });
+			writeFileSync(secretsPath(home), JSON.stringify({ version: 1, secrets: {} }), { mode: 0o644 });
+			const calls: string[] = [];
+			expect(await runSetup(ctx, section, fakeSteps(calls))).toBe(1);
+			expect(calls).toEqual([]);
+			expect(ui.shown).toHaveLength(1);
+			expect(ui.shown[0]!.kind).toBe("log.error");
+			expect(ui.shown[0]!.message).toContain("chmod 600");
+		});
+	}
+
+	test("an unparseable secrets.json refuses and is left as is", async () => {
+		const { ctx, ui, home } = testContext({ answers: [] });
+		writeFileSync(secretsPath(home), "{nope", { mode: 0o600 });
+		expect(await runSetup(ctx, undefined, fakeSteps([]))).toBe(1);
+		expect(ui.shown[0]!.message).toContain(`cannot parse ${secretsPath(home)}`);
+		expect(readFileSync(secretsPath(home), "utf8")).toBe("{nope");
+	});
+
+	test("testContext hides the developer's provider credentials from the host", async () => {
+		vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-from-the-shell");
+		vi.stubEnv("OPENAI_API_KEY", "sk-from-the-shell");
+		const { ctx } = testContext({ answers: [] });
+		const host = await ctx.host();
+		expect(await host.models.checkAuth("anthropic")).toBeUndefined();
+		expect(await host.models.checkAuth("openai")).toBeUndefined();
+		expect(ctx.env).toEqual({});
+	});
+
+	test("testContext's env is visible to the host, and ctx.env is exactly it", async () => {
+		vi.stubEnv("OPENAI_API_KEY", "sk-from-the-shell");
+		const { ctx } = testContext({ answers: [], env: { ANTHROPIC_API_KEY: "sk-ant-test" } });
+		const host = await ctx.host();
+		expect(await host.models.checkAuth("anthropic")).toBeDefined();
+		expect(await host.models.checkAuth("openai")).toBeUndefined();
+		expect(ctx.env).toEqual({ ANTHROPIC_API_KEY: "sk-ant-test" });
 	});
 
 	test("context settings() writes validated config", async () => {

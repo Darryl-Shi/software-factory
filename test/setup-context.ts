@@ -3,7 +3,7 @@
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { onTestFinished } from "vitest";
+import { onTestFinished, vi } from "vitest";
 import { setDefaultSecretStore } from "../src/core/settings.ts";
 import { createBoat } from "../src/main.ts";
 import { createModelHost } from "../src/models/host.ts";
@@ -34,6 +34,77 @@ export interface TestContextOptions {
 	daemonPid?: number;
 }
 
+/**
+ * Every env var pi-ai's built-in providers read for credentials (or for the project/account a credential needs):
+ * the README's "Environment Variables" table, plus the Bedrock and Vertex ambient-credential variables found in
+ * pi-ai's dist. pi looks keys up as `env?.[name] || process.env[name]`, so the developer's shell would leak into
+ * `host().models` without these stubs.
+ */
+export const PROVIDER_ENV_VARS = [
+	"AI_GATEWAY_API_KEY",
+	"ANT_LING_API_KEY",
+	"ANTHROPIC_API_KEY",
+	"ANTHROPIC_AUTH_TOKEN",
+	"ANTHROPIC_OAUTH_TOKEN",
+	"ANTHROPIC_PROFILE",
+	"ANTHROPIC_SERVICE_ACCOUNT_ID",
+	"AWS_ACCESS_KEY_ID",
+	"AWS_BEARER_TOKEN_BEDROCK",
+	"AWS_CONTAINER_CREDENTIALS_FULL_URI",
+	"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+	"AWS_DEFAULT_REGION",
+	"AWS_PROFILE",
+	"AWS_REGION",
+	"AWS_SECRET_ACCESS_KEY",
+	"AWS_SESSION_TOKEN",
+	"AWS_WEB_IDENTITY_TOKEN_FILE",
+	"AZURE_OPENAI_API_KEY",
+	"AZURE_OPENAI_BASE_URL",
+	"AZURE_OPENAI_RESOURCE_NAME",
+	"BASETEN_API_KEY",
+	"CEREBRAS_API_KEY",
+	"CLOUDFLARE_ACCOUNT_ID",
+	"CLOUDFLARE_API_KEY",
+	"CLOUDFLARE_GATEWAY_ID",
+	"COPILOT_GITHUB_TOKEN",
+	"DEEPSEEK_API_KEY",
+	"FIREWORKS_API_KEY",
+	"GCLOUD_PROJECT",
+	"GEMINI_API_KEY",
+	"GOOGLE_APPLICATION_CREDENTIALS",
+	"GOOGLE_CLOUD_API_KEY",
+	"GOOGLE_CLOUD_LOCATION",
+	"GOOGLE_CLOUD_PROJECT",
+	"GROQ_API_KEY",
+	"HF_TOKEN",
+	"KIMI_API_KEY",
+	"META_API_KEY",
+	"MINIMAX_API_KEY",
+	"MINIMAX_CN_API_KEY",
+	"MISTRAL_API_KEY",
+	"MOONSHOT_API_KEY",
+	"NVIDIA_API_KEY",
+	"OPENAI_API_KEY",
+	"OPENCODE_API_KEY",
+	"OPENROUTER_API_KEY",
+	"QWEN_TOKEN_PLAN_API_KEY",
+	"QWEN_TOKEN_PLAN_CN_API_KEY",
+	"RADIUS_API_KEY",
+	"TOGETHER_API_KEY",
+	"TYPESAFE_API_KEY",
+	"XAI_API_KEY",
+	"XIAOMI_API_KEY",
+	"XIAOMI_TOKEN_PLAN_AMS_API_KEY",
+	"XIAOMI_TOKEN_PLAN_CN_API_KEY",
+	"XIAOMI_TOKEN_PLAN_SGP_API_KEY",
+	"ZAI_API_KEY",
+	"ZAI_CODING_CN_API_KEY",
+	// the factory's own credentials (doctor, setup sections)
+	"GH_TOKEN",
+	"BOAT_API_KEY",
+	"PARALLEL_API_KEY",
+] as const;
+
 export interface TestDaemon {
 	pid(): number | undefined;
 	restart(): Promise<void>;
@@ -59,6 +130,13 @@ export interface TestContext {
  * for `store:` refs (`setDefaultSecretStore`), so `ctx.boat.limits("store:boat")` and `resolveSecret` see it.
  * When called inside a test, the default is reset when that test finishes (`onTestFinished`); otherwise the caller
  * resets it with `setDefaultSecretStore(undefined)` (e.g. in `afterEach`).
+ *
+ * The host must not see the developer's credentials: every PROVIDER_ENV_VARS entry is unset in `process.env` with
+ * `vi.stubEnv`, then `opts.env` is stubbed on top, so keys a test passes are visible to the host (and `ctx.env` is
+ * exactly `opts.env`). Inside a test the stubs are undone when it finishes (`vi.unstubAllEnvs`, which also undoes the
+ * test's own `vi.stubEnv` calls); outside one the caller calls `vi.unstubAllEnvs()`.
+ * HOME is left alone: the only home-dir credential pi-ai probes is Vertex's gcloud ADC file, which counts only with
+ * GOOGLE_CLOUD_PROJECT/GCLOUD_PROJECT and GOOGLE_CLOUD_LOCATION set, and those are unset here.
  * `ctx.homedir` is `<home>/user-home`, an empty temp dir, never the real `~`.
  */
 export function testContext(opts: TestContextOptions): TestContext {
@@ -70,10 +148,15 @@ export function testContext(opts: TestContextOptions): TestContext {
 	const ui = new ScriptedUi(opts.answers);
 	const secrets = new SecretStore(secretsPath(home));
 	setDefaultSecretStore(secrets);
+	for (const name of PROVIDER_ENV_VARS) vi.stubEnv(name, undefined);
+	for (const [name, value] of Object.entries(opts.env ?? {})) vi.stubEnv(name, value);
 	try {
-		onTestFinished(() => setDefaultSecretStore(undefined));
+		onTestFinished(() => {
+			setDefaultSecretStore(undefined);
+			vi.unstubAllEnvs();
+		});
 	} catch {
-		// not inside a test (e.g. beforeAll): the caller resets the default store
+		// not inside a test (e.g. beforeAll): the caller resets the default store and the env stubs
 	}
 	const runs: TestContext["runs"] = [];
 	const run: SetupContext["run"] =
