@@ -22,7 +22,7 @@ describe.skipIf(!available)("Sandbox (bubblewrap)", () => {
 	const dir = mkdtempSync(join(tmpdir(), "sf-sbx-"));
 	const secretDir = join(dir, "secret-home", ".factory");
 	const ws: Workspace = { repo: "me/x", path: join(dir, "wt"), baseRef: "", branch: "main", newRepo: true };
-	const sandbox = new Sandbox({ stateDir: join(dir, "state") });
+	const sandbox = new Sandbox({ stateDir: join(dir, "state", "environments") }); // the factory home (dir/state) is denied
 	const workdir = join(dir, "root");
 	const settings = {
 		sandbox: {
