@@ -206,6 +206,66 @@ describe("setup service", () => {
 		expect(ui.remaining()).toBe(0);
 	});
 
+	test("install warns once about credentials read from the environment and asks to install anyway", async () => {
+		const { calls, run } = stubRun({
+			"systemctl --user is-active software-factory": { code: 3 },
+			"loginctl show-user alice -p Linger": { stdout: "Linger=yes\n" },
+		});
+		const env = { PATH: "/usr/bin", USER: "alice", GH_TOKEN: "ghp_x", BOAT_API_KEY: "bk", PARALLEL_API_KEY: "pk", ANTHROPIC_API_KEY: "sk-ant" };
+		const { ctx, ui } = testContext({ answers: ["install", true], run, env });
+		await step.run(ctx);
+		const warns = ui.shown.filter((s) => s.kind === "log.warn").map((s) => s.message);
+		expect(warns).toEqual([
+			[
+				"GH_TOKEN (github.identity.tokenRef) is read from the environment, which the service won't have; run factory setup github to store it",
+				"BOAT_API_KEY (boat.apiKey) is read from the environment, which the service won't have; run factory setup qa to store it",
+				"PARALLEL_API_KEY (webSearch.apiKey) is read from the environment, which the service won't have; run factory setup search to store it",
+				"ANTHROPIC_API_KEY (provider anthropic) is read from the environment, which the service won't have; run factory setup models to store it",
+			].join("\n"),
+		]);
+		expect(ui.shown.filter((s) => s.kind === "confirm").map((s) => s.message)).toEqual(["Install the service anyway?"]);
+		expect(calls).toContain("systemctl --user enable --now software-factory");
+		expect(ui.remaining()).toBe(0);
+	});
+
+	test("declining to install anyway leaves the service alone", async () => {
+		const { calls, run } = stubRun({ "systemctl --user is-active software-factory": { code: 3 } });
+		const { ctx, ui } = testContext({ answers: ["install", false], run, env: { PATH: "/usr/bin", GH_TOKEN: "ghp_x" } });
+		await step.run(ctx);
+		expect(existsSync(servicePaths(ctx.homedir).unit)).toBe(false);
+		expect(calls).toEqual(["systemctl --user is-active software-factory"]);
+		expect(ui.remaining()).toBe(0);
+	});
+
+	test("no warning when every credential is stored", async () => {
+		const { calls, run } = stubRun({
+			"systemctl --user is-active software-factory": { code: 3 },
+			"loginctl show-user alice -p Linger": { stdout: "Linger=yes\n" },
+		});
+		const config = [
+			"version: 1",
+			"github:",
+			"  identity: { kind: pat, tokenRef: store:github }",
+			"boat:",
+			"  apiKey: store:boat",
+			"webSearch:",
+			"  apiKey: store:parallel",
+			"",
+		].join("\n");
+		// The env still has GH_TOKEN, but the config does not read it; anthropic and openai come from auth.json.
+		const { ctx, ui, home } = testContext({ answers: ["install"], run, config, env: { PATH: "/usr/bin", USER: "alice", GH_TOKEN: "ghp_x" } });
+		for (const k of ["github", "boat", "parallel"]) ctx.secrets.set(k, "v");
+		mkdirSync(join(home, "pi"), { recursive: true });
+		const auth = { anthropic: { type: "api_key", key: "k" }, openai: { type: "api_key", key: "k" } };
+		writeFileSync(join(home, "pi", "auth.json"), JSON.stringify(auth), { mode: 0o600 });
+		expect((await (await ctx.host()).models.checkAuth("anthropic"))?.source).toBe("stored credential");
+		await step.run(ctx);
+		expect(ui.shown.filter((s) => s.kind === "log.warn")).toEqual([]);
+		expect(ui.shown.filter((s) => s.kind === "confirm")).toEqual([]);
+		expect(calls).toContain("systemctl --user enable --now software-factory");
+		expect(ui.remaining()).toBe(0);
+	});
+
 	test("other platforms warn", async () => {
 		const { calls, run } = stubRun();
 		const { ctx, ui } = testContext({ answers: [], run, platform: "win32" });
