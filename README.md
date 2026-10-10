@@ -8,10 +8,15 @@ and at the approval gates you turn on, but you can message the agent working on 
 
 - **The core is model-free and durable** (`src/core/`). It is a state machine that runs as a Pi Durable Task, plus the
   agent bridge, projects, layered settings and durable pending asks. It never calls a model: it configures role
-  Conversations (architect, builder, reviewer, plus the builder's helpers) and reads what they submit through the bridge.
+  Conversations (architect, builder and the helpers it has write code, reviewer, QA) and reads what they submit
+  through the bridge.
   Its whole outside surface is a set of operations and an event stream (`FactoryCore` in `src/core/types.ts`).
-- **GitHub and a local sandbox are the backend.** The core calls them directly: `GitHub` (`src/github/`) opens repos,
-  delivers and waits for CI; `Sandbox` (`src/sandbox/`) gives each role a sandboxed environment in the run's worktree.
+- **GitHub, a local sandbox and boat.dev are the backend.** The core calls them directly: `GitHub` (`src/github/`) opens
+  repos, delivers and waits for CI; `Sandbox` (`src/sandbox/`) gives each role a sandboxed environment in the run's
+  worktree; `Boat` (`src/boat/`) gives each review round's QA agent a fresh boat.dev VM running the product.
+- **Each review round is a code review plus AQ testing, in parallel.** The reviewer checks the product against the
+  spec, runs the tests and reviews the diff for quality and security. The QA agent uses the product in the VM and
+  backs every finding with a screenshot. QA is on by default (`qa.enabled`) and can be turned off per project.
 - **The web UI is the interface**, on `http://127.0.0.1:7317`: a ticket board where each run moves through the pipeline
   stages on its own, a full-screen run view with the agents' conversations, a chat box, and approvals in a floating
   card, and a Settings view. The `factory` command only starts, stops and checks the process.
@@ -31,6 +36,8 @@ code differs from them is listed in [`DEVIATIONS.md`](DEVIATIONS.md).
   against a scripted factory. The latest dry run ran with the sandbox off (`DRYRUN_SANDBOX=0`). The bubblewrap tests
   (`test/sandbox.test.ts`) and a dry run with the sandbox on have not been run since the fixed-architecture refactor;
   both need `bubblewrap` and `socat`.
+- **AQ testing and writing helpers** (design spec §9, §9.1) were added on 10 October 2026. They are verified with a
+  disk-based fake boat.dev (`--fake-boat`) and a stub Cua Driver; nothing has run against the live boat.dev API yet.
 - **Not yet done:** a live trial against github.com with real models. The real-GitHub client (`GhApiHost`) has only
   been tested against a fake `gh` binary, `web_search` only against a fake Parallel endpoint, and the role prompts
   have not been tested with real models.
@@ -45,6 +52,8 @@ code differs from them is listed in [`DEVIATIONS.md`](DEVIATIONS.md).
 - **For real GitHub:** the `gh` CLI and a token or a GitHub App. See [configuration](docs/configuration.md#github-identity).
 - **For real models:** the providers' API keys in the environment. pi-ai reads them, for example `ANTHROPIC_API_KEY`
   and `OPENAI_API_KEY` for the default roles.
+- **For AQ testing:** `BOAT_API_KEY` (a boat.dev key), unless `qa.enabled: false`. Without it and with QA on, runs
+  fail at `PREPARING` with a message saying so.
 - **For web search (optional):** `PARALLEL_API_KEY`. Without it, `web_search` tells the agent it isn't configured
   and the agent carries on.
 
@@ -122,7 +131,7 @@ The factory keeps its files next to the config file (`~/.factory/` by default):
   a ticket (a run), and creates the project if it is new; cards move on their own and show "Your turn" when a run
   waits for you.
 - **Run view:** click any card, at any stage, for a full-screen view. The left rail lists the run's conversations
-  (architect, builder and its helpers, each reviewer) and a timeline; the centre is the transcript, with every tool
+  (architect, builder and its helpers, each reviewer and its round's QA agent) and a timeline; the centre is the transcript, with every tool
   call as one plain row you can expand. The chat box always goes to the agent the run is with: questions from the
   architect are answered there, and at other times your message is steered into the agent's work (a busy agent sees
   it after its current step; an idle one replies). Approvals and escalations float above the conversation, so you can
@@ -137,14 +146,14 @@ To look around without credentials, reopen a dry run's factory and browse its ru
 
 ```sh
 DRYRUN_DIR=$PWD/.dryrun npm run dry-run
-bin/factory serve --config .dryrun/config.yaml --fake-github .dryrun/github --scripted   # prints the link
+DRYRUN_BOAT_KEY=x bin/factory serve --config .dryrun/config.yaml --fake-github .dryrun/github --fake-boat .dryrun/boat --scripted   # prints the link
 bin/factory stop --config .dryrun/config.yaml        # when you are done
 ```
 
 ## Tests
 
 ```sh
-npm test            # vitest, 98 tests, about a minute; no credentials or network needed
+npm test            # vitest, 119 tests, a few minutes; no credentials or network needed
 npm run typecheck   # tsc (noEmit)
 ```
 
@@ -152,8 +161,9 @@ npm run typecheck   # tsc (noEmit)
 |---|---|
 | `test/machine.test.ts` | State transitions, gates, rejections, escalations, round and fix caps, CI modes, cancel/retry, events, pinning |
 | `test/settings.test.ts` | Layering and source attribution, unset, validate-on-save, the fixed schema and role tool sets, refusing a legacy `stages`/`workers` config or `roles.<role>.extensions` key, projects |
-| `test/findings.test.ts` | Review and findings validation, builder responses, bridge enforcement, helper role tools |
-| `test/durability.test.ts` | `kill -9` mid-build and at a pending approval (SQLite), then resume |
+| `test/findings.test.ts` | Review and QA findings validation, builder responses, bridge enforcement, helpers that write |
+| `test/qa.test.ts` | AQ testing on the fake boat: QA pass/fail with screenshots, `submit_qa` rules, statuses ran/off/skipped/unavailable, missing key, cancel, ttl stop and resume, the startup sweep |
+| `test/durability.test.ts` | `kill -9` mid-build, at a pending approval, mid-helper and mid-QA (and a VM deleted while down), then resume |
 | `test/sandbox.test.ts` | The real bubblewrap sandbox: write rules, denyRead, no credential env vars, network allowlist |
 | `test/github-api.test.ts` | `GhApiHost` request shapes, token handling, the GitHub App JWT exchange |
 | `test/messages.test.ts` | `message`: routing, refusals, side turns and their cost, spec revision at the gate, steering a busy builder, held messages, re-review of changes made at the delivery gate |
@@ -162,7 +172,7 @@ npm run typecheck   # tsc (noEmit)
 | `test/daemon.test.ts` | `serve`/`stop`/`status`/`web` as real processes: detaching, a second `serve`, a busy port, a bad or legacy config, unknown options, stale pid files, a fresh install |
 
 Notes:
-- The 6 sandbox tests need bubblewrap and socat installed; without them they are skipped (92 passed, 6 skipped).
+- The 6 sandbox tests need bubblewrap and socat installed; without them they are skipped. Where bubblewrap is installed but the kernel forbids unprivileged user namespaces, 3 of them fail with "bwrap: No permissions to create a new namespace".
 - The durability tests and the fake GitHub write under `os.tmpdir()`. If `/tmp` is a small or quota-limited tmpfs,
   run `TMPDIR=/path/with/space npm test`.
 
@@ -173,9 +183,10 @@ src/core/          core.ts (Factory), run-task.ts (state machine), run-doc.ts, b
                    messages.ts (who gets a message, and when), usage.ts (cost records), types.ts, run-config.ts
 src/github/        github.ts (GitHub: open, create, diff, writeArtifact, deliver, checks, annotate, merge),
                    host.ts (GitHubHost: GhApiHost for github.com, LocalGitHubHost as a local fake), git.ts (git helpers)
+src/boat/          boat.ts (Boat: QA VMs per review round, BoatEnv), backend.ts (BoatApiBackend on @boatdev/sdk, LocalBoatBackend fake)
 src/sandbox/       sandbox.ts (Sandbox: per-role environments in the run's worktree, inside sandbox-runtime)
 src/web/           server.ts (HTTP + server-sent events) and ui/ (the static web UI, no build step)
-src/agents/        tools.ts (coding, coding-readonly, subagent, test-runner, browser; each role's fixed set),
+src/agents/        tools.ts (coding, coding-readonly, subagent, test-runner, computer, browser; each role's fixed set),
                    web-search.ts, prompts.ts (role-* prompts)
 src/main.ts        process wiring: models, storage, GitHub, Sandbox, Factory, web server
 src/daemon.ts      serve in the background: pid, log and link files

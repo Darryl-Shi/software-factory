@@ -47,6 +47,7 @@ src/
   `extraExtensions`, extension schema merging.
 - `FactoryCore` and `CORE_OPS` stay: they are the web server's typed allowlist of operations.
 - **Agent tools:** a constant `ROLE_TOOLS` gives each role a fixed tool set (today's defaults):
+  *(Superseded for the helper, reviewer and new qa roles by design-spec §9/§9.1: helpers write code, the reviewer has no `browser`, and `qa` gets `computer`.)*
   - architect: coding-readonly, web-search
   - builder: coding, subagent, test-runner, web-search
   - helper: coding-readonly, web-search

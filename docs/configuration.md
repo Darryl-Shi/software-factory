@@ -45,8 +45,14 @@ If any check fails, the change is rejected and the file is left unchanged.
 |---|---|---|
 | `roles.architect` | `anthropic/claude-opus-5-5`, `high` | Discussion and spec |
 | `roles.builder` | `anthropic/claude-opus-5-5`, `high` | The single writer |
-| `roles.helper` | `anthropic/claude-sonnet-5-5`, `medium` | Helpers the builder spawns; read-only |
-| `roles.reviewer` | `openai/gpt-6-sol`, `high` | Whole-product review |
+| `roles.helper` | unset = the builder's model and thinking | Helpers the builder spawns; they write code in the builder's worktree |
+| `roles.reviewer` | `openai/gpt-6-sol`, `high` | Product vs spec, runs the tests, reviews the diff and code for quality and security |
+| `roles.qa` | `anthropic/claude-sonnet-5-5`, `medium` | AQ testing in a boat.dev VM; the model must accept images |
+| `qa.enabled` | `true` | Run AQ testing beside each review. Set `false` per project to turn it off |
+| `boat.apiKey` | `env:BOAT_API_KEY` | Reference to the boat.dev API key (`env:` or `file:`, never the key). Needed when `qa.enabled` |
+| `boat.size` | `default` | VM size: `small`, `default` or `large` |
+| `boat.ttl` | `1h` (10m–24h) | Idle time after which boat stops the VM (it is resumed on the next command) |
+| `boat.runScripts` | `[scripts/run.sh, bin/run]` | Repo-relative; the first that exists starts the product in the VM. None means QA is skipped |
 | `policy.approvals` | `[spec]` | Approval gates, any of `spec`, `delivery`, `merge` |
 | `policy.reviewRoundCap` | `3` (1–20) | Review rounds before escalation |
 | `policy.escalateOnNoProgress` | `true` | Escalate when a fix round leaves the diff unchanged |
@@ -80,8 +86,9 @@ Each role's tools are fixed, not settings. The role's prompt (`role-<role>`) alw
 |---|---|
 | architect | `coding-readonly`, `web-search` |
 | builder | `coding`, `subagent`, `test-runner`, `web-search` |
-| helper | `coding-readonly`, `web-search` |
-| reviewer | `coding-readonly`, `test-runner`, `browser`, `web-search` |
+| helper | `coding`, `test-runner`, `web-search` (no `subagent`, no bridge tools) |
+| reviewer | `coding-readonly`, `test-runner`, `web-search` |
+| qa | `coding-readonly` (bash runs in the VM), `computer`, `web-search` |
 
 Model credentials are not settings. pi-ai reads them from the environment, e.g. `ANTHROPIC_API_KEY` and
 `OPENAI_API_KEY`.
@@ -152,6 +159,25 @@ breaks. The tool runs in the factory process, so the key never reaches the sandb
 `allowedDomains` entry. Queries leave the machine and are kept in transcripts. Every role has the tool; to turn
 searching off, leave the key unset.
 
+### AQ testing
+
+Each review round, if `qa.enabled` and a run script exists, the core creates one boat.dev VM named
+`factory-<run>-<round>` with `noEnv` (no environment variables of yours), uploads the reviewed build as a git bundle,
+runs the setup script and starts the run script. The QA agent drives the VM's desktop and Chrome through the Cua
+Driver and must cite screenshots for its findings. The VM is deleted when the round ends, when the run is cancelled,
+and at startup if it is left over from a crash.
+
+- **What leaves the machine:** the reviewed source (as a bundle) goes to boat.dev, and the screenshots come back.
+  GitHub credentials and your environment never go to the VM. Screenshots stay under `<config dir>/artifacts` and
+  are never committed; delivery notes only point to the run view.
+- **The key** is read in the factory process; it is denied to every sandboxed command like the GitHub token. Use a
+  key scoped to sandboxes if boat offers one. With QA on and the key unresolved, a run fails at `PREPARING` and says
+  to set the key or set `qa.enabled: false`. `factory doctor` checks it per scope.
+- **If boat is down,** the round's QA status is `unavailable`, the run goes on with the review alone, and a notice
+  says so.
+- **Validation:** `boat.ttl` must be 10m–24h; `boat.runScripts` must be non-empty repo-relative paths; `roles.qa.model`
+  must accept image input.
+
 ## Old config files
 
 The `stages` and `workers` sections are gone, and so are `roles.<role>.extensions`, every `stages.*.use`,
@@ -179,6 +205,10 @@ machine is to leave `webSearch.apiKey` unresolved (for the default `env:PARALLEL
 
 `factory doctor` prints the same message as a `FAIL` line. Any other unknown key fails validation on save as before.
 
+A config without `qa` or `boat` keys takes their defaults, so **AQ testing is on and needs `BOAT_API_KEY`** after
+upgrading. Set `qa: { enabled: false }` (globally or per project) to keep the old behaviour. Runs already in flight
+keep their pinned config and stay QA-off. An unset `roles.helper` now means the builder's model.
+
 **Finish or cancel in-flight runs before upgrading.** Runs started before this change are not migrated: their pinned
 config still has the old paths. If such a run resumes, it doesn't see its old values and falls back to the default CI
 mode, GitHub identity and workdir. If its sandbox environment hasn't been provisioned yet, the environment gets the
@@ -197,9 +227,14 @@ github:
 ci: { mode: if-present, fixRounds: 2 }
 sandbox: { allowedDomains: [registry.npmjs.org] }
 webSearch: { mode: fast, apiKey: env:PARALLEL_API_KEY }
+qa: { enabled: true }
+boat: { apiKey: env:BOAT_API_KEY, size: default, ttl: 1h }
 projects:
   todo:
     repo: me/todo
     policy: { approvals: [spec, delivery, merge] }
     ci: { mode: required }
+  cli-tool:
+    repo: me/cli-tool
+    qa: { enabled: false }     # nothing visual to test
 ```

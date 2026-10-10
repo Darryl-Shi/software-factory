@@ -49,11 +49,12 @@ not selectable: `ROLE_TOOLS` in `tools.ts` gives each role a fixed set, after it
 
 | Tool set | Provides | Roles |
 |---|---|---|
-| `coding` | read, write, edit and bash tools | builder |
-| `coding-readonly` | read and bash tools | architect, helper, reviewer |
-| `subagent` | helpers as owned Conversations | builder |
-| `test-runner` | `run_tests` | builder, reviewer |
-| `browser` | `http_request`: an HTTP client over curl, not a real browser | reviewer |
+| `coding` | read, write, edit and bash tools | builder, helper |
+| `coding-readonly` | read and bash tools | architect, reviewer, qa |
+| `subagent` | helpers (which write code) as owned Conversations | builder |
+| `test-runner` | `run_tests` | builder, helper, reviewer |
+| `computer` | the Cua Driver in the QA VM; every screenshot is stored as a run artifact | qa |
+| `browser` | `http_request` over curl; no role gets it now, kept so older Conversations resume | — |
 | `web-search` | `web_search`: Parallel's Search API in `fast` mode, run in the factory process | all |
 | `role-*` (`prompts.ts`) | each role's prompt sections | each its own |
 
@@ -83,11 +84,14 @@ Any non-terminal state ──cancel──► CANCELLED;  errors → FAILED;  ret
 3. **Spec.** The spec must contain an "Acceptance behaviours" heading. `GitHub.writeArtifact` commits it to
    `docs/spec.md`. If the `spec` gate is on (the default), the run waits for approval. A rejection sends it back to
    the discussion.
-4. **Build.** One builder Conversation does the build. It is the only writer, and it may spawn read-only helpers
-   through `subagent`. It finishes with `report_done`, which must answer every blocking finding it was given.
-5. **Whole-product review.** A fresh reviewer Conversation with read-only tools reviews the whole product against
-   the spec. It submits a verdict with `submit_review`. The verdict is `fail` exactly when a blocking finding exists,
-   and every finding needs `evidence` and a `specRef`.
+4. **Build.** One builder Conversation does the build and is accountable for it. It may have helpers write code in
+   parallel through `subagent` (in its own worktree; helpers use `roles.helper`, else the builder's model). It
+   finishes with `report_done`, which must answer every blocking finding it was given.
+5. **Review and AQ testing, in parallel.** A fresh reviewer Conversation with read-only tools reviews the whole
+   product against the spec, runs the tests, and reviews the round's diff for quality and security; it submits
+   `submit_review` (every finding needs `evidence`; `specRef` is optional). If `qa.enabled` and the repo has a run
+   script, a fresh QA Conversation uses the product in a boat.dev VM (`src/boat/`) and submits `submit_qa`, where
+   every finding cites a screenshot it took. The round fails exactly when either submitted a blocking finding.
    - On `fail`, the findings go back to the same builder.
    - The run escalates when the round cap is reached, or when a fix round leaves the diff unchanged
      (`policy.escalateOnNoProgress`).
@@ -183,8 +187,8 @@ server is its transport.
 - **Agents never hold the GitHub credentials.** The core and `GitHub` push, open PRs and merge. Agents only work in
   the worktree.
 - **Every agent command runs inside `@anthropic-ai/sandbox-runtime`.**
-  - Each role has its own write rules. The builder can write its worktree and scratch dir; the architect, reviewer
-    and helpers are read-only.
+  - Each role has its own write rules. The builder and its helpers can write the worktree and scratch dir; the
+    architect and reviewer are read-only. The QA agent runs in a boat.dev VM (created with `noEnv`), not here.
   - `denyRead` hides secret paths.
   - Network access goes through an allowlist.
   - Commands start from an empty environment, so no credential env vars reach them.
