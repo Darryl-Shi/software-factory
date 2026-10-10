@@ -21,7 +21,11 @@ and at the approval gates you turn on, but you can message the agent working on 
   stages on its own, a full-screen run view with the agents' conversations, a chat box, and approvals in a floating
   card, and a Settings view. The `factory` command only starts, stops and checks the process.
 - **Each role has a fixed tool set** (`src/agents/`). Every role can search the web: `web_search` is backed by
-  Parallel's Search API in `fast` mode. Set `PARALLEL_API_KEY` to turn it on.
+  Parallel's Search API in `fast` mode. Give it a Parallel key with `factory setup search` (or `PARALLEL_API_KEY`)
+  to turn it on.
+- **`factory setup` is the setup wizard.** It sets up the credentials (GitHub, model providers, boat.dev, Parallel),
+  pi provider packages and OpenAI- or Anthropic-compatible endpoints, the roles' models, and a user service that
+  runs the factory. The factory stores what it collects, so no env vars are needed.
 
 The design is in [`docs/design-spec.md`](docs/design-spec.md), as amended by the
 [fixed architecture cleanup](docs/superpowers/specs/2026-10-09-fixed-architecture-cleanup-design.md). Every place the
@@ -50,14 +54,20 @@ code differs from them is listed in [`DEVIATIONS.md`](DEVIATIONS.md).
   - Linux: `bubblewrap` and `socat` (`sudo apt install bubblewrap socat`).
   - macOS: `sandbox-exec`.
 - **For real GitHub:** the `gh` CLI and a token or a GitHub App. See [configuration](docs/configuration.md#github-identity).
-- **For real models:** the providers' API keys in the environment. pi-ai reads them, for example `ANTHROPIC_API_KEY`
-  and `OPENAI_API_KEY` for the default roles.
-- **For AQ testing:** `BOAT_API_KEY` (a boat.dev key), unless `qa.enabled: false`. Without it and with QA on, runs
-  fail at `PREPARING` with a message saying so.
-- **For web search (optional):** `PARALLEL_API_KEY`. Without it, `web_search` tells the agent it isn't configured
-  and the agent carries on.
+- **For real models:** credentials for the roles' providers: an API key or a subscription login (OAuth).
+- **For AQ testing:** a boat.dev key, unless `qa.enabled: false`. Without it and with QA on, runs fail at
+  `PREPARING` with a message saying so.
+- **For web search (optional):** a Parallel key. Without it, `web_search` tells the agent it isn't configured and the
+  agent carries on.
 
-`bin/factory doctor` checks the config file, the model credentials, the sandbox, the GitHub identity and `gh`.
+`bin/factory setup` checks the prerequisites and stores the credentials: tokens and keys in `secrets.json` (mode
+0600), model credentials in `pi/auth.json`, both next to the config file. Environment variables still work as before:
+`GH_TOKEN`, `BOAT_API_KEY`, `PARALLEL_API_KEY`, and the providers' keys that pi-ai reads, such as `ANTHROPIC_API_KEY`
+and `OPENAI_API_KEY` for the default roles.
+
+`bin/factory doctor` checks the config file, the model credentials, the sandbox, the GitHub identity and `gh`. Each
+credential line names where the credential comes from, and a credential or prerequisite problem ends with the
+`factory setup <section>` that fixes it.
 
 ## Install
 
@@ -78,12 +88,17 @@ minutes. On a Linux host without `socat`, run it with `DRYRUN_SANDBOX=0`:
 npm run dry-run          # DRYRUN_DIR=/some/dir to choose where it writes; report.md is the result
 ```
 
-**With real GitHub and models.** Set `GH_TOKEN` and the model keys, then:
+**With real GitHub and models.**
 
 ```sh
-bin/factory doctor
+npm install
+bin/factory setup        # credentials, providers, role models, and optionally a user service
 bin/factory serve        # starts the factory in the background and prints the web UI's link
 ```
+
+If setup installed the service, the service runs the factory: skip `bin/factory serve`. Setup's last line shows the
+link only if the web UI was already listening when setup finished (otherwise it says `next: factory serve`, which you
+can ignore); `bin/factory web` prints the link once the service is up.
 
 Open the link. **Create** a ticket with a project name, its repo (`owner/name`; created at the first delivery if it
 doesn't exist) and the request, then answer the architect's questions and the approvals in the run view.
@@ -96,6 +111,7 @@ factory stop [--config p]
 factory status [--config p]
 factory web [--config p]          print the web UI's link
 factory doctor [--config p]
+factory setup [section] [--config p]
 ```
 
 - **`serve`** starts the factory as a background process and prints the web UI's link once it listens. It is the one
@@ -109,6 +125,17 @@ factory doctor [--config p]
 - **`status`** prints `running (pid N)` and the link, or `not running` (exit 1).
 - **`web`** prints the link again.
 - **`doctor`** checks the setup and prints one `ok`/`warn`/`FAIL` line per check.
+- **`setup`** is the interactive setup wizard. It needs a terminal: without one (stdin or stdout not a TTY) it exits 1
+  with `factory setup is interactive; run it in a terminal`. There is no non-interactive mode.
+  - With no section, it shows a status line per section, runs the sections in order (asking `Reconfigure <title>?`,
+    e.g. `Reconfigure GitHub?`, for those already set up), runs `doctor`'s checks, and ends with the web UI's link or
+    `next: factory serve`.
+  - With a section, it runs only that one: `prereqs`, `github`, `models`, `roles`, `qa`, `search` or `service`. An
+    unknown section exits 1 and lists them.
+  - Each section saves when it finishes. Ctrl-C, at a prompt or while a spinner runs, prints
+    `setup cancelled; completed sections were saved` and exits 130.
+  - It works whether or not the factory is running. See [configuration](docs/configuration.md#setup) for what each
+    section does.
 
 `serve` options:
 - `--config <path>`: the default is `~/.factory/config.yaml` (or `$FACTORY_CONFIG`). The file is created if missing.
@@ -123,6 +150,10 @@ The factory keeps its files next to the config file (`~/.factory/` by default):
 - `factory.log`: the background process's output (mode 0600; it carries the link).
 - `web-token`: the web UI's access token (mode 0600).
 - `web-url`: the link, written while the web UI listens.
+- `secrets.json`: the secrets `factory setup` stored (mode 0600; see
+  [configuration](docs/configuration.md#secret-references)).
+- `pi/`: the model host's directory: provider packages, `models.json` and `auth.json` (see
+  [configuration](docs/configuration.md#model-providers)).
 
 ## Web UI
 
@@ -153,7 +184,7 @@ bin/factory stop --config .dryrun/config.yaml        # when you are done
 ## Tests
 
 ```sh
-npm test            # vitest, 119 tests, a few minutes; no credentials or network needed
+npm test            # vitest, a few minutes; no credentials or network needed
 npm run typecheck   # tsc (noEmit)
 ```
 
@@ -170,6 +201,10 @@ npm run typecheck   # tsc (noEmit)
 | `test/web.test.ts` | The web server: token and cookie, Host/Origin/content-type checks, operations and error codes, the event stream, a busy port as an error, the static UI |
 | `test/web-search.test.ts` | `web_search` against a fake Parallel endpoint: request shape, result formatting, errors, a run using pinned `webSearch` settings |
 | `test/daemon.test.ts` | `serve`/`stop`/`status`/`web` as real processes: detaching, a second `serve`, a busy port, a bad or legacy config, unknown options, stale pid files, a fresh install |
+| `test/secrets.test.ts` | The secret store: file and directory modes, atomic writes, refusing a loose or unparseable file, `store:` refs |
+| `test/model-host.test.ts` | The model host: built-in providers, `models.json`, an installed provider package, extension errors as diagnostics, no `.pi/` from the cwd, live `auth.json` |
+| `test/doctor.test.ts` | `doctor`: credential sources, extension diagnostics, `→ factory setup <section>` hints |
+| `test/setup-*.test.ts` | `factory setup`: the UI adapter, the wizard, each section against stubs and local servers, and the command's refusals |
 
 Notes:
 - The 6 sandbox tests need bubblewrap and socat installed; without them they are skipped. Where bubblewrap is installed but the kernel forbids unprivileged user namespaces, 3 of them fail with "bwrap: No permissions to create a new namespace".
@@ -188,9 +223,14 @@ src/sandbox/       sandbox.ts (Sandbox: per-role environments in the run's workt
 src/web/           server.ts (HTTP + server-sent events) and ui/ (the static web UI, no build step)
 src/agents/        tools.ts (coding, coding-readonly, subagent, test-runner, computer, browser; each role's fixed set),
                    web-search.ts, prompts.ts (role-* prompts)
-src/main.ts        process wiring: models, storage, GitHub, Sandbox, Factory, web server
+src/models/        host.ts (the model host: pi-coding-agent's ModelRuntime and package manager over <factoryHome>/pi)
+src/secrets/       store.ts (SecretStore over <factoryHome>/secrets.json; backs `store:` refs)
+src/setup/         ui.ts (SetupUi, ClackUi), context.ts (SetupContext), wizard.ts (runSetup),
+                   steps/ (one file per section: prereqs, github, models, roles, qa, search, service)
+src/main.ts        process wiring: model host, secret store, storage, GitHub, Sandbox, Factory, web server
 src/daemon.ts      serve in the background: pid, log and link files
-src/cli.ts, bin/factory   the `factory` command: serve | stop | status | web | doctor
+src/doctor.ts      the `doctor` checks (also run at the end of `factory setup`)
+src/cli.ts, bin/factory   the `factory` command: serve | stop | status | web | doctor | setup
 src/testing/       scripted provider and dry-run agents
 scripts/dry-run.ts the §8 dry run          test/   vitest suites
 docs/              design spec, architecture, configuration, dry-run report

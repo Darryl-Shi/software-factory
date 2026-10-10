@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // `factory` command. `factory serve` starts the process that owns the storage and the core (detached, unless
 // --foreground); the web UI is the interface. `stop` and `status` manage it, `web` prints the web UI link and
-// `doctor` checks the setup (src/doctor.ts).
+// `doctor` checks the setup (src/doctor.ts) and `setup` runs the interactive setup wizard (src/setup/).
 
 const argv = process.argv.slice(2);
 const flags: Record<string, string | true> = {};
@@ -26,6 +26,7 @@ const HELP = `factory — software factory on Pi Durable
   factory setup [section] [--config p]
 `;
 const SERVE_FLAGS = ["config", "port", "fake-github", "fake-boat", "scripted", "ci-poll-ms", "foreground", "help"];
+const SETUP_FLAGS = ["config", "help"];
 
 /** The config file's absolute path: --config, else $FACTORY_CONFIG, else ~/.factory/config.yaml. */
 async function configPath(): Promise<string> {
@@ -63,6 +64,7 @@ async function main() {
 		return print(url);
 	}
 	if (cmd === "doctor") return doctor();
+	if (cmd === "setup") return setup();
 	throw new Error(`unknown command ${cmd}\n\n${HELP}`);
 }
 
@@ -113,6 +115,24 @@ async function serve() {
 	};
 	process.on("SIGINT", stop);
 	process.on("SIGTERM", stop);
+}
+
+/** `factory setup [section]`: refusals (option, section, not a TTY) come before anything is read or prompted. */
+async function setup() {
+	const unknown = Object.keys(flags).find((k) => !SETUP_FLAGS.includes(k));
+	if (unknown) throw new Error(`unknown option --${unknown}`);
+	if (pos.length > 2) throw new Error(`unexpected argument ${pos[2]}`);
+	const section = pos[1];
+	const { SECTIONS, createSetupContext } = await import("./setup/context.ts");
+	if (section !== undefined && !(SECTIONS as readonly string[]).includes(section))
+		throw new Error(`unknown section ${section}; sections: ${SECTIONS.join(", ")}`);
+	if (!process.stdin.isTTY || !process.stdout.isTTY) {
+		console.error("factory setup is interactive; run it in a terminal");
+		process.exit(1);
+	}
+	const { runSetup } = await import("./setup/wizard.ts");
+	const { ClackUi } = await import("./setup/ui.ts");
+	process.exit(await runSetup(createSetupContext({ configPath: await configPath(), ui: new ClackUi() }), section));
 }
 
 async function doctor() {

@@ -53,7 +53,7 @@ entries name the code as it is now.
     - **Problem:** the first two are not model IDs that pi-ai's `createModels()` knows.
     - **Built:** `anthropic/claude-opus-5-5`, `anthropic/claude-sonnet-5-5` and `openai/gpt-6-sol`. The reviewer stays in a different model family, per §8's open risks.
 12. **No `docs` tool set.** The §5 example gives the architect `[coding-readonly, docs]`. No `docs` extension exists in Pi; the architect's fixed set is `coding-readonly, web-search`, and `web_search` covers looking up library docs (see 22).
-13. **`secretRef` supports `env:NAME` and `file:/path` only.** A `store:` key needs a secret-store integration, which Pi doesn't provide as a ready service here. The validator rejects inline secrets that look like tokens.
+13. *(Obsolete since `factory setup`.)* `store:key` refs now resolve through the factory's own secret store, `<factory home>/secrets.json` (mode 0600), which `factory setup` writes; see [configuration](docs/configuration.md#secret-references). The validator still rejects inline secrets that look like tokens.
 14. **Extra settings were added** (none weaken §6):
     - `sandbox.setupScripts` and `sandbox.enabled` (tests disable the sandbox), `sandbox.unixSockets` (see 7);
     - `workdir`;
@@ -102,6 +102,7 @@ leaves open, and the places where the code still differs from it.
     - **Spec:** every stage (intake, interface, repo, delivery, environment) is an extension selected by `stages.<kind>.use`, and each role's worker extensions are chosen in its settings (§3.2, §3.3, §5, §6).
     - **Built:** the core calls a `GitHub` class and a `Sandbox` class directly; the web UI is the only interface; each role has a fixed tool set; settings live at `workdir`, `github.*`, `ci.*`, `sandbox.*`, `web.*` and `webSearch.*`. `factory serve` runs in the background, and `stop`, `status`, `web` and `doctor` are the only other commands.
     - **Why:** every stage had exactly one implementation, so the pluggability added contracts, lookups, schema merging and docs without buying anything.
+    - *(Since then, `factory setup` was added as a further command; see 36.)*
 
 ## AQ testing and helpers that write (§2, §3.7, §9, §9.1 — added after the fixed architecture)
 
@@ -113,3 +114,11 @@ leaves open, and the places where the code still differs from it.
 33. **Cost.** QA agent tokens are recorded under role `qa` for the review round; the VM's machine time is a separate `qa` record with `vmSeconds` (from create to dispose) and no USD figure, because the SDK's usage call is account-wide.
 34. **Helpers write code** in the builder's environment (its worktree, scratch dir and write rules). No helper environment is provisioned for new runs. `roles.helper` has no defaults; unset, it takes the builder's effective model and thinking (shown with source `default`).
 35. **Combined round verdict.** The reviewer and the QA agent run in parallel (`Promise.allSettled`); the round fails if either submitted a blocking finding. Findings are numbered across both (`F1…`), logged as separate `review` and `qa` entries with the same `reviewSeq`, and the next round's reviewer and QA agent each see only their own prior findings plus the builder's responses.
+
+## Setup and model providers (added after AQ testing; [setup spec](docs/superpowers/specs/2026-10-11-setup-flow-design.md))
+
+36. **pi-coding-agent as the model host.** The factory now depends on `@earendil-works/pi-coding-agent@1.1.0` (pinned; it depends on the same `pi-ai ^1.1.0`, so there is one copy of pi-ai).
+    - **Spec:** the core receives `createModels()` with pi-ai's providers "straight from Pi" (§3), and a role's `model` is one that `createModels()` knows (§6).
+    - **Why:** pi-durable takes a pi-ai `Models` object and has no extension or package loader. Provider packages, `models.json` endpoints and stored logins (API key or OAuth, with locking and refresh in `auth.json`) are pi-coding-agent's: its `DefaultPackageManager` installs packages, its resource loader runs their extensions, and its `ModelRuntime` combines all of them into one `Models`. Using it avoids reimplementing that, and keeps the formats `pi` users know.
+    - **Built:** `createModelHost` (`src/models/host.ts`) runs pi-coding-agent's services over `<factory home>/pi`, with that directory as `cwd` too, so nothing is read from `~/.pi/agent` or from a `.pi/` directory where `serve` starts. `Factory` receives the `ModelRuntime` as its `Models` and is otherwise unchanged. Only what extensions register as **providers and virtual models** is used; their tools, commands, flags and event hooks attach to pi-coding-agent sessions, which the factory never creates, and each role's tool set stays fixed (27).
+    - **Cost:** extensions are loaded and **run in-process**, outside the sandbox, with access to the factory's credentials. `factory setup` shows a warning and asks before it installs a package. Extension load errors are diagnostics (`serve` logs them, `doctor` warns), never a failed start. New packages and `models.json` changes need a restart; credentials apply live.
