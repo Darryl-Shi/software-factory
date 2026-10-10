@@ -3,6 +3,7 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Api, AuthInteraction, Model } from "@earendil-works/pi-ai";
+import { CredentialSynchronizationError, type ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { ConfigStore } from "../../core/settings.ts";
 import type { SetupContext } from "../context.ts";
 import { authInteraction, SetupCancelled } from "../ui.ts";
@@ -12,17 +13,29 @@ type ModelsDoc = { providers: Record<string, any> };
 
 const modelsPath = (agentDir: string) => join(agentDir, "models.json");
 
-/** `<agentDir>/models.json`, or `{ providers: {} }` when absent. Other top-level keys are kept. Throws on bad JSON. */
+/** models.json is not plain JSON setup can rewrite (pi also accepts `//` comments and trailing commas). */
+export class ModelsJsonError extends Error {
+	constructor(path: string, why: string) {
+		super(`models.json can't be parsed: ${why}; edit ${path} by hand`);
+		this.name = "ModelsJsonError";
+	}
+}
+
+/**
+ * `<agentDir>/models.json`, or `{ providers: {} }` when absent. Other top-level keys are kept; a BOM is skipped.
+ * pi's own parser (comments, trailing commas) is not exported, and rewriting such a file would drop its comments, so
+ * anything `JSON.parse` rejects throws ModelsJsonError and the file is left for the user.
+ */
 export function readModelsJson(agentDir: string): ModelsDoc {
 	const path = modelsPath(agentDir);
 	if (!existsSync(path)) return { providers: {} };
 	let doc: unknown;
 	try {
-		doc = JSON.parse(readFileSync(path, "utf8"));
+		doc = JSON.parse(readFileSync(path, "utf8").replace(/^\uFEFF/, ""));
 	} catch (e) {
-		throw new Error(`${path}: ${(e as Error).message}`);
+		throw new ModelsJsonError(path, (e as Error).message);
 	}
-	if (!isObj(doc)) throw new Error(`${path}: expected a JSON object`);
+	if (!isObj(doc)) throw new ModelsJsonError(path, "expected a JSON object");
 	return { ...doc, providers: isObj(doc.providers) ? doc.providers : {} };
 }
 
@@ -100,9 +113,27 @@ export function inUseMessage(provider: string, paths: string[]): string {
 	return `${provider} is used by ${paths.join(", ")}; change those roles first`;
 }
 
-/** True for a user cancel, including one a login flow wrapped as the cause. */
-export function isCancel(e: unknown): boolean {
-	return e instanceof SetupCancelled || (e instanceof Error && e.cause instanceof SetupCancelled);
+/** The user's cancel, also when a login flow wrapped it as the cause; undefined for any other error. */
+export function cancelOf(e: unknown): SetupCancelled | undefined {
+	if (e instanceof SetupCancelled) return e;
+	if (e instanceof Error && e.cause instanceof SetupCancelled) return e.cause;
+	return undefined;
+}
+
+/**
+ * Deletes the stored credential for `id`, if any. A stored credential wins over models.json's `apiKey`, so a key left
+ * behind by a removed endpoint would be sent to whatever server a later provider with that id points at. Works for
+ * ids no provider has. True when one was deleted.
+ */
+export async function clearCredential(models: ModelRuntime, id: string): Promise<boolean> {
+	if (!(await models.listCredentials()).some((c) => c.providerId === id)) return false;
+	try {
+		await models.logout(id);
+	} catch (e) {
+		// deleted; only pi's snapshot refresh afterwards failed
+		if (!(e instanceof CredentialSynchronizationError)) throw e;
+	}
+	return true;
 }
 
 export function errorMessage(e: unknown): string {
@@ -128,6 +159,13 @@ const APIS = [
 ] as const;
 
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+
+/** Base URL placeholders: OpenAI-style APIs include `/v1`, Anthropic's SDK adds it itself. */
+const BASE_URL_PLACEHOLDER: Record<string, string> = {
+	"openai-completions": "http://localhost:11434/v1",
+	"openai-responses": "https://api.example.com/v1",
+	"anthropic-messages": "https://api.example.com",
+};
 
 /**
  * pi gives a models.json provider without `apiKey` a generic login that prompts once for a secret. The key was
@@ -203,14 +241,18 @@ async function testCall(ctx: SetupContext, model: Model<Api>): Promise<string> {
 		.trim();
 }
 
-/** Undoes an added endpoint: its models.json entry and the key the login stored. */
-async function revertEndpoint(ctx: SetupContext, id: string, loggedIn: boolean): Promise<void> {
+/**
+ * Undoes an added endpoint: any credential stored for it (a failed login may have stored one anyway) and its
+ * models.json entry. The files are as before, so `needsRestart` goes back to its value before the add.
+ */
+async function revertEndpoint(ctx: SetupContext, id: string, restartBefore: boolean): Promise<void> {
 	const host = await ctx.host();
+	await clearCredential(host.models, id);
 	const doc = readModelsJson(host.agentDir);
 	delete doc.providers[id];
 	writeModelsJson(host.agentDir, doc);
-	if (loggedIn) await host.models.logout(id);
 	await ctx.reloadHost();
+	ctx.needsRestart = restartBefore;
 }
 
 /** Add a compatible endpoint (spec §3.4): write models.json → reload → login (key auth) → optional test call. */
@@ -235,7 +277,7 @@ export async function addEndpoint(ctx: SetupContext): Promise<void> {
 	const baseUrl = (
 		await ui.text({
 			message: "Base URL",
-			placeholder: "http://localhost:11434/v1",
+			placeholder: BASE_URL_PLACEHOLDER[api],
 			validate: (v) => (/^https?:\/\/[^\s/]+/.test(v.trim()) ? undefined : "enter an http:// or https:// URL"),
 		})
 	)
@@ -266,24 +308,28 @@ export async function addEndpoint(ctx: SetupContext): Promise<void> {
 	const entry = { name, baseUrl, api, ...(auth === "none" ? { apiKey: "none" } : {}), models };
 	const doc = readModelsJson(host.agentDir);
 	doc.providers[id] = entry;
+	// A credential left under this id (an endpoint removed before this fix, a hand edit) would win over the new auth.
+	if (await clearCredential(host.models, id)) ui.log.info(`cleared a stored credential for ${id} left from an earlier endpoint`);
 	writeModelsJson(host.agentDir, doc);
+	// Set now, so a cancel at any later prompt still leaves the restart offer for the saved endpoint.
+	const restartBefore = ctx.needsRestart;
+	ctx.needsRestart = true;
 	let next = await ctx.reloadHost();
 	if (!next.models.getProvider(id)) {
 		const why = next.diagnostics.map((d) => d.message).join("\n");
 		ui.log.error(`${id} did not load${why ? `:\n${why}` : ""}`);
-		await revertEndpoint(ctx, id, false);
+		await revertEndpoint(ctx, id, restartBefore);
 		return;
 	}
 
-	let loggedIn = false;
 	if (key !== undefined) {
 		for (;;) {
 			try {
 				await next.models.login(id, "api_key", prefilledKey(authInteraction(ui), key));
-				loggedIn = true;
 				break;
 			} catch (e) {
-				if (isCancel(e)) throw e;
+				const cancel = cancelOf(e);
+				if (cancel) throw cancel;
 				ui.log.error(`${id}: ${errorMessage(e)}`);
 				const choice = await ui.select({
 					message: "Saving the key failed",
@@ -294,7 +340,7 @@ export async function addEndpoint(ctx: SetupContext): Promise<void> {
 					initial: "retry",
 				});
 				if (choice === "skip") {
-					await revertEndpoint(ctx, id, false);
+					await revertEndpoint(ctx, id, restartBefore);
 					return;
 				}
 				next = await ctx.host();
@@ -318,14 +364,13 @@ export async function addEndpoint(ctx: SetupContext): Promise<void> {
 				const choice = await retrySaveSkip(ctx, id);
 				if (choice === "save") break;
 				if (choice === "skip") {
-					await revertEndpoint(ctx, id, loggedIn);
+					await revertEndpoint(ctx, id, restartBefore);
 					return;
 				}
 			}
 		}
 	}
 	ui.log.success(`added ${id} with ${ids.length} model${ids.length === 1 ? "" : "s"}`);
-	ctx.needsRestart = true;
 }
 
 /** Remove a compatible endpoint: refused while a role uses it. */
@@ -347,9 +392,11 @@ export async function removeEndpoint(ctx: SetupContext): Promise<void> {
 		ui.log.error(inUseMessage(id, paths));
 		return;
 	}
+	// Its stored key goes too: left behind, it would be sent to the next provider that takes this id.
+	const keyRemoved = await clearCredential(host.models, id);
 	delete doc.providers[id];
 	writeModelsJson(host.agentDir, doc);
-	await ctx.reloadHost();
-	ui.log.success(`removed ${id} from models.json`);
 	ctx.needsRestart = true;
+	await ctx.reloadHost();
+	ui.log.success(`removed ${id} from models.json${keyRemoved ? " and its key from auth.json" : ""}`);
 }

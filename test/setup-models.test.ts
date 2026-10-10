@@ -1,14 +1,18 @@
 // Setup section "models" (spec §3.4): provider logins, provider packages, compatible endpoints in models.json.
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { afterEach, describe, expect, onTestFinished, test } from "vitest";
+import { CredentialSynchronizationError, DefaultPackageManager, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { afterEach, describe, expect, onTestFinished, test, vi } from "vitest";
 import { setDefaultSecretStore } from "../src/core/settings.ts";
 import { agentDirOf } from "../src/models/host.ts";
 import { discoverModels, providersInUse, readModelsJson, writeModelsJson } from "../src/setup/steps/endpoints.ts";
-import { step } from "../src/setup/steps/models.ts";
+import { packageChange, step } from "../src/setup/steps/models.ts";
+import { SetupCancelled } from "../src/setup/ui.ts";
 import { testContext } from "./setup-context.ts";
+import { CANCEL } from "./setup-helpers.ts";
 
 afterEach(() => setDefaultSecretStore(undefined));
 
@@ -18,7 +22,7 @@ const LOGIN_PKG = resolve("test/fixtures/login-provider");
 const PROVIDER_PKG = resolve("test/fixtures/provider-package");
 const BROKEN_PKG = resolve("test/fixtures/broken-package");
 
-type Opts = { message: string; initial?: unknown; options?: { value: string; label: string; hint?: string }[] };
+type Opts = { message: string; initial?: unknown; placeholder?: string; options?: { value: string; label: string; hint?: string }[] };
 /** Answers a prompt with its default (`initial`). */
 const dflt = (o: Opts) => o.initial;
 /** The four per-model prompts (context window, max tokens, images, reasoning), each answered with its default. */
@@ -87,6 +91,47 @@ function replyOk(res: ServerResponse) {
 
 const realFetch: typeof fetch = (input, init) => fetch(input, init);
 
+/** Writes `<agentDir>/auth.json` as pi does (0600). */
+function writeAuthJson(home: string, doc: object) {
+	mkdirSync(agentDirOf(home), { recursive: true, mode: 0o700 });
+	writeFileSync(join(agentDirOf(home), "auth.json"), JSON.stringify(doc), { mode: 0o600 });
+}
+
+/** The source pi recorded in settings.json for the only user package. */
+async function onlyPackageSource(ctx: { host(): Promise<{ packages: DefaultPackageManager }> }) {
+	const pkgs = (await ctx.host()).packages.listConfiguredPackages();
+	expect(pkgs).toHaveLength(1);
+	return pkgs[0]!.source;
+}
+
+/**
+ * Simulates `npm install` for `npm:<name>@<version>` sources without the network: copies the provider-package fixture
+ * to pi's managed npm path (`<agentDir>/npm/node_modules/<name>`) with that version, then records the source with pi's
+ * real `addSourceToSettings`, which replaces an entry for the same npm name in place. PI_OFFLINE keeps pi from
+ * installing anything when it resolves the packages on reload.
+ */
+function fakeNpmInstalls(home: string) {
+	vi.stubEnv("PI_OFFLINE", "1");
+	const spy = vi.spyOn(DefaultPackageManager.prototype, "installAndPersist").mockImplementation(async function (this: DefaultPackageManager, source: string) {
+		const m = /^npm:(.+)@([^@]+)$/.exec(source);
+		if (!m) throw new Error(`fakeNpmInstalls: unsupported source ${source}`);
+		const dir = join(agentDirOf(home), "npm", "node_modules", m[1]!);
+		rmSync(dir, { recursive: true, force: true });
+		cpSync(PROVIDER_PKG, dir, { recursive: true });
+		writeFileSync(join(dir, "package.json"), JSON.stringify({ name: m[1], version: m[2], type: "module", pi: { extensions: ["./index.ts"] } }));
+		this.addSourceToSettings(source);
+	});
+	onTestFinished(() => spy.mockRestore());
+}
+
+/** A throwaway local package whose extension is `body` (a function of `pi`). */
+function tempPackage(body: string): string {
+	const dir = mkdtempSync(join(tmpdir(), "sf-pkg-"));
+	writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "sf-tmp", version: "0.0.1", type: "module", pi: { extensions: ["./index.ts"] } }));
+	writeFileSync(join(dir, "index.ts"), `export default function (pi: any) {\n${body}\n}\n`);
+	return dir;
+}
+
 describe("models: logins", () => {
 	test("api_key login through the scripted UI stores the credential", async () => {
 		let options: Opts["options"];
@@ -117,7 +162,19 @@ describe("models: logins", () => {
 		expect(shownOf(ui, "password").map((s) => s.message)).toEqual(["SF Login key"]);
 		expect(shownOf(ui, "select").map((s) => s.message)).toEqual(["Model providers", "Log in to", "Model providers"]);
 		expect(shownOf(ui, "log.success").some((s) => s.message.includes("sf-login"))).toBe(true);
+		// credentials apply live: a login needs no restart
+		expect(ctx.needsRestart).toBe(false);
 		expect(ui.remaining()).toBe(0);
+	});
+
+	test("a cancel in the middle of a login propagates and stores nothing", async () => {
+		const { ctx, ui, home } = testContext({ answers: ["login", "sf-login", CANCEL] });
+		await (await ctx.host()).packages.installAndPersist(LOGIN_PKG);
+		await ctx.reloadHost();
+		await expect(step.run(ctx)).rejects.toBeInstanceOf(SetupCancelled);
+		expect(authJson(home)).toEqual({});
+		expect(shownOf(ui, "log.error")).toEqual([]);
+		expect(ctx.needsRestart).toBe(false);
 	});
 
 	test("a provider with API key and OAuth asks for the method", async () => {
@@ -209,6 +266,34 @@ describe("models: logins", () => {
 		expect(await (await ctx.host()).models.listCredentials()).toEqual([]);
 		expect(ui.remaining()).toBe(0);
 	});
+
+	test("logging out of a provider a role uses asks first (default No)", async () => {
+		const { ctx, ui, home } = testContext({
+			config: "version: 1\nroles:\n  builder:\n    model: sf-login/m\n",
+			answers: [
+				"logout",
+				"sf-login",
+				(o: Opts) => {
+					expect(o.message).toBe("sf-login is used by roles.builder; log out anyway?");
+					expect(o.initial).toBe(false);
+					return false;
+				},
+				"done",
+				"logout",
+				"sf-login",
+				true,
+				"done",
+			],
+		});
+		await (await ctx.host()).packages.installAndPersist(LOGIN_PKG);
+		await (await ctx.reloadHost()).models.login("sf-login", "api_key", { prompt: async () => "k", notify: () => {} });
+		await step.run(ctx);
+		expect(authJson(home)["sf-login"]).toEqual({ type: "api_key", key: "k" });
+		await step.run(ctx);
+		expect(authJson(home)["sf-login"]).toBeUndefined();
+		expect(shownOf(ui, "confirm")).toHaveLength(2);
+		expect(ui.remaining()).toBe(0);
+	});
 });
 
 describe("models: provider packages", () => {
@@ -232,7 +317,9 @@ describe("models: provider packages", () => {
 		expect(ui.shown[noteAt + 1]?.kind).toBe("confirm");
 		expect(shownOf(ui, "confirm").map((s) => s.message)).toContain("Log in to sf-fixture now?");
 		expect(shownOf(ui, "log.success").some((s) => s.message.includes("sf-fixture"))).toBe(true);
-		expect(shownOf(ui, "spinner").length).toBeGreaterThan(0);
+		// a plain line, not an animated spinner: pi's npm/git children write to the inherited terminal
+		expect(shownOf(ui, "log.info").map((s) => s.message)).toContain(`Installing ${PROVIDER_PKG}…`);
+		expect(shownOf(ui, "spinner")).toEqual([]);
 		expect(ctx.needsRestart).toBe(true);
 		expect(settingsPackages(home)).toHaveLength(1);
 		expect(Object.values(factoryPackages(home))).toEqual([["sf-fixture"]]);
@@ -263,7 +350,7 @@ describe("models: provider packages", () => {
 		expect(shownOf(ui, "note").map((s) => s.body)).toContain(TRUST);
 		expect(settingsPackages(home)).toEqual([]);
 		expect(factoryPackages(home)).toEqual({});
-		expect(shownOf(ui, "spinner")).toEqual([]);
+		expect(shownOf(ui, "log.info").some((s) => s.message.startsWith("Installing"))).toBe(false);
 		expect(ctx.needsRestart).toBe(false);
 		expect(ui.remaining()).toBe(0);
 	});
@@ -315,6 +402,124 @@ describe("models: provider packages", () => {
 		expect(ui.remaining()).toBe(0);
 	});
 
+	test("a cancel at the removal offer keeps the installed package and needsRestart", async () => {
+		const { ctx, home } = testContext({ answers: ["install", BROKEN_PKG, true, CANCEL] });
+		await expect(step.run(ctx)).rejects.toBeInstanceOf(SetupCancelled);
+		expect(settingsPackages(home)).toHaveLength(1);
+		expect(ctx.needsRestart).toBe(true);
+	});
+
+	test("a package that extends an existing provider id counts as supplying it", async () => {
+		const pkg = tempPackage(`pi.registerProvider("openai", { baseUrl: "http://127.0.0.1:9/v1" });`);
+		const { ctx, ui, home } = testContext({ answers: ["install", pkg, true, false, "done"] });
+		await step.run(ctx);
+		expect(shownOf(ui, "confirm").map((s) => s.message)).toEqual([`Install ${pkg}?`, "Log in to openai now?"]);
+		expect(Object.values(factoryPackages(home))).toEqual([["openai"]]);
+		expect(shownOf(ui, "log.warn")).toEqual([]);
+		expect(ui.remaining()).toBe(0);
+	});
+
+	test("re-installing a package at another version moves its record and does not offer removal", async () => {
+		// Approach: pi's real addSourceToSettings and host reload, with only the npm download simulated (fakeNpmInstalls).
+		const { ctx, ui, home } = testContext({
+			config: "version: 1\nroles:\n  builder:\n    model: sf-fixture/text-1\n",
+			answers: [
+				"install",
+				"npm:sf-fixture-provider@0.0.1",
+				true,
+				false, // Log in to sf-fixture now?
+				"install",
+				"npm:sf-fixture-provider@0.0.2",
+				true,
+				"remove-package",
+				first,
+				"done",
+			],
+		});
+		fakeNpmInstalls(home);
+		await step.run(ctx);
+		expect(settingsPackages(home)).toEqual(["npm:sf-fixture-provider@0.0.2"]);
+		expect(factoryPackages(home)).toEqual({ "npm:sf-fixture-provider@0.0.2": ["sf-fixture"] });
+		expect(shownOf(ui, "confirm").map((s) => s.message)).toEqual([
+			"Install npm:sf-fixture-provider@0.0.1?",
+			"Log in to sf-fixture now?",
+			"Install npm:sf-fixture-provider@0.0.2?",
+		]);
+		expect(shownOf(ui, "log.success").map((s) => s.message)).toContain("replaced npm:sf-fixture-provider@0.0.1 with npm:sf-fixture-provider@0.0.2");
+		expect(shownOf(ui, "log.warn")).toEqual([]);
+		// the in-use guard still holds for the new version
+		expect(shownOf(ui, "log.error").map((s) => s.message)).toEqual(["sf-fixture is used by roles.builder; change those roles first"]);
+		expect(ctx.needsRestart).toBe(true);
+		expect(ui.remaining()).toBe(0);
+	});
+
+	test("packageChange tells a new package from a replaced or unchanged one", () => {
+		expect(packageChange(["a"], ["a", "npm:x@1"])).toEqual({ kind: "new", source: "npm:x@1" });
+		expect(packageChange(["a", "npm:x@1"], ["a", "npm:x@2"])).toEqual({ kind: "replaced", source: "npm:x@2", old: "npm:x@1" });
+		expect(packageChange(["a", "npm:x@1"], ["a", "npm:x@1"])).toEqual({ kind: "unchanged" });
+	});
+
+	test("remove reports every in-use provider of the package", async () => {
+		const { ctx, ui, home } = testContext({
+			config: "version: 1\nroles:\n  builder:\n    model: sf-fixture/text-1\n  reviewer:\n    model: sf-other/x\n",
+			answers: ["remove-package", first, "done"],
+		});
+		await (await ctx.host()).packages.installAndPersist(PROVIDER_PKG);
+		const source = await onlyPackageSource(ctx);
+		writeFileSync(join(agentDirOf(home), "factory-packages.json"), JSON.stringify({ [source]: ["sf-fixture", "sf-other"] }));
+		await step.run(ctx);
+		expect(shownOf(ui, "log.error").map((s) => s.message)).toEqual([
+			"sf-fixture is used by roles.builder; change those roles first",
+			"sf-other is used by roles.reviewer; change those roles first",
+		]);
+		expect(settingsPackages(home)).toHaveLength(1);
+		expect(ui.remaining()).toBe(0);
+	});
+
+	test("removing a package setup has no record of asks first (default No)", async () => {
+		const { ctx, ui, home } = testContext({
+			answers: [
+				"remove-package",
+				first,
+				(o: Opts) => {
+					expect(o.initial).toBe(false);
+					return false;
+				},
+				"done",
+				"remove-package",
+				first,
+				true,
+				"done",
+			],
+		});
+		await (await ctx.host()).packages.installAndPersist(PROVIDER_PKG); // outside setup: no factory-packages.json
+		const source = await onlyPackageSource(ctx);
+		await step.run(ctx);
+		expect(settingsPackages(home)).toHaveLength(1);
+		expect(ctx.needsRestart).toBe(false);
+		await step.run(ctx);
+		expect(settingsPackages(home)).toEqual([]);
+		expect(shownOf(ui, "confirm").map((s) => s.message)).toEqual([
+			`setup can't tell which providers ${source} supplies; remove it anyway?`,
+			`setup can't tell which providers ${source} supplies; remove it anyway?`,
+		]);
+		expect(shownOf(ui, "log.info").map((s) => s.message)).toContain(`Removing ${source}…`);
+		expect(shownOf(ui, "spinner")).toEqual([]);
+		expect(ctx.needsRestart).toBe(true);
+		expect(ui.remaining()).toBe(0);
+	});
+
+	test("a removal that matches nothing in settings.json is reported", async () => {
+		const { ctx, ui } = testContext({ answers: ["install", PROVIDER_PKG, true, false, "remove-package", first, "done"] });
+		const spy = vi.spyOn(DefaultPackageManager.prototype, "removeAndPersist").mockResolvedValue(false);
+		onTestFinished(() => spy.mockRestore());
+		await step.run(ctx);
+		const source = await onlyPackageSource(ctx);
+		expect(shownOf(ui, "log.warn").map((s) => s.message)).toEqual([`nothing in settings.json matched ${source}; nothing was removed`]);
+		expect(shownOf(ui, "log.success").some((s) => s.message.startsWith("removed"))).toBe(false);
+		expect(ui.remaining()).toBe(0);
+	});
+
 	test("remove a package no role uses", async () => {
 		let picked = "";
 		const pick = (o: Opts) => (picked = first(o));
@@ -340,7 +545,10 @@ describe("models: compatible endpoints", () => {
 				"my-ep",
 				"My EP",
 				"openai-completions",
-				srv.base,
+				(o: Opts) => {
+					expect(o.placeholder).toBe("http://localhost:11434/v1");
+					return srv.base;
+				},
 				"none",
 				(o: Opts) => {
 					offered = o.options!.map((x) => x.value);
@@ -403,7 +611,10 @@ describe("models: compatible endpoints", () => {
 				"my-ep",
 				"My EP",
 				"anthropic-messages",
-				"http://127.0.0.1:9",
+				(o: Opts) => {
+					expect(o.placeholder).toBe("https://api.example.com");
+					return "http://127.0.0.1:9";
+				},
 				"none",
 				"m1",
 				...MODEL_DEFAULTS,
@@ -511,6 +722,81 @@ describe("models: compatible endpoints", () => {
 		expect(ui.remaining()).toBe(0);
 	});
 
+	test("a cancel at the test request prompt leaves the endpoint saved and needsRestart set", async () => {
+		const { ctx, home } = testContext({
+			answers: ["add-endpoint", "my-ep", "My EP", "anthropic-messages", "http://127.0.0.1:9", "none", "m1", ...MODEL_DEFAULTS, CANCEL],
+		});
+		await expect(step.run(ctx)).rejects.toBeInstanceOf(SetupCancelled);
+		expect(Object.keys(readModelsJson(agentDirOf(home)).providers)).toEqual(["my-ep"]);
+		expect(ctx.needsRestart).toBe(true);
+	});
+
+	test("removing an endpoint logs out its key; the same id re-added without auth never sends the old key", async () => {
+		const a = await server(endpoint(["a"]));
+		const b = await server(endpoint(["a"], replyOk));
+		const add = (base: string, auth: string[]) => ["add-endpoint", "my-ep", "My EP", "openai-completions", base, ...auth, ["a"], "", ...MODEL_DEFAULTS];
+		const { ctx, ui, home } = testContext({
+			fetch: realFetch,
+			answers: [...add(a.base, ["key", "k1"]), false, "remove-endpoint", "my-ep", "done", ...add(b.base, ["none"]), true, "done"],
+		});
+		await step.run(ctx);
+		expect(authJson(home)["my-ep"]).toBeUndefined();
+		expect(shownOf(ui, "log.success").map((s) => s.message)).toContain("removed my-ep from models.json and its key from auth.json");
+		await step.run(ctx);
+		expect(b.requests.map((r) => r.url)).toEqual(["/v1/models", "/v1/chat/completions"]);
+		expect(b.requests.map((r) => r.auth)).toEqual([undefined, "Bearer none"]);
+		expect(ui.remaining()).toBe(0);
+	});
+
+	test("adding an endpoint clears a stale stored credential for its id", async () => {
+		const b = await server(endpoint(["a"], replyOk));
+		const { ctx, ui, home } = testContext({
+			fetch: realFetch,
+			answers: ["add-endpoint", "my-ep", "My EP", "openai-completions", b.base, "none", ["a"], "", ...MODEL_DEFAULTS, true, "done"],
+		});
+		writeAuthJson(home, { "my-ep": { type: "api_key", key: "stale" } });
+		await step.run(ctx);
+		expect(authJson(home)["my-ep"]).toBeUndefined();
+		expect(b.requests.at(-1)).toEqual({ url: "/v1/chat/completions", auth: "Bearer none" });
+		expect(shownOf(ui, "log.info").map((s) => s.message)).toContain("cleared a stored credential for my-ep left from an earlier endpoint");
+		expect(ui.remaining()).toBe(0);
+	});
+
+	test("Skip after a failed key login clears a key that was stored anyway", async () => {
+		const srv = await server(endpoint(["a"]));
+		// the key is written, then refreshing pi's snapshot fails (CredentialSynchronizationError)
+		const login = ModelRuntime.prototype.login;
+		const spy = vi.spyOn(ModelRuntime.prototype, "login").mockImplementationOnce(async function (this: ModelRuntime, ...args) {
+			const credential = await login.apply(this, args);
+			throw new CredentialSynchronizationError(args[0], "login", credential, { cause: new Error("refresh failed") });
+		});
+		onTestFinished(() => spy.mockRestore());
+		const { ctx, ui, home } = testContext({
+			fetch: realFetch,
+			answers: ["add-endpoint", "my-ep", "My EP", "openai-completions", srv.base, "key", "k1", ["a"], "", ...MODEL_DEFAULTS, "skip", "done"],
+		});
+		await step.run(ctx);
+		expect(shownOf(ui, "log.error")).toHaveLength(1);
+		expect(authJson(home)["my-ep"]).toBeUndefined();
+		expect(readModelsJson(agentDirOf(home)).providers).toEqual({});
+		expect(ctx.needsRestart).toBe(false);
+		expect(ui.remaining()).toBe(0);
+	});
+
+	test("a models.json that can't be parsed is reported and setup returns to the menu", async () => {
+		const { ctx, ui, home } = testContext({ answers: ["add-endpoint", "remove-endpoint", "done"] });
+		const path = join(agentDirOf(home), "models.json");
+		await ctx.host();
+		const text = '// my endpoints\n{ "providers": {} }\n';
+		writeFileSync(path, text);
+		await step.run(ctx);
+		const errors = shownOf(ui, "log.error").map((s) => s.message);
+		expect(errors).toHaveLength(2);
+		for (const m of errors) expect(m).toMatch(new RegExp(`^models\\.json can't be parsed: .+; edit ${path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} by hand$`));
+		expect(readFileSync(path, "utf8")).toBe(text);
+		expect(ui.remaining()).toBe(0);
+	});
+
 	test("remove endpoint in use is refused", async () => {
 		const { ctx, ui, home } = testContext({
 			config: "version: 1\nroles:\n  builder:\n    model: my-ep/a\n",
@@ -578,6 +864,9 @@ describe("models: endpoint helpers", () => {
 		const { home } = testContext({ answers: [] });
 		const dir = agentDirOf(home);
 		expect(readModelsJson(dir)).toEqual({ providers: {} });
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(join(dir, "models.json"), '\uFEFF{ "providers": { "b": { "baseUrl": "v" } } }');
+		expect(readModelsJson(dir)).toEqual({ providers: { b: { baseUrl: "v" } } });
 		writeModelsJson(dir, { providers: { a: { baseUrl: "u" } }, keep: 1 } as never);
 		expect(statSync(join(dir, "models.json")).mode & 0o777).toBe(0o600);
 		expect(readModelsJson(dir)).toEqual({ providers: { a: { baseUrl: "u" } }, keep: 1 });

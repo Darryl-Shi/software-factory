@@ -4,9 +4,20 @@ import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type { AuthType } from "@earendil-works/pi-ai";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import type { ModelHost } from "../../models/host.ts";
 import type { SetupContext, Step, StepStatus } from "../context.ts";
 import { authInteraction } from "../ui.ts";
-import { addEndpoint, errorMessage, inUseMessage, isCancel, providersInUse, removeEndpoint, roleProviders, writeJsonAtomic } from "./endpoints.ts";
+import {
+	addEndpoint,
+	cancelOf,
+	errorMessage,
+	inUseMessage,
+	ModelsJsonError,
+	providersInUse,
+	removeEndpoint,
+	roleProviders,
+	writeJsonAtomic,
+} from "./endpoints.ts";
 
 export const TRUST_NOTE =
 	"Packages are code that runs inside the factory process, outside the sandbox, with access to its credentials. Review the source before installing.";
@@ -81,7 +92,8 @@ async function login(ctx: SetupContext, id: string): Promise<boolean> {
 			ui.log.success(`${id}: logged in (${check.source ?? check.type})`);
 			return true;
 		} catch (e) {
-			if (isCancel(e)) throw e;
+			const cancel = cancelOf(e);
+			if (cancel) throw cancel;
 			ui.log.error(`${id}: ${errorMessage(e)}`);
 			const choice = await ui.select({
 				message: `Logging in to ${id} failed`,
@@ -121,6 +133,8 @@ async function logout(ctx: SetupContext): Promise<void> {
 		message: "Log out of",
 		options: stored.map((c) => ({ value: c.providerId, label: c.providerId, hint: c.type === "oauth" ? "OAuth" : "API key" })),
 	});
+	const paths = providersInUse(await ctx.settings()).get(id);
+	if (paths?.length && !(await ui.confirm({ message: `${id} is used by ${paths.join(", ")}; log out anyway?`, initial: false }))) return;
 	await models.logout(id);
 	ui.log.success(`logged out of ${id}`);
 }
@@ -136,6 +150,33 @@ function packageSource(typed: string, homedir: string): string {
 
 function lastLines(s: string, n: number): string {
 	return s.trimEnd().split("\n").slice(-n).join("\n");
+}
+
+/** The user-scope package sources in pi's settings.json, as pi stores them. */
+function userSources(host: ModelHost): string[] {
+	return host.packages
+		.listConfiguredPackages()
+		.filter((p) => p.scope === "user")
+		.map((p) => p.source);
+}
+
+export type PackageChange = { kind: "new"; source: string } | { kind: "replaced"; source: string; old: string } | { kind: "unchanged" };
+
+/**
+ * What an install did to settings.json's user packages. pi's `addSourceToSettings` replaces an entry for the same
+ * package in place (npm: same name, git: same host and path; `npm:foo@1` → `npm:foo@2`), appends a new one, or leaves
+ * an identical one alone. pi exposes no public helper for its match key, so this compares the lists before and after.
+ */
+export function packageChange(before: readonly string[], after: readonly string[]): PackageChange {
+	const added = after.filter((s) => !before.includes(s));
+	const removed = before.filter((s) => !after.includes(s));
+	if (!added.length) return { kind: "unchanged" };
+	if (removed.length === 1) return { kind: "replaced", source: added[0]!, old: removed[0]! };
+	return { kind: "new", source: added[0]! };
+}
+
+async function offerLogins(ctx: SetupContext, ids: readonly string[]): Promise<void> {
+	for (const id of ids) if (await ctx.ui.confirm({ message: `Log in to ${id} now?`, initial: true })) await login(ctx, id);
 }
 
 async function installPackage(ctx: SetupContext): Promise<void> {
@@ -155,74 +196,98 @@ async function installPackage(ctx: SetupContext): Promise<void> {
 	}
 
 	const host = await ctx.host();
-	const providersBefore = new Set(host.models.getProviders().map((p) => p.id));
-	const sourcesBefore = new Set(host.packages.listConfiguredPackages().map((p) => p.source));
+	// Providers registered by extensions (not the built-ins), so a package that extends an existing id counts too.
+	const registeredBefore = new Set(host.models.getRegisteredProviderIds());
+	const sourcesBefore = userSources(host);
 	const diagnosticsBefore = new Set(host.diagnostics.map((d) => d.message));
-	const spin = ui.spinner();
-	spin.start(`Installing ${source}`);
+	// A plain line, not a spinner: pi runs npm/git with the terminal inherited, which would garble an animation.
+	ui.log.info(`Installing ${source}…`);
 	try {
 		await host.packages.installAndPersist(source); // throws before it records the source
 	} catch (e) {
-		spin.stop("install failed");
 		ui.log.error(lastLines(errorMessage(e), 20));
 		return;
 	}
-	spin.stop(`installed ${source}`);
+	// On disk and in settings.json from here on: a cancel at a later prompt still leaves the restart offer.
+	const restartBefore = ctx.needsRestart;
+	ctx.needsRestart = true;
 
 	const next = await ctx.reloadHost();
-	const pkg = next.packages.listConfiguredPackages().find((p) => p.scope === "user" && !sourcesBefore.has(p.source));
-	if (!pkg) {
+	const change = packageChange(sourcesBefore, userSources(next));
+	const registered = next.models.getRegisteredProviderIds();
+	const fresh = registered.filter((id) => !registeredBefore.has(id));
+	if (change.kind === "unchanged") {
 		ui.log.info(`${source} was already installed`);
 		return;
 	}
-	const added = next.models.getProviders().map((p) => p.id).filter((id) => !providersBefore.has(id));
-	if (added.length) {
-		const record = readPackageProviders(next.agentDir);
-		record[pkg.source] = added;
+	const record = readPackageProviders(next.agentDir);
+
+	if (change.kind === "replaced") {
+		// The same package at another version or ref: its record moves to the new source. It keeps the providers the
+		// new version still registers, plus any it newly adds. Never offer removal here: the guard below would be skipped.
+		const old = record[change.old];
+		delete record[change.old];
+		if (old) record[change.source] = [...old.filter((id) => registered.includes(id)), ...fresh.filter((id) => !old.includes(id))];
 		writePackageProviders(next.agentDir, record);
-		ctx.needsRestart = true;
-		ui.log.success(`${source} added ${added.length === 1 ? "provider" : "providers"} ${added.join(", ")}`);
-		for (const id of added) if (await ui.confirm({ message: `Log in to ${id} now?`, initial: true })) await login(ctx, id);
+		ui.log.success(`replaced ${change.old} with ${change.source}`);
+		const dropped = old?.filter((id) => !registered.includes(id)) ?? [];
+		if (dropped.length) ui.log.warn(`${change.source} no longer supplies ${dropped.join(", ")}`);
+		await offerLogins(ctx, fresh);
+		return;
+	}
+
+	if (fresh.length) {
+		record[change.source] = fresh;
+		writePackageProviders(next.agentDir, record);
+		ui.log.success(`${source} added ${fresh.length === 1 ? "provider" : "providers"} ${fresh.join(", ")}`);
+		await offerLogins(ctx, fresh);
 		return;
 	}
 
 	ui.log.warn(`${source} registered no providers`);
 	for (const d of next.diagnostics) if (!diagnosticsBefore.has(d.message)) ui.log.warn(d.message);
-	if ((await ui.confirm({ message: "Remove the package?", initial: true })) && (await removeSource(ctx, pkg.source))) return;
+	if (await ui.confirm({ message: "Remove the package?", initial: true })) {
+		const removed = await removeSource(ctx, change.source);
+		if (removed === "removed") ctx.needsRestart = restartBefore; // settings.json is as before
+		if (removed !== "failed") return;
+	}
 	// kept (or the removal failed): it loads at the next start
-	const record = readPackageProviders(next.agentDir);
-	record[pkg.source] = [];
+	record[change.source] = [];
 	writePackageProviders(next.agentDir, record);
-	ctx.needsRestart = true;
 }
 
-/** `removeAndPersist`, then drops the package's record and reloads the host. False when the removal failed. */
-async function removeSource(ctx: SetupContext, source: string): Promise<boolean> {
+/**
+ * `removeAndPersist`, then drops the package's record and reloads the host. `unmatched`: pi found no settings.json
+ * entry for the source, so nothing was removed from the configuration.
+ */
+async function removeSource(ctx: SetupContext, source: string): Promise<"removed" | "unmatched" | "failed"> {
 	const { ui } = ctx;
 	const host = await ctx.host();
-	const spin = ui.spinner();
-	spin.start(`Removing ${source}`);
+	ui.log.info(`Removing ${source}…`);
+	let matched: boolean;
 	try {
-		await host.packages.removeAndPersist(source);
+		matched = await host.packages.removeAndPersist(source);
 	} catch (e) {
-		spin.stop("remove failed");
 		ui.log.error(lastLines(errorMessage(e), 20));
-		return false;
+		return "failed";
 	}
-	spin.stop("removed");
 	const record = readPackageProviders(host.agentDir);
 	delete record[source];
 	writePackageProviders(host.agentDir, record);
 	await ctx.reloadHost();
+	if (!matched) {
+		ui.log.warn(`nothing in settings.json matched ${source}; nothing was removed`);
+		return "unmatched";
+	}
 	ui.log.success(`removed ${source}`);
-	return true;
+	return "removed";
 }
 
 /** Remove a provider package: refused while a role uses a provider it added. */
 async function removePackage(ctx: SetupContext): Promise<void> {
 	const { ui } = ctx;
 	const host = await ctx.host();
-	const pkgs = host.packages.listConfiguredPackages().filter((p) => p.scope === "user");
+	const pkgs = userSources(host);
 	if (!pkgs.length) {
 		ui.log.info("no provider packages installed");
 		return;
@@ -230,17 +295,24 @@ async function removePackage(ctx: SetupContext): Promise<void> {
 	const record = readPackageProviders(host.agentDir);
 	const source = await ui.select({
 		message: "Remove which package?",
-		options: pkgs.map((p) => ({ value: p.source, label: p.source, hint: record[p.source]?.join(", ") || undefined })),
+		options: pkgs.map((s) => ({ value: s, label: s, hint: record[s] ? record[s].join(", ") || "no providers" : "providers unknown" })),
 	});
-	const inUse = providersInUse(await ctx.settings());
-	for (const id of record[source] ?? []) {
-		const paths = inUse.get(id);
-		if (paths?.length) {
-			ui.log.error(inUseMessage(id, paths));
+	const supplied = record[source];
+	if (!supplied) {
+		// installed outside setup: which providers it supplies is unknown, so the in-use guard can't run
+		if (!(await ui.confirm({ message: `setup can't tell which providers ${source} supplies; remove it anyway?`, initial: false }))) return;
+	} else {
+		const inUse = providersInUse(await ctx.settings());
+		const blocked = supplied.flatMap((id) => {
+			const paths = inUse.get(id);
+			return paths?.length ? [inUseMessage(id, paths)] : [];
+		});
+		if (blocked.length) {
+			for (const m of blocked) ui.log.error(m);
 			return;
 		}
 	}
-	if (await removeSource(ctx, source)) ctx.needsRestart = true;
+	if ((await removeSource(ctx, source)) === "removed") ctx.needsRestart = true;
 }
 
 // ---------------------------------------------------------------- the step
@@ -256,6 +328,16 @@ async function status(ctx: SetupContext): Promise<StepStatus> {
 	}
 	if (missing.length) return { state: "missing", detail: `no credentials for ${missing.join(", ")}` };
 	return { state: "ok", detail: ok.join(", ") };
+}
+
+/** Runs an endpoint action; a models.json setup can't rewrite is reported and the menu comes back. */
+async function editingModelsJson(ctx: SetupContext, action: (ctx: SetupContext) => Promise<void>): Promise<void> {
+	try {
+		await action(ctx);
+	} catch (e) {
+		if (!(e instanceof ModelsJsonError)) throw e;
+		ctx.ui.log.error(e.message);
+	}
 }
 
 async function run(ctx: SetupContext): Promise<void> {
@@ -275,10 +357,10 @@ async function run(ctx: SetupContext): Promise<void> {
 				await removePackage(ctx);
 				break;
 			case "add-endpoint":
-				await addEndpoint(ctx);
+				await editingModelsJson(ctx, addEndpoint);
 				break;
 			case "remove-endpoint":
-				await removeEndpoint(ctx);
+				await editingModelsJson(ctx, removeEndpoint);
 				break;
 			case "done":
 				return;
