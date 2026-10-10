@@ -146,7 +146,8 @@ All of these live under `sandbox`.
 `factory setup github` sets the identity and `github.visibility`:
 - For `pat` or `bot`, the token is pasted or imported from `gh auth token` and stored as `store:github`, or
   `env:GH_TOKEN` is kept when it is set. Setup checks it with `GET /user` and shows the login. For a classic token it
-  warns when the `repo` or `workflow` scope is missing; for a fine-grained token it lists the permissions below.
+  warns when the `repo` or `workflow` scope is missing, and saves it anyway; for a fine-grained token it lists the
+  permissions below.
 - For `app`, it asks for the App id, the installation id and the private key's PEM file. The PEM's contents are stored
   as `store:github-app-key`, and setup checks them by minting an installation token.
 
@@ -172,9 +173,9 @@ Any other value, such as a literal token, is rejected.
 The secret store is a JSON file, `{ "version": 1, "secrets": { "<key>": "<value>" } }`. Keys match `[a-z0-9-]+`.
 - The file is mode 0600 and its directory 0700. Each write goes to a temp file that is then renamed over it.
 - It is read on every use, so a key that `factory setup` stores applies to a running factory without a restart.
-- A file that is readable by group or others is refused, by `serve`, `doctor` and `setup` alike:
-  `secrets.json has mode 0644; run chmod 600 <path>`. A file that doesn't parse is an error naming it, and setup
-  never overwrites it.
+- A file that is readable by group or others is an error: `secrets.json has mode 0644; run chmod 600 <path>`.
+  `factory setup` refuses to start; `serve` and `doctor` fail where they resolve a `store:` ref (`doctor` as a `FAIL`
+  line). A file that doesn't parse is an error naming it, in the same places, and setup never overwrites it.
 - An unknown key resolves to nothing, as an unset env var does.
 
 | Key | Holds | Written by | Ref |
@@ -189,8 +190,8 @@ Model credentials are not in the secret store; they are in `pi/auth.json` (see [
 ### Web search
 
 `factory setup search` stores a pasted Parallel key as `store:parallel` and sets `webSearch.apiKey` to it, or keeps
-`env:PARALLEL_API_KEY` when that is set. It then offers one test search (billed). Skipping leaves web search
-unconfigured.
+`env:PARALLEL_API_KEY` when that is set. It then offers one test search (billed). Skip leaves the existing
+`webSearch.apiKey` and stored key unchanged.
 
 Without a key, `web_search` returns an error that tells the agent to carry on without searching; nothing else
 breaks. The tool runs in the factory process, so the key never reaches the sandbox and `api.parallel.ai` needs no
@@ -224,24 +225,35 @@ and at startup if it is left over from a crash.
 
 `factory setup [section] [--config p]` is an interactive terminal wizard; it needs a TTY and has no non-interactive
 mode. With no section it shows each section's status, runs the sections in the order below (asking
-`Reconfigure <section>?`, default No, for those already set up), runs `doctor`'s checks and prints the web UI's link
-or `next: factory serve`. `factory setup <section>` runs one section unconditionally.
+`Reconfigure <title>?`, e.g. `Reconfigure GitHub?`, default No, for those already set up), runs `doctor`'s checks and
+prints the web UI's link or `next: factory serve`. `factory setup <section>` runs one section unconditionally, then
+offers the restart below if it changed packages or `models.json`.
 
 | Section | What it does | Writes |
 |---|---|---|
-| `prereqs` | Checks Node ≥ 22, `git`, `gh` and the sandbox runtime (bubblewrap and socat on Linux, `sandbox-exec` on macOS). Prints the install command for the package manager it finds (`apt`, `dnf`, `pacman`, `brew`); it never runs it and never uses sudo. If the sandbox runtime is still missing, offers to disable the sandbox (default No). | `sandbox.enabled: false`, if you accept |
+| `prereqs` | Checks Node ≥ 22, `git`, `gh` and the sandbox runtime (ripgrep on both; bubblewrap and socat on Linux, `sandbox-exec` on macOS). Prints the install command for the package manager it finds (`apt`, `dnf`, `pacman`, `brew`); it never runs it and never uses sudo. If the sandbox runtime is still missing, offers to disable the sandbox (default No). | `sandbox.enabled: false`, if you accept |
 | `github` | The GitHub identity and repo visibility (see [GitHub identity](#github-identity)) | `github.identity`, `github.visibility`; `store:github` or `store:github-app-key` |
-| `models` | Logs in to providers and out of them, installs and removes provider packages, adds and removes compatible endpoints (see [Model providers](#model-providers)) | `pi/auth.json`, `pi/settings.json`, `pi/models.json` |
+| `models` | Logs in to providers and out of them, installs and removes provider packages, adds and removes compatible endpoints (see [Model providers](#model-providers)) | `pi/auth.json`, `pi/settings.json`, `pi/models.json`, `pi/factory-packages.json` (which providers each package added) |
 | `roles` | Picks each role's model from the models that have credentials (`qa`: only models that accept images; `helper`: `Same as builder` unsets it), and its thinking level. Warns when the reviewer uses the builder's provider. | `roles.*` |
 | `qa` | The boat.dev key, or AQ testing off (see [AQ testing](#aq-testing)) | `boat.apiKey`, `qa.enabled`; `store:boat` |
 | `search` | The Parallel key (see [Web search](#web-search)) | `webSearch.apiKey`; `store:parallel` |
 | `service` | Installs, reinstalls or removes a user service that runs the factory (see [Running as a service](#running-as-a-service)) | the unit or plist |
 
-- Settings are written globally, through the same validate-on-save as the web UI. A rejected value is shown and asked
-  again; the file is left unchanged.
-- When a check fails (an HTTP error, a missing scope, a failed login or test call), setup offers **Retry** (the
-  default), **Save anyway** or **Skip**. Skip leaves the config and secrets unchanged.
-- Each section saves when it finishes. Ctrl-C prints `setup cancelled; completed sections were saved` and exits 130.
+Settings are written globally, through the same validate-on-save as the web UI; a rejected value leaves the file
+unchanged. When something fails, each section does this (the first option is the default):
+
+| Section | A check fails | The config rejects a value |
+|---|---|---|
+| `prereqs` | Missing tools: **Check again** / **Continue** | The error is shown; not asked again |
+| `github` | `gh` missing: **Retry** / **Skip**. `GET /user` or the App token fails: **Retry** / **Save anyway** / **Skip** (Skip writes nothing). A classic token without `repo` or `workflow` only warns, and is saved. | The error ends setup (exit 1); not asked again |
+| `models` | A login, or storing an endpoint's key: **Retry** / **Skip**. The endpoint test call: **Retry** / **Save anyway** / **Skip** (Skip removes the endpoint). A failed package install shows the last 20 lines of output and adds nothing. | n/a (writes only `pi/` files) |
+| `roles` | n/a | **Retry** (asks again for the roles the error names) / **Skip** |
+| `qa` | The boat check: **Retry** / **Save anyway** / **Skip** (Skip writes nothing) | The error is shown; not asked again |
+| `search` | The test search: **Retry** / **Save anyway** / **Skip** (Skip writes nothing). Declining the test search saves without one. | The error is shown; not asked again |
+| `service` | `systemctl`/`launchctl` fails: its output and the command to run by hand; the file stays | n/a |
+
+- Each section saves when it finishes. Ctrl-C, at a prompt or while a spinner runs, prints
+  `setup cancelled; completed sections were saved` and exits 130.
 - Setup works whether or not the factory is running.
 
 ## Model providers
@@ -292,17 +304,19 @@ validation as any unknown model does.
 - the provider id (`[a-z0-9-]+`, not a built-in or package provider's id), and a name;
 - the API: `openai-completions`, `openai-responses` or `anthropic-messages`;
 - the base URL;
-- the auth: an API key, stored in `auth.json` (`type: api_key`), or none;
+- the auth: an API key, stored in `auth.json` (`type: api_key`) and never in `models.json`, or none (written as the
+  placeholder `apiKey: "none"`, which pi needs to count the provider as configured);
 - the models. For the `openai-*` APIs setup first tries `GET <baseUrl>/models` and offers the ids it finds; ids can
   also be entered by hand. Each model gets `contextWindow` (default 128000), `maxTokens` (default 16384), image input
   (`qa` needs it) and `reasoning`; cost is written as zero.
 
-Setup can then make one test call ("Reply with OK") to the first model. It writes the provider to `models.json` and
-keeps the other entries. **Remove a compatible endpoint** is refused while a role setting uses it.
+Setup writes the provider to `models.json`, keeping the other entries, stores the key, then offers one test call
+("Reply with OK") to the first model. Skipping after a failed key save or test call removes the endpoint again.
+**Remove a compatible endpoint** is refused while a role setting uses it.
 
 **Restarts.** Credentials apply live, but new or removed packages and `models.json` changes are loaded only when the
 factory starts. When a section changed them and the factory is running, setup offers to restart it: the service if it
-is installed, else `factory stop` and `factory serve`.
+runs as one, else `factory stop` and `factory serve`.
 
 `factory doctor` names each role's credential source: `env:…`, `auth.json (api key)` or `auth.json (OAuth)`.
 
@@ -319,7 +333,7 @@ credentials are written into the service file; they stay in `secrets.json` and `
 | Install | `systemctl --user daemon-reload`, then `systemctl --user enable --now software-factory` | `launchctl bootstrap gui/<uid> <plist>` |
 | Restart on failure | `Restart=on-failure` | `KeepAlive: { SuccessfulExit: false }` |
 | Log | the journal (`journalctl --user -u software-factory`) | `<factory home>/factory.log` |
-| Remove | `systemctl --user disable --now software-factory`, then the file is deleted | `launchctl bootout gui/<uid>/dev.software-factory`, then the file is deleted |
+| Remove | `systemctl --user disable --now software-factory`, then the file is deleted and `systemctl --user daemon-reload` runs | `launchctl bootout gui/<uid>/dev.software-factory` (if loaded), then the file is deleted |
 
 The systemd unit:
 

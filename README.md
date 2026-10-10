@@ -66,7 +66,8 @@ code differs from them is listed in [`DEVIATIONS.md`](DEVIATIONS.md).
 and `OPENAI_API_KEY` for the default roles.
 
 `bin/factory doctor` checks the config file, the model credentials, the sandbox, the GitHub identity and `gh`. Each
-line names where a credential comes from, and each problem ends with the `factory setup <section>` that fixes it.
+credential line names where the credential comes from, and a credential or prerequisite problem ends with the
+`factory setup <section>` that fixes it.
 
 ## Install
 
@@ -95,10 +96,12 @@ bin/factory setup        # credentials, providers, role models, and optionally a
 bin/factory serve        # starts the factory in the background and prints the web UI's link
 ```
 
-If setup installed the service, the factory is already running and setup prints the link instead; skip
-`bin/factory serve`. Open the link. **Create** a ticket with a project name, its repo (`owner/name`; created at the
-first delivery if it doesn't exist) and the request, then answer the architect's questions and the approvals in the
-run view.
+If setup installed the service, the service runs the factory: skip `bin/factory serve`. Setup's last line shows the
+link only if the web UI was already listening when setup finished (otherwise it says `next: factory serve`, which you
+can ignore); `bin/factory web` prints the link once the service is up.
+
+Open the link. **Create** a ticket with a project name, its repo (`owner/name`; created at the first delivery if it
+doesn't exist) and the request, then answer the architect's questions and the approvals in the run view.
 
 ## Commands
 
@@ -124,12 +127,13 @@ factory setup [section] [--config p]
 - **`doctor`** checks the setup and prints one `ok`/`warn`/`FAIL` line per check.
 - **`setup`** is the interactive setup wizard. It needs a terminal: without one (stdin or stdout not a TTY) it exits 1
   with `factory setup is interactive; run it in a terminal`. There is no non-interactive mode.
-  - With no section, it shows a status line per section, runs the sections in order (asking `Reconfigure <section>?`
-    for those already set up), runs `doctor`'s checks, and ends with the web UI's link or `next: factory serve`.
+  - With no section, it shows a status line per section, runs the sections in order (asking `Reconfigure <title>?`,
+    e.g. `Reconfigure GitHub?`, for those already set up), runs `doctor`'s checks, and ends with the web UI's link or
+    `next: factory serve`.
   - With a section, it runs only that one: `prereqs`, `github`, `models`, `roles`, `qa`, `search` or `service`. An
     unknown section exits 1 and lists them.
-  - Each section saves when it finishes. Ctrl-C prints `setup cancelled; completed sections were saved` and exits
-    130.
+  - Each section saves when it finishes. Ctrl-C, at a prompt or while a spinner runs, prints
+    `setup cancelled; completed sections were saved` and exits 130.
   - It works whether or not the factory is running. See [configuration](docs/configuration.md#setup) for what each
     section does.
 

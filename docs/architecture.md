@@ -90,9 +90,11 @@ Both live in the factory home, the config file's directory (`~/.factory` by defa
 - It is `<factory home>/secrets.json`, `{ "version": 1, "secrets": { "<key>": "<value>" } }`: the file 0600, its
   directory 0700, each write to a temp file then renamed. `get` re-reads the file, so the daemon sees new values
   without a restart, and refuses a file readable by group or others.
-- `resolveSecret(ref, store?)` in `src/core/settings.ts` resolves `env:`, `file:` and `store:` refs. Each process
-  entry point (`main.ts`, `doctor`, `setup`) sets the default store with `setDefaultSecretStore`, so `GhApiHost`,
-  `Boat` and `web_search` resolve `store:` refs without being handed a store.
+- `resolveSecret(ref, store?)` in `src/core/settings.ts` resolves `env:`, `file:` and `store:` refs, through the
+  store it is given or else the process default. `main.ts` (`serve`) and `createSetupContext` (`setup`) set the
+  default with `setDefaultSecretStore`, so `GhApiHost`, `Boat` and `web_search` resolve `store:` refs without being
+  handed a store. `doctor` (`src/doctor.ts`) sets no default: it builds its own `SecretStore` and passes it to
+  `resolveSecret` and `Boat.limits`.
 - The sandbox always denies the factory home, so neither `secrets.json` nor `pi/` (with `auth.json`) is readable by
   an agent, wherever `--config` points.
 
@@ -111,17 +113,18 @@ cli.ts setup ──► runSetup (wizard.ts) ──► steps/: prereqs · github 
 - **`cli.ts`** refuses unknown options, an unknown section and a missing TTY, then calls
   `runSetup(createSetupContext({ configPath, ui: new ClackUi() }), section)` and exits with its code (0, 1 or 130).
 - **`wizard.ts`** (`runSetup`) refuses a legacy config or a bad `secrets.json` before any prompt. With no section it
-  shows the status summary, runs every step (asking `Reconfigure <section>?` for one that is `ok`), offers a restart
-  after a step that changed packages or `models.json` (`ctx.needsRestart`) while the factory runs, runs the doctor
-  checks and prints the outro. With a section it runs that step alone. `SetupCancelled` anywhere ends it with exit
-  130; what earlier steps saved stays saved.
+  shows the status summary, runs every step (asking `Reconfigure <title>?`, the step's title, for one that is `ok`),
+  offers a restart after a step that changed packages or `models.json` (`ctx.needsRestart`) while the factory runs,
+  runs the doctor checks and prints the outro. With a section it runs that step alone, then makes the same restart
+  offer. `SetupCancelled` from a prompt ends it with exit 130; Ctrl-C while a spinner runs is handled in `ClackUi`,
+  which prints the same message and exits 130 itself. What earlier steps saved stays saved.
 - **`steps/`** has one module per section, each exporting a `Step` (`name`, `title`, `status`, `run`); `index.ts`
   lists them in order. A step writes settings through `ctx.settings()`, the factory's own `ConfigStore` over the
   current host's models, so the web UI's validate-on-save applies. Secrets go through `ctx.secrets`, and model
   credentials and packages through `ctx.host()` (`reloadHost()` after a change).
 - **`context.ts`** builds the context. `createSetupContext` is the CLI's (the real store, host, commands and daemon);
-  tests build one from stubs with `buildSetupContext` (`test/setup-context.ts`), so no test touches the real home,
-  the network, `gh`, `systemctl` or `launchctl`.
+  tests build one from stubs with `testContext` (`test/setup-context.ts`, over `buildSetupContext`), so no test
+  touches the real home, the network, `gh`, `systemctl` or `launchctl`.
 - **`ui.ts`:** steps depend only on the `SetupUi` interface. `ClackUi` implements it with `@clack/prompts` and turns a
   cancel into `SetupCancelled`. `authInteraction(ui)` adapts it to pi-ai's login protocol (prompts, auth URLs, device
   codes, progress). Tests use `ScriptedUi` (`test/setup-helpers.ts`), which pops queued answers and records what is
