@@ -202,7 +202,7 @@ class SetupCancelled extends Error {}
 interface SetupContext {
   configPath: string; factoryHome: string;
   ui: SetupUi;
-  settings: FactoryConfig;            // the existing validated settings API (read effective/raw, set/unset global)
+  settings: ConfigStore;              // the existing validated settings API (effective/raw, set/unset with validate-on-save)
   host: () => Promise<ModelHost>;     // lazy; rebuilt after packages/models.json change
   secrets: SecretStore;
   run: (cmd: string, args: string[], opts?: { input?: string }) => Promise<{ code: number; stdout: string; stderr: string }>;
@@ -302,7 +302,8 @@ restart it (the service if installed, else `factory stop` and `factory serve`).
 
 For each role, show a `select` of `getAvailable()` models (those whose provider has credentials). The current value is
 the default; if the current model is unavailable, it is shown first, marked `(no credentials)`.
-- **`helper`:** the first option is `Same as builder`, which unsets `roles.helper.model`.
+- **`helper`:** the first option is `Same as builder`, which unsets `roles.helper.model` and `roles.helper.thinking`
+  (and skips the thinking prompt).
 - **`qa`:** only models whose `input` includes `image`.
 - **thinking:** a `select` of `off`, `low`, `medium` and `high`, with the current value as the default.
 - **Family warning:** if the reviewer's provider is the builder's provider, warn `The reviewer is meant to be a
@@ -337,7 +338,7 @@ Choose one:
   Description=software factory
   After=network-online.target
   [Service]
-  ExecStart=<process.execPath> <repo>/node_modules/tsx/dist/cli.mjs <repo>/src/cli.ts serve --foreground --config <abs config>
+  ExecStart=<process.execPath> --import <repo>/node_modules/tsx/dist/esm/index.mjs --no-warnings <repo>/src/cli.ts serve --foreground --config <abs config>
   Environment=PATH=<PATH at setup time>
   Restart=on-failure
   [Install]
