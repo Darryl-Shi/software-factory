@@ -3,7 +3,9 @@
 export type RunId = string;
 export type AskId = string;
 export type RepoRef = string; // "owner/name"
-export type Role = "architect" | "builder" | "helper" | "reviewer";
+export type Role = "architect" | "builder" | "helper" | "reviewer" | "qa";
+/** Whether AQ testing ran in a review round (§2 "QA status"). */
+export type QaStatus = "ran" | "off" | "skipped" | "unavailable";
 export type Gate = "spec" | "delivery" | "merge";
 export type Unsubscribe = () => void;
 
@@ -55,7 +57,9 @@ export interface Finding {
 	specRef?: string;
 	description: string;
 	evidence?: string;
-	source?: "reviewer" | "human" | "ci";
+	/** Ids of screenshots the QA agent took in its VM (§3.7); every QA finding cites at least one. */
+	screenshots?: string[];
+	source?: "reviewer" | "qa" | "human" | "ci";
 }
 export type HumanFinding = { severity: string; description: string; specRef?: string; evidence?: string };
 
@@ -106,6 +110,8 @@ export interface Notice {
 	advisory?: Finding[];
 	acceptedBlocking?: Finding[];
 	noCi?: boolean;
+	/** The final round's QA status (on the final notice). */
+	qaStatus?: QaStatus;
 	final?: boolean;
 }
 
@@ -135,6 +141,8 @@ export interface DeliveryContext {
 	advisory: Finding[];
 	acceptedBlocking: Finding[];
 	mode: "push-main" | "pull-request";
+	/** The final review round's QA status; QA findings' screenshots stay in the factory's run view. */
+	qaStatus?: QaStatus;
 }
 
 // ---------------------------------------------------------------- projects, runs, events (§3.5, §3.6)
@@ -161,6 +169,8 @@ export interface CostRecord {
 	durationMs: number;
 	/** Set on usage from turns your messages started while the role was idle (see `message`). */
 	trigger?: "message";
+	/** QA: the boat.dev VM's machine time for the round (a record of its own, with boat's dollars in `usd`). */
+	vmSeconds?: number;
 }
 
 export interface PendingAsk {
@@ -201,7 +211,11 @@ export interface RunView {
 	caps: { review: number; ciFix: number };
 	pendingAsk?: PendingAsk;
 	artifacts: { spec?: ArtifactRef & { text: string }; delivery?: Delivery };
-	conversations: { architect?: string; builder?: string; reviewers: { id: string; seq: number }[]; active?: string };
+	conversations: { architect?: string; builder?: string; reviewers: { id: string; seq: number }[]; qa: { id: string; seq: number }[]; active?: string };
+	/** One entry per review (review #seq): the round it belongs to and whether AQ testing ran in it. */
+	reviews: ReviewRoundView[];
+	/** QA status of the latest review round (undefined before the first review). */
+	qaStatus?: QaStatus;
 	cost: CostRecord[];
 	configHash: string;
 	piVersion: string;
@@ -219,6 +233,19 @@ export interface RunView {
 	updatedAt: number;
 }
 
+export interface ReviewRoundView {
+	seq: number;
+	round: number;
+	qaStatus?: QaStatus;
+	reviewer?: string;
+	qa?: string;
+	/** The QA VM (boat.dev sandbox) of this review, if one was provisioned. */
+	vm?: { id: string; name: string; attempt: number; state: "provisioning" | "ready" | "disposed" };
+	/** Screenshot ids the QA agent took in this review. */
+	screenshots: string[];
+	submitted: { review: boolean; qa: boolean };
+}
+
 export interface EscalationInfo {
 	reason: string;
 	from: RunState;
@@ -228,8 +255,10 @@ export interface EscalationInfo {
 
 export interface FindingsLogEntry {
 	seq: number;
-	kind: "review" | "human" | "ci";
+	kind: "review" | "qa" | "human" | "ci";
 	round: number;
+	/** For review and qa entries: the review (#seq) they came from. */
+	reviewSeq?: number;
 	findings: Finding[];
 	responses?: FindingResponse[];
 	reviewerConversation?: string;
@@ -286,6 +315,8 @@ export interface FactoryCore {
 	resolveEscalation(run: RunId, ask: AskId, choice: { accept: true } | { moreRounds: number } | { abort: true }): Promise<void>;
 	/** Send a message to the agent the run is with. It never moves the run; see `messageTarget` for who receives it. */
 	message(run: RunId, text: string): Promise<{ message: string; to: Role; conversationId?: string }>;
+	/** A QA screenshot (§3.7), kept by the core as a run artifact. Over HTTP: GET /api/runs/<run>/screenshots/<id>. */
+	getScreenshot(run: RunId, id: string): Promise<{ mime: string; bytes: Uint8Array }>;
 	settingsSchema(): Record<string, SettingField>;
 	getSettings(scope: Scope): Promise<EffectiveSettings>;
 	setSetting(scope: Scope, path: string, value: unknown): Promise<void>;
@@ -310,6 +341,7 @@ export const CORE_OPS = [
 	"submitHumanFindings",
 	"resolveEscalation",
 	"message",
+	"getScreenshot",
 	"settingsSchema",
 	"getSettings",
 	"setSetting",

@@ -28,12 +28,20 @@ function findingLines(title: string, fs: Finding[]): string[] {
 	return [
 		`## ${title}`,
 		"",
-		...fs.map((f) => `- **${f.severity}**${f.specRef ? ` (spec: ${f.specRef})` : ""}: ${f.description}${f.evidence ? `\n  <details><summary>evidence</summary>\n\n  \`\`\`\n  ${f.evidence.slice(0, 1500).replace(/\n/g, "\n  ")}\n  \`\`\`\n  </details>` : ""}`),
+		...fs.map((f) => `- **${f.severity}**${f.source && f.source !== "reviewer" ? ` [${f.source}]` : ""}${f.specRef ? ` (spec: ${f.specRef})` : ""}: ${f.description}${f.screenshots?.length ? ` (screenshots ${f.screenshots.join(", ")}: see the run view)` : ""}${f.evidence ? `\n  <details><summary>evidence</summary>\n\n  \`\`\`\n  ${f.evidence.slice(0, 1500).replace(/\n/g, "\n  ")}\n  \`\`\`\n  </details>` : ""}`),
 		"",
 	];
 }
 
-export function report(ctx: Pick<DeliveryContext, "request" | "advisory" | "acceptedBlocking" | "spec"> & { runId: string }, notes: string[] = []): string {
+const QA_STATUS_TEXT: Record<string, string> = {
+	ran: "ran: a QA agent used the product in a boat.dev VM in the final review round",
+	off: "off: AQ testing is turned off for this project (qa.enabled: false); the reviewer ran the product and its tests locally",
+	skipped: "skipped: the product has nothing to launch (no run script), so no QA agent used it",
+	unavailable: "unavailable: boat.dev could not provide a VM, so no QA agent used the product in the final round",
+};
+
+export function report(ctx: Pick<DeliveryContext, "request" | "advisory" | "acceptedBlocking" | "spec" | "qaStatus"> & { runId: string }, notes: string[] = []): string {
+	const all = [...ctx.advisory, ...ctx.acceptedBlocking];
 	return [
 		`Delivered by the software factory (run \`${ctx.runId}\`).`,
 		"",
@@ -43,6 +51,8 @@ export function report(ctx: Pick<DeliveryContext, "request" | "advisory" | "acce
 		"",
 		...findingLines("Advisory findings (non-blocking)", ctx.advisory),
 		...findingLines("Open blocking findings accepted as is by a human", ctx.acceptedBlocking),
+		...(ctx.qaStatus ? [`**AQ testing (QA status):** ${QA_STATUS_TEXT[ctx.qaStatus] ?? ctx.qaStatus}.`, ""] : []),
+		...(all.some((f) => f.screenshots?.length) ? ["Screenshots cited by QA findings are in the factory's run view; they are not committed or uploaded.", ""] : []),
 		...notes.map((n) => `> ${n}`),
 	].join("\n");
 }
@@ -135,6 +145,35 @@ export class GitHub {
 			fingerprint: createHash("sha256").update(patch).digest("hex"),
 			empty: patch.length === 0,
 		};
+	}
+
+	/**
+	 * Record the working tree as it is now (committed or not, untracked files included) as a commit under
+	 * `refs/factory/<run branch>/<name>`, without touching HEAD, the index or the files. The reviewer's "changes since
+	 * the previous review" and the QA VM's copy of the reviewed build are taken from it. Returns the commit SHA.
+	 */
+	async snapshot(ws: Workspace, name: string): Promise<string> {
+		const index = join(ws.path, "..", `.${ws.branch.replace(/\//g, "_")}.snap-index`);
+		rmSync(index, { force: true });
+		const env = { GIT_INDEX_FILE: index };
+		await git(ws.path, ["add", "-A"], { env });
+		const tree = (await git(ws.path, ["write-tree"], { env })).stdout.trim();
+		rmSync(index, { force: true });
+		const ref = `refs/factory/${ws.branch.replace(/^factory\//, "")}/${name}`;
+		const existing = await git(ws.path, ["rev-parse", "--verify", "-q", ref], { allowFail: true });
+		if (existing.code === 0 && (await gitOut(ws.path, ["rev-parse", `${existing.stdout.trim()}^{tree}`])) === tree) return existing.stdout.trim();
+		const sha = (await git(ws.path, ["commit-tree", tree, "-p", "HEAD", "-m", `factory: ${name}`])).stdout.trim();
+		await git(ws.path, ["update-ref", ref, sha]);
+		return sha;
+	}
+
+	/** A git bundle of one snapshot (see `snapshot`), for a machine that has no access to the remote. */
+	async bundle(ws: Workspace, name: string, out: string): Promise<{ ref: string; sha: string }> {
+		const sha = await this.snapshot(ws, name);
+		const ref = `refs/factory/${ws.branch.replace(/^factory\//, "")}/${name}`;
+		mkdirSync(dirname(out), { recursive: true });
+		await git(ws.path, ["bundle", "create", out, ref]);
+		return { ref, sha };
 	}
 
 	/** Deviation (DEVIATIONS.md): commit a core artifact (docs/spec.md) into the workspace. Idempotent. */

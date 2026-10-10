@@ -6,12 +6,25 @@ const nonEmpty = (v: unknown): v is string => typeof v === "string" && v.trim().
 /**
  * A reviewer submission is valid iff:
  * - verdict is "pass" or "fail";
- * - the verdict is "fail" if and only if at least one finding is blocking;
- * - every finding has a severity, a blocking flag, a description and a specRef;
- * - every reviewer finding carries evidence it observed (a command and its output, or a screenshot);
- * - reviewers cannot submit findings as `human` (or `ci`).
+ * - the verdict is "fail" if and only if at least one finding is blocking (with or without a specRef: code-quality and
+ *   security findings often rest on no spec clause);
+ * - every finding has a severity, a blocking flag and a description;
+ * - every reviewer finding carries evidence it observed (a command and its output, or the code it points to: file and lines);
+ * - reviewers cannot submit findings as `qa`, `human` or `ci`.
  */
 export function validateReview(input: unknown): { ok: true; review: ReviewResult } | { ok: false; problems: string[] } {
+	return validateSubmission(input, "reviewer");
+}
+
+/**
+ * A QA submission (AQ testing, §3.4) follows the reviewer's rules, plus: every finding cites at least one screenshot, and
+ * every cited screenshot is one this QA agent took this round (`taken`). Its findings' source is "qa".
+ */
+export function validateQa(input: unknown, taken: readonly string[]): { ok: true; review: ReviewResult } | { ok: false; problems: string[] } {
+	return validateSubmission(input, "qa", taken);
+}
+
+function validateSubmission(input: unknown, who: "reviewer" | "qa", taken: readonly string[] = []): { ok: true; review: ReviewResult } | { ok: false; problems: string[] } {
 	const problems: string[] = [];
 	if (typeof input !== "object" || input === null) return { ok: false, problems: ["submission must be an object"] };
 	const { verdict, findings } = input as { verdict?: unknown; findings?: unknown };
@@ -25,21 +38,32 @@ export function validateReview(input: unknown): { ok: true; review: ReviewResult
 			problems.push(`${at}: must be an object`);
 			return;
 		}
-		const source = f.source ?? "reviewer";
-		if (source !== "reviewer") problems.push(`${at}: reviewers may only submit findings with source "reviewer"`);
+		const source = f.source ?? who;
+		if (source !== who) problems.push(`${at}: ${who === "qa" ? "the QA agent" : "reviewers"} may only submit findings with source "${who}"`);
 		if (!nonEmpty(f.severity)) problems.push(`${at}: severity is required`);
 		if (typeof f.blocking !== "boolean") problems.push(`${at}: blocking must be true or false`);
 		if (!nonEmpty(f.description)) problems.push(`${at}: description is required`);
-		if (!nonEmpty(f.specRef)) problems.push(`${at}: specRef (the spec clause the finding rests on) is required`);
+		if (f.specRef !== undefined && f.specRef !== null && typeof f.specRef !== "string") problems.push(`${at}: specRef must be text`);
 		if (!nonEmpty(f.evidence))
-			problems.push(`${at}: evidence is required: the command you ran and its output, or a screenshot, that you observed yourself`);
+			problems.push(
+				who === "qa"
+					? `${at}: evidence is required: the UI steps you took and what you saw`
+					: `${at}: evidence is required: the command you ran and its output, or the code you point to (file and lines), observed yourself`,
+			);
+		let shots: string[] | undefined;
+		if (who === "qa") {
+			shots = Array.isArray(f.screenshots) ? f.screenshots.filter(nonEmpty) : [];
+			if (shots.length === 0) problems.push(`${at}: cite at least one screenshot you took (screenshots: [id])`);
+			for (const id of shots) if (!taken.includes(id)) problems.push(`${at}: screenshot ${id} is not one you took this round${taken.length ? ` (yours: ${taken.join(", ")})` : " (take one with the computer tool)"}`);
+		} else if (f.screenshots !== undefined && (!Array.isArray(f.screenshots) || f.screenshots.length > 0)) problems.push(`${at}: the reviewer takes no screenshots; cite a command and its output or file and lines`);
 		out.push({
 			severity: String(f.severity ?? ""),
 			blocking: f.blocking === true,
-			specRef: f.specRef,
+			...(nonEmpty(f.specRef) ? { specRef: f.specRef } : {}),
 			description: String(f.description ?? ""),
 			evidence: f.evidence,
-			source: "reviewer",
+			...(shots ? { screenshots: shots } : {}),
+			source: who,
 		});
 	});
 	const blocking = out.filter((f) => f.blocking).length;
@@ -100,5 +124,6 @@ export function formatFinding(f: Finding): string {
 		`  ${f.description.replace(/\n/g, "\n  ")}`,
 	];
 	if (f.evidence) lines.push(`  evidence:\n    ${f.evidence.slice(0, 4000).replace(/\n/g, "\n    ")}`);
+	if (f.screenshots?.length) lines.push(`  screenshots: ${f.screenshots.join(", ")}`);
 	return lines.join("\n");
 }

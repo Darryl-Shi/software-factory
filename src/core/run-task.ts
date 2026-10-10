@@ -12,14 +12,17 @@ import {
 	UsageDoc,
 } from "@earendil-works/pi-durable";
 import { createEditTool, createWriteTool } from "@earendil-works/pi-durable/tools";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { ROLE_TOOLS } from "../agents/tools.ts";
+import type { Boat } from "../boat/boat.ts";
 import type { GitHub } from "../github/github.ts";
 import type { Sandbox } from "../sandbox/sandbox.ts";
-import { BridgeDoc, type BridgeTool, bridgeToolsNotFor, EnvDoc } from "./bridge.ts";
-import { formatFinding, validateReview } from "./findings.ts";
+import { BridgeDoc, type BridgeTool, bridgeToolsNotFor, EnvDoc, ScreenshotsDoc } from "./bridge.ts";
+import { formatFinding, validateQa, validateReview } from "./findings.ts";
 import { messageContent } from "./messages.ts";
 import { RunConfigDoc } from "./run-config.ts";
-import { RunDoc, type RunDocState } from "./run-doc.ts";
+import { lastQaStatus, type ReviewRoundState, RunDoc, type RunDocState } from "./run-doc.ts";
 import { parseDuration } from "./settings.ts";
 import { addCost, sumUsage, type UsageSum } from "./usage.ts";
 import type {
@@ -31,6 +34,7 @@ import type {
 	Gate,
 	Notice,
 	PendingAsk,
+	QaStatus,
 	Question,
 	ReviewResult,
 	Role,
@@ -45,6 +49,12 @@ type RunInput = { runId: string; start: RunState };
 export interface CoreServices {
 	github: GitHub;
 	sandbox: Sandbox;
+	/** boat.dev VMs for AQ testing (§3.7). */
+	boat: Boat;
+	/** Where run artifacts (QA screenshots) live: <artifactsDir>/<runId>/screenshots/<id>.png. */
+	artifactsDir: string;
+	/** Whether a provider/modelId accepts image input (QA screenshots go to the builder as images only then). */
+	acceptsImages(model: string): boolean;
 	bridge: Extension;
 	/** Resolves when the run's document changes (answers, approvals); never rejects. */
 	changed(runId: string, ms: number): Promise<void>;
@@ -116,9 +126,16 @@ export function createRunTask(svc: CoreServices) {
 		return { runId: d.id, config: d.pinned.config };
 	}
 
-	async function createRoleConversation(rt: TaskRuntime<any, any, any, any>, tx: Tx, d: RunDocState, role: Role): Promise<string> {
+	async function createRoleConversation(
+		rt: TaskRuntime<any, any, any, any>,
+		tx: Tx,
+		d: RunDocState,
+		role: Role,
+		qa?: { envId: string; cwd?: string; seq: number },
+	): Promise<string> {
 		const roleCfg = d.pinned.config.roles?.[role] ?? {};
-		const env = d.envs[role] ?? d.envs.builder;
+		// The QA agent works in its boat.dev VM; every other role in the run's local sandbox.
+		const env = qa ? { envId: qa.envId, cwd: qa.cwd } : (d.envs[role] ?? d.envs.builder);
 		const conv = await tx.createConversation({ ownership: { kind: "task", taskId: rt.taskId } });
 		const [provider, ...rest] = String(roleCfg.model ?? "").split("/");
 		const extensions = [...ROLE_TOOLS[role], svc.bridge];
@@ -128,7 +145,7 @@ export function createRunTask(svc: CoreServices) {
 			thinkingLevel: (roleCfg.thinking ?? "medium") as any,
 			extensions,
 			tools: { remove },
-			...(env ? { cwd: env.cwd } : {}),
+			...(env?.cwd ? { cwd: env.cwd } : {}),
 		});
 		const b = await tx.doc(BridgeDoc, conv.id);
 		b.runId = d.id;
@@ -140,6 +157,7 @@ export function createRunTask(svc: CoreServices) {
 		const rc = await tx.doc(RunConfigDoc, conv.id);
 		rc.runId = d.id;
 		rc.webSearch = JSON.parse(JSON.stringify(d.pinned.config.webSearch ?? {}));
+		if (qa) rc.qa = { seq: qa.seq, artifactsDir: svc.artifactsDir };
 		return conv.id as unknown as string;
 	}
 
@@ -166,17 +184,21 @@ export function createRunTask(svc: CoreServices) {
 		role: Role,
 		conversationId: string,
 		key: string,
-		content: string,
+		content: string | ({ type: "text"; text: string } | { type: "image"; data: string; mimeType: string })[],
 		tools: BridgeTool[],
 		findingIds?: string[],
+		opts: { drive?: boolean } = {},
 	): Promise<AgentResult> {
 		if (d.counters.attempt) key = `${key}:retry${d.counters.attempt}`;
 		await rt.commit(async (tx) => {
 			const b = await tx.doc(BridgeDoc, conversationId as never);
 			if (b.expect?.key !== key) b.expect = { key, tools, ...(findingIds ? { findingIds } : {}) };
-			const r = await tx.doc(RunDoc, d.id, null as never);
-			r.conversations.active = conversationId;
-			r.driving = { conversationId, key };
+			// The QA agent runs beside the reviewer and takes no messages: it never becomes the run's active agent.
+			if (opts.drive !== false) {
+				const r = await tx.doc(RunDoc, d.id, null as never);
+				r.conversations.active = conversationId;
+				r.driving = { conversationId, key };
+			}
 			return undefined;
 		}, c);
 		const usageOf = async () => sumUsage((await rt.snapshot(UsageDoc, conversationId as never, c)) as any);
@@ -192,8 +214,8 @@ export function createRunTask(svc: CoreServices) {
 				attempt === 0
 					? content
 					: `You stopped without calling ${tools.join(" or ")}. The factory only continues when you call ${tools.join(" or ")}. Continue your work if needed, then call it.`;
-			const sub = await handle.submit({ type: "input", content: text, requestId }, c);
-			await deliverHeld(rt, c, d.id, role, conversationId, handle);
+			const sub = await handle.submit({ type: "input", content: text as any, requestId }, c);
+			if (opts.drive !== false) await deliverHeld(rt, c, d.id, role, conversationId, handle);
 			const settled = await sub.wait(c);
 			result = (await rt.snapshot(BridgeDoc, conversationId as never, c))?.results[key];
 			if (result === undefined && settled.status === "unanswered") {
@@ -215,6 +237,7 @@ export function createRunTask(svc: CoreServices) {
 			...(d.conversations.architect !== undefined ? [["architect", d.conversations.architect] as [Role, string]] : []),
 			...(d.conversations.builder !== undefined ? [["builder", d.conversations.builder] as [Role, string]] : []),
 			...d.conversations.reviewers.map((r) => ["reviewer", r.id] as [Role, string]),
+			...(d.conversations.qa ?? []).map((r) => ["qa", r.id] as [Role, string]),
 		];
 		const now = await Promise.all(convs.map(async ([, id]) => sumUsage((await rt.snapshot(UsageDoc, id as never, c)) as any)));
 		if (!convs.some(([, id], i) => now[i]!.totalTokens > (d.usage?.[String(id)]?.totalTokens ?? 0))) return;
@@ -298,13 +321,16 @@ export function createRunTask(svc: CoreServices) {
 			state === "DELIVERED"
 				? `Delivered${url ? `: ${url}` : ""}${d.artifacts.delivery?.kind === "pr" && !gates(d).includes("merge") ? " (PR left open, no auto-merge)" : ""}${d.noCi ? " — the repo has no CI checks; CI did not run" : ""}`
 				: `${state === "FAILED" ? "Failed" : "Cancelled"} in ${d.state}: ${reason ?? ""}`;
+		const qa = lastQaStatus(d);
+		const textQa = state === "DELIVERED" && qa ? `${text} · QA status: ${qa}` : text;
 		notice(d, {
 			level: state === "DELIVERED" ? "info" : state === "FAILED" ? "error" : "warn",
-			text,
+			text: textQa,
 			...(url ? { url } : {}),
 			advisory: d.advisory,
 			acceptedBlocking: d.acceptedBlocking,
 			...(d.noCi ? { noCi: true } : {}),
+			...(lastQaStatus(d) ? { qaStatus: lastQaStatus(d) } : {}),
 			final: true,
 		});
 		d.history.push({ from: d.state, to: state, at: svc.now(), round: d.counters.reviewRound });
@@ -355,14 +381,58 @@ export function createRunTask(svc: CoreServices) {
 		].join("\n");
 	}
 
-	function reviewerInput(d: RunDocState, diff: { stat: string; patch: string; files: { path: string; status: string }[] }): string {
-		const ws = d.workspace!;
-		const prior = d.findingsLog.filter((e) => e.kind === "review");
+	/** Builder input with the QA findings' screenshots as images, when the builder's model takes images. */
+	function builderContent(d: RunDocState): string | ({ type: "text"; text: string } | { type: "image"; data: string; mimeType: string })[] {
+		const text = builderInput(d);
+		const ids = [...new Set((d.pending.builderFindings ?? []).flatMap((f) => f.screenshots ?? []))];
+		if (!ids.length || !svc.acceptsImages(String(d.pinned.config.roles?.builder?.model ?? ""))) return text;
+		const parts: ({ type: "text"; text: string } | { type: "image"; data: string; mimeType: string })[] = [{ type: "text", text }];
+		for (const id of ids.slice(0, 12)) {
+			const file = join(svc.artifactsDir, d.id, "screenshots", `${id}.png`);
+			if (!existsSync(file)) continue;
+			parts.push({ type: "text", text: `\nScreenshot ${id} (QA):` }, { type: "image", data: readFileSync(file).toString("base64"), mimeType: "image/png" });
+		}
+		return parts;
+	}
+
+	/** An agent's own prior findings (review or qa entries) with the builder's responses, plus human gate findings. */
+	function priorSections(d: RunDocState, kind: "review" | "qa", label: string): string[] {
+		const parts: string[] = [];
+		const prior = d.findingsLog.filter((e) => e.kind === kind);
 		const lastPrior = prior.at(-1);
+		const responses = d.findingsLog.flatMap((e) => e.responses ?? []);
+		if (lastPrior) {
+			parts.push("", `## Your prior findings and the builder's responses (${label})`);
+			for (const f of lastPrior.findings) {
+				const r = responses.find((x) => x.findingId === f.id);
+				parts.push(formatFinding(f), `  builder: ${r ? `${r.status}${r.reason ? ` — ${r.reason}` : ""}` : "(no response)"}`);
+			}
+		}
+		const human = d.humanFindingsForReview;
+		if (human.length) {
+			parts.push("", "## Human findings from a gate rejection (blocking)");
+			for (const f of human) {
+				const r = responses.find((x) => x.findingId === f.id);
+				parts.push(formatFinding(f), `  builder: ${r ? `${r.status}${r.reason ? ` — ${r.reason}` : ""}` : "(no response)"}`);
+			}
+		}
+		return parts;
+	}
+
+	const clip = (patch: string) => (patch.length > 60_000 ? patch.slice(0, 60_000) + "\n… (truncated; inspect the workspace)" : patch);
+
+	function reviewerInput(d: RunDocState, diff: { stat: string; patch: string; files: { path: string; status: string }[] }, since?: { base: string; stat: string; patch: string }): string {
+		const ws = d.workspace!;
+		const qaOn = d.pinned.config.qa?.enabled === true;
+		const runScripts = (d.pinned.config.boat?.runScripts ?? []) as string[];
 		const parts = [
 			`# Review (review #${d.counters.reviewSeq}, round ${d.counters.reviewRound}${d.loop === "ci" ? `, after CI fix ${d.counters.ciFixes}` : ""})`,
 			`Workspace (read-only): ${ws.path}. Review the WHOLE product against the spec, not only the diff.`,
-			`Run the test suite yourself; do not trust the builder's report. Flag any test deleted or weakened in the diff.`,
+			`Run the test suite yourself; do not trust the builder's report. Flag any test deleted or weakened in the diff. Run the product (bash; curl a running service) and check the acceptance behaviours.`,
+			`Review the round's diff and the code it touches for quality and security (structure, duplication, maintainability, error handling; injection, unsafe input handling, secrets in code, missing access checks). Who wrote a line does not matter.`,
+			...(qaOn
+				? [`AQ testing is on for this project: if the product is something a user launches (an app, a service, a CLI), a missing or broken run script (one of ${runScripts.join(", ")}) is a BLOCKING finding.`]
+				: []),
 			"",
 			`## Spec (docs/spec.md)`,
 			d.artifacts.spec?.text ?? "",
@@ -373,29 +443,38 @@ export function createRunTask(svc: CoreServices) {
 			"```",
 			"Changed files: " + diff.files.map((f) => `${f.status} ${f.path}`).join(", "),
 			"```diff",
-			diff.patch.length > 60_000 ? diff.patch.slice(0, 60_000) + "\n… (truncated; inspect the workspace)" : diff.patch,
+			clip(diff.patch),
 			"```",
 		];
-		if (lastPrior) {
-			const responses = d.findingsLog.filter((e) => e.kind !== "review" || e.seq > lastPrior.seq).flatMap((e) => e.responses ?? []);
-			const allResponses = [...(lastPrior.responses ?? []), ...responses];
-			parts.push("", "## Your prior findings and the builder's responses");
-			for (const f of lastPrior.findings) {
-				const r = allResponses.find((x) => x.findingId === f.id);
-				parts.push(formatFinding(f), `  builder: ${r ? `${r.status}${r.reason ? ` — ${r.reason}` : ""}` : "(no response)"}`);
-			}
-		}
-		const human = d.humanFindingsForReview;
-		if (human.length) {
-			parts.push("", "## Human findings from a gate rejection (blocking)");
-			const responses = d.findingsLog.flatMap((e) => e.responses ?? []);
-			for (const f of human) {
-				const r = responses.find((x) => x.findingId === f.id);
-				parts.push(formatFinding(f), `  builder: ${r ? `${r.status}${r.reason ? ` — ${r.reason}` : ""}` : "(no response)"}`);
-			}
-		}
-		parts.push("", `Call submit_review. Every finding needs specRef and evidence you observed.`);
+		if (since)
+			parts.push("", `## Changes since the previous review (${since.base.slice(0, 12)})`, "```", since.stat || "(no change)", "```", "```diff", clip(since.patch), "```");
+		parts.push(...priorSections(d, "review", "reviewer"));
+		parts.push("", `Call submit_review. Every finding needs evidence you observed (a command and its output, or file and lines); give specRef when a spec clause applies.`);
 		return parts.join("\n");
+	}
+
+	function qaInput(d: RunDocState, r: ReviewRoundState, bootOk: boolean): string {
+		const ws = d.workspace!;
+		const agents = existsSync(join(ws.path, "AGENTS.md")) ? readFileSync(join(ws.path, "AGENTS.md"), "utf8").slice(0, 12_000) : "(no AGENTS.md)";
+		return [
+			`# AQ testing (review #${r.seq}, round ${r.round})`,
+			`The reviewed build is checked out in this VM at ${svc.boat.record(r.vm!.envId)?.appDir ?? "~/app"} and ${bootOk ? "is running" : "did NOT boot cleanly (see the output below)"}. Use it like its user would, with the computer tool, and check the acceptance behaviours. The product runs on localhost; AGENTS.md says where.`,
+			"",
+			`## Spec (docs/spec.md)`,
+			d.artifacts.spec?.text ?? "",
+			"",
+			`## AGENTS.md`,
+			agents,
+			"",
+			`## Setup and run script output`,
+			"```",
+			(r.bootLog ?? "").slice(-8000),
+			"```",
+			...(bootOk ? [] : ["A product that does not boot from a clean checkout is a blocking finding: take a screenshot of the failure in the terminal and cite it."]),
+			...priorSections(d, "qa", "QA"),
+			"",
+			`Call submit_qa. Every finding needs evidence (the UI steps and what you saw) and at least one screenshot id you took this round.`,
+		].join("\n");
 	}
 
 	// ------------------------------------------------------------------ phases
@@ -406,9 +485,17 @@ export function createRunTask(svc: CoreServices) {
 		},
 
 		PREPARING: async (rt, c, d) => {
+			// AQ testing needs a boat key; check that it resolves before any work (no VM yet).
+			if (d.pinned.config.qa?.enabled === true && !svc.boat.keyResolves(d.pinned.config)) {
+				const ref = d.pinned.config.boat?.apiKey ?? "env:BOAT_API_KEY";
+				throw new Error(
+					`AQ testing is on (qa.enabled) but the boat API key does not resolve (boat.apiKey = ${ref}). Either set the key (e.g. export ${String(ref).startsWith("env:") ? String(ref).slice(4) : "BOAT_API_KEY"} for the factory process), or set qa.enabled: false for project ${d.project}.`,
+				);
+			}
 			const ws = await svc.github.open(d.repo, rc(d));
 			const envs: RunDocState["envs"] = {};
-			for (const role of ["architect", "builder", "reviewer", "helper"] as Role[]) envs[role] = await svc.sandbox.provision(ws, role, rc(d));
+			// Helpers run in the builder's environment; they get none of their own.
+			for (const role of ["architect", "builder", "reviewer"] as Role[]) envs[role] = await svc.sandbox.provision(ws, role, rc(d));
 			await transition(rt, c, d.id, async (doc, tx): Promise<Phase> => {
 				doc.workspace = ws;
 				doc.envs = envs;
@@ -518,7 +605,7 @@ export function createRunTask(svc: CoreServices) {
 			const key = `${d.id}:BUILDING:${d.counters.buildSeq}`;
 			const findings = d.pending.builderFindings ?? [];
 			const ids = findings.filter((f) => f.blocking).map((f) => f.id!);
-			const r = await runAgent(rt, c, d, "builder", conv, key, builderInput(d), ["report_done"], ids);
+			const r = await runAgent(rt, c, d, "builder", conv, key, builderContent(d), ["report_done"], ids);
 			const diff = await svc.github.diff(d.workspace!, d.workspace!.baseRef);
 			const noProgress =
 				d.counters.buildSeq > 1 && d.pinned.config.policy?.escalateOnNoProgress !== false && diff.fingerprint === d.lastFingerprint;
@@ -536,34 +623,156 @@ export function createRunTask(svc: CoreServices) {
 						cap: doc.loop === "ci" ? "ciFix" : "review",
 						findings: doc.pending.builderFindings ?? [],
 					});
-				doc.counters.reviewSeq += 1;
-				const reviewer = await createRoleConversation(rt, tx, doc, "reviewer");
-				doc.conversations.reviewers.push({ id: reviewer, seq: doc.counters.reviewSeq });
+				await enterReview(rt, tx, doc);
 				return "REVIEWING";
 			});
 		},
 
 		REVIEWING: async (rt, c, d) => {
-			const conv = d.conversations.reviewers.find((x) => x.seq === d.counters.reviewSeq)!.id;
-			const key = `${d.id}:REVIEWING:${d.counters.reviewSeq}`;
-			const diff = await svc.github.diff(d.workspace!, d.workspace!.baseRef);
-			const r = await runAgent(rt, c, d, "reviewer", conv, key, reviewerInput(d, diff), ["submit_review"]);
-			const checked = validateReview(r.payload);
-			if (!checked.ok) throw new Error(`invalid review reached the core: ${checked.problems.join("; ")}`);
-			await transition(rt, c, d.id, async (doc, tx): Promise<Phase> => {
-				pushCost(doc, "reviewer", conv, r);
-				const findings = assignIds(doc, checked.review.findings);
-				const review: ReviewResult = { verdict: checked.review.verdict, findings };
+			const seq = d.counters.reviewSeq;
+			const ws = d.workspace!;
+			const reviewer = d.conversations.reviewers.find((x) => x.seq === seq)!.id;
+			// Runs that entered REVIEWING before AQ testing existed have no review record: QA is off for them.
+			if (!d.reviews?.[String(seq)]) await commitReview(rt, c, d.id, seq, (r) => Object.assign(r, { reviewer, qaStatus: "off" }));
+			let r = (await read(rt, d.id, c)).reviews![String(seq)]!;
+			if (!r.sha) {
+				const sha = await svc.github.snapshot(ws, `review-${seq}`);
+				await commitReview(rt, c, d.id, seq, (x) => (x.sha = sha));
+			}
+			if (r.qaStatus === undefined) {
+				// AQ testing applies when it is on for the project and one of the run scripts exists at the reviewed build.
+				const cfg = d.pinned.config;
+				const runScripts = (cfg.boat?.runScripts ?? []) as string[];
+				const status: ReviewRoundState["qaStatus"] = cfg.qa?.enabled !== true ? "off" : runScripts.some((p) => existsSync(join(ws.path, p))) ? "pending" : "skipped";
+				await commitReview(rt, c, d.id, seq, (x) => (x.qaStatus = status));
+			}
+			r = (await read(rt, d.id, c)).reviews![String(seq)]!;
+
+			const reviewerBranch = async () => {
+				if (r.review) return;
+				const doc = await read(rt, d.id, c);
+				const diff = await svc.github.diff(ws, ws.baseRef);
+				const prevSha = doc.reviews?.[String(seq - 1)]?.sha;
+				const since = prevSha ? await svc.github.diff(ws, prevSha) : undefined;
+				const key = `${d.id}:REVIEWING:${seq}`;
+				const res = await runAgent(rt, c, doc, "reviewer", reviewer, key, reviewerInput(doc, diff, since ? { base: prevSha!, stat: since.stat, patch: since.patch } : undefined), ["submit_review"]);
+				const checked = validateReview(res.payload);
+				if (!checked.ok) throw new Error(`invalid review reached the core: ${checked.problems.join("; ")}`);
+				await rt.commit(async (tx) => {
+					const x = (await tx.doc(RunDoc, d.id, null as never)) as unknown as RunDocState;
+					x.reviews![String(seq)]!.review = checked.review;
+					pushCost(x, "reviewer", reviewer, res);
+					return undefined;
+				}, c);
+			};
+
+			const qaBranch = async () => {
+				if (r.qaStatus !== "pending" && !(r.qaStatus === "ran" && !r.qaResult)) return;
+				let prov: Awaited<ReturnType<Boat["provision"]>>;
+				try {
+					prov = await svc.boat.provision(ws, rc(d), { seq, bundle: (out) => svc.github.bundle(ws, `review-${seq}`, out) });
+				} catch (e) {
+					const why = e instanceof Error ? e.message : String(e);
+					svc.log(`run ${d.id}: boat unavailable for review ${seq}: ${why}`);
+					await svc.boat.dispose(`${d.id}-qa-${seq}`).catch(() => undefined);
+					await commitReview(rt, c, d.id, seq, (x, doc) => {
+						x.qaStatus = "unavailable";
+						if (x.vm) x.vm.state = "disposed";
+						notice(doc, { level: "warn", text: `AQ testing unavailable for review #${seq}: boat.dev could not provide a VM (${why.slice(0, 200)}); this round is the review alone` });
+					});
+					return;
+				}
+				const vmRec = svc.boat.record(prov.envId);
+				await rt.commit(async (tx) => {
+					const doc = (await tx.doc(RunDoc, d.id, null as never)) as unknown as RunDocState;
+					const x = doc.reviews![String(seq)]!;
+					x.vm = { envId: prov.envId, id: prov.vmId, name: prov.name, attempt: prov.attempt, state: "ready", outcome: prov.outcome };
+					x.bootLog = prov.bootLog;
+					if (x.qa === undefined) {
+						x.qa = await createRoleConversation(rt, tx, doc, "qa", { envId: prov.envId, ...(vmRec?.appDir ? { cwd: vmRec.appDir } : {}), seq });
+						doc.conversations.qa = [...(doc.conversations.qa ?? []), { id: x.qa, seq }];
+						x.qaStatus = "ran";
+						x.toldAttempt = `${prov.attempt}:${prov.outcome}`;
+					}
+					return undefined;
+				}, c);
+				const doc = await read(rt, d.id, c);
+				const x = doc.reviews![String(seq)]!;
+				const qaConv = x.qa!;
+				const told = `${prov.attempt}:${prov.outcome}`;
+				if ((prov.outcome === "restarted" || prov.outcome === "replaced") && x.toldAttempt !== told) {
+					// After a crash: the VM was stopped (resumed, product restarted) or gone (replaced). Tell the QA agent.
+					const handle = await rt.conversation(qaConv as never, c);
+					const note =
+						prov.outcome === "replaced"
+							? "[factory] Your VM was lost and has been replaced with a fresh one running the same reviewed build. Files and state you created there are gone; screenshots you already took are kept. Continue testing."
+							: "[factory] Your VM was stopped and has been resumed; the product was restarted. Continue testing.";
+					await handle?.submit({ type: "input", content: note, requestId: `${d.id}:QA:${seq}:vm:${told}`, whenBusy: "steer" }, c);
+					await commitReview(rt, c, d.id, seq, (y) => (y.toldAttempt = told));
+				}
+				const key = `${d.id}:QA:${seq}`;
+				const res = await runAgent(rt, c, doc, "qa", qaConv, key, qaInput(doc, x, prov.bootOk), ["submit_qa"], undefined, { drive: false });
+				const taken = ((await rt.snapshot(ScreenshotsDoc, qaConv as never, c)) as { ids?: string[] } | undefined)?.ids ?? [];
+				const checked = validateQa(res.payload, taken);
+				if (!checked.ok) throw new Error(`invalid QA verdict reached the core: ${checked.problems.join("; ")}`);
+				const usage = await svc.boat.usage(prov.envId).catch(() => undefined);
+				await svc.boat.dispose(prov.envId).catch((e) => svc.log(`run ${d.id}: disposing QA VM failed: ${e}`));
+				await rt.commit(async (tx) => {
+					const y = (await tx.doc(RunDoc, d.id, null as never)) as unknown as RunDocState;
+					const z = y.reviews![String(seq)]!;
+					z.qaResult = checked.review;
+					z.screenshots = [...taken];
+					if (z.vm) z.vm.state = "disposed";
+					pushCost(y, "qa", qaConv, res);
+					if (usage) {
+						const roleCfg = y.pinned.config.boat ?? {};
+						y.cost.push({
+							role: "qa",
+							round: y.counters.reviewRound,
+							seq,
+							conversationId: String(qaConv),
+							model: `boat.dev VM (${roleCfg.size ?? "default"})`,
+							thinking: "",
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 0,
+							usd: usage.dollars,
+							durationMs: usage.seconds * 1000,
+							vmSeconds: usage.seconds,
+						});
+					}
+					return undefined;
+				}, c);
+			};
+
+			// The review and AQ testing run in parallel; the core waits for both, even when one has already failed.
+			const settled = await Promise.allSettled([reviewerBranch(), qaBranch()]);
+			const failed = settled.find((x): x is PromiseRejectedResult => x.status === "rejected");
+			if (failed) throw failed.reason;
+
+			await transition(rt, c, d.id, async (doc): Promise<Phase> => {
+				const x = doc.reviews![String(seq)]!;
+				const qaStatus = (x.qaStatus === "pending" ? "unavailable" : x.qaStatus) as QaStatus;
+				x.qaStatus = qaStatus;
+				const reviewFindings = assignIds(doc, x.review!.findings);
+				const qaFindings = x.qaResult ? assignIds(doc, x.qaResult.findings) : [];
+				const findings = [...reviewFindings, ...qaFindings];
+				const verdict: "pass" | "fail" = findings.some((f) => f.blocking) ? "fail" : "pass";
+				const review: ReviewResult = { verdict, findings };
 				doc.lastReview = review;
-				doc.findingsLog.push({ seq: doc.findingsLog.length + 1, kind: "review", round: doc.counters.reviewRound, findings, reviewerConversation: conv });
+				doc.findingsLog.push({ seq: doc.findingsLog.length + 1, kind: "review", round: doc.counters.reviewRound, reviewSeq: seq, findings: reviewFindings, reviewerConversation: reviewer });
+				if (x.qaResult) doc.findingsLog.push({ seq: doc.findingsLog.length + 1, kind: "qa", round: doc.counters.reviewRound, reviewSeq: seq, findings: qaFindings, reviewerConversation: x.qa! });
 				doc.humanFindingsForReview = [];
-				if (review.verdict === "pass") {
+				const qaNote = `QA ${qaStatus}${x.qaResult ? ` (${x.qaResult.verdict})` : ""}`;
+				if (verdict === "pass") {
 					doc.advisory = findings.filter((f) => !f.blocking);
-					notice(doc, { level: "info", text: `Review passed (review #${doc.counters.reviewSeq})${doc.advisory.length ? ` with ${doc.advisory.length} advisory finding(s)` : ""}` });
+					notice(doc, { level: "info", text: `Review passed (review #${seq}; ${qaNote})${doc.advisory.length ? ` with ${doc.advisory.length} advisory finding(s)` : ""}`, qaStatus });
 					return toGateOrNext(doc, "delivery", "DELIVERING");
 				}
 				const blocking = findings.filter((f) => f.blocking).length;
-				notice(doc, { level: "warn", text: `Review failed (review #${doc.counters.reviewSeq}): ${blocking} blocking finding(s)` });
+				notice(doc, { level: "warn", text: `Review round failed (review #${seq}; reviewer ${x.review!.verdict}, ${qaNote}): ${blocking} blocking finding(s)`, qaStatus });
 				if (doc.loop === "ci") {
 					if (doc.counters.ciFixes < doc.caps.ciFix) {
 						doc.counters.ciFixes += 1;
@@ -616,9 +825,7 @@ export function createRunTask(svc: CoreServices) {
 					await transition(rt, c, d.id, async (doc, tx): Promise<Phase> => {
 						doc.lastFingerprint = now.fingerprint;
 						notice(doc, { level: "warn", text: "The workspace changed after the last review (the builder acted on a message); reviewing again before delivery" });
-						doc.counters.reviewSeq += 1;
-						const reviewer = await createRoleConversation(rt, tx, doc, "reviewer");
-						doc.conversations.reviewers.push({ id: reviewer, seq: doc.counters.reviewSeq });
+						await enterReview(rt, tx, doc);
 						return "REVIEWING";
 					});
 					return;
@@ -633,6 +840,7 @@ export function createRunTask(svc: CoreServices) {
 				advisory: d.advisory,
 				acceptedBlocking: d.acceptedBlocking,
 				mode: ws.newRepo ? "push-main" : "pull-request",
+				...(lastQaStatus(d) ? { qaStatus: lastQaStatus(d) } : {}),
 			};
 			const out = await svc.github.deliver(ws, ctx, rc(d));
 			await transition(rt, c, d.id, (doc): Phase => {
@@ -718,6 +926,27 @@ export function createRunTask(svc: CoreServices) {
 		b.expect = expect;
 	}
 
+	/** A fresh review: a new reviewer Conversation and the review's record (QA is decided on entering REVIEWING). */
+	async function enterReview(rt: TaskRuntime<any, any, any, any>, tx: Tx, doc: RunDocState) {
+		doc.counters.reviewSeq += 1;
+		const seq = doc.counters.reviewSeq;
+		const reviewer = await createRoleConversation(rt, tx, doc, "reviewer");
+		doc.conversations.reviewers.push({ id: reviewer, seq });
+		doc.reviews = { ...(doc.reviews ?? {}), [String(seq)]: { seq, round: doc.counters.reviewRound, reviewer } };
+	}
+
+	/** Change the current review's record (its own commit, no transition). */
+	async function commitReview(rt: TaskRuntime<any, any, any, any>, c: Context, runId: string, seq: number, change: (r: ReviewRoundState, doc: RunDocState) => void) {
+		await rt.commit(async (tx) => {
+			const doc = (await tx.doc(RunDoc, runId, null as never)) as unknown as RunDocState;
+			doc.reviews ??= {};
+			const r = (doc.reviews[String(seq)] ??= { seq, round: doc.counters.reviewRound });
+			change(r, doc);
+			doc.updatedAt = svc.now();
+			return undefined;
+		}, c);
+	}
+
 	async function startBuild(rt: TaskRuntime<any, any, any, any>, tx: Tx, d: RunDocState) {
 		if (!d.conversations.builder) d.conversations.builder = await createRoleConversation(rt, tx, d, "builder");
 		if (d.counters.buildSeq === 0) toBuilding(d, []);
@@ -725,11 +954,25 @@ export function createRunTask(svc: CoreServices) {
 
 	async function sideEffectsAtEnd(d: RunDocState) {
 		for (const e of Object.values(d.envs)) if (e) await svc.sandbox.dispose(e.envId).catch((err) => svc.log(`dispose failed: ${err}`));
+		// any QA VM still live is deleted (delivered, failed or cancelled)
+		for (const r of Object.values(d.reviews ?? {})) if (r.vm && r.vm.state !== "disposed") await svc.boat.dispose(r.vm.envId).catch((err) => svc.log(`QA VM dispose failed: ${err}`));
+	}
+
+	/** Record the QA VMs sideEffectsAtEnd deleted. */
+	async function markVmsDisposed(rt: TaskRuntime<any, any, any, any>, c: Context, runId: string) {
+		const d = await read(rt, runId, c);
+		if (!Object.values(d.reviews ?? {}).some((r) => r.vm && r.vm.state !== "disposed")) return;
+		await rt.commit(async (tx) => {
+			const doc = (await tx.doc(RunDoc, runId, null as never)) as unknown as RunDocState;
+			for (const r of Object.values(doc.reviews ?? {})) if (r.vm) r.vm.state = "disposed";
+			return undefined;
+		}, c);
 	}
 
 	async function finalize(rt: RT, c: Context, d: RunDocState) {
 		await settleUsage(rt, c, d.id);
 		await sideEffectsAtEnd(d);
+		await markVmsDisposed(rt, c, d.id);
 		await rt.commit(() => ({ status: "terminal", outcome: { status: "completed", result: d.state } }), c);
 	}
 
@@ -769,6 +1012,7 @@ export function createRunTask(svc: CoreServices) {
 			}
 			await settleUsage(rt, c, runId).catch((e) => svc.log(`usage settle failed: ${e}`));
 			await sideEffectsAtEnd(d);
+			await markVmsDisposed(rt, c, runId).catch(() => undefined);
 			await rt.commit(() => ({ status: "terminal", outcome: { status: "aborted", reason: "cancelled" } }), c);
 		},
 	});

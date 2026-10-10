@@ -1,8 +1,9 @@
 // Sandbox (spec §3.3, §7): every role works in the run's git worktree; every command it
 // executes runs inside Anthropic's sandbox runtime (@anthropic-ai/sandbox-runtime, used as a library). In-process file
 // tools are not processes, so the ExecutionEnv applies the same path rules to their readers and writers.
-// Write access is fixed by role: only the builder may write the worktree (and its git dirs); the architect, reviewer
-// and helpers may write only their scratch dir.
+// Write access is fixed by role: only the builder and its helpers (which run in the builder's environment) may write the
+// worktree (and its git dirs); the architect and reviewer may write only their scratch dir. The QA agent works in a
+// boat.dev VM instead (src/boat). The core's credentials (GitHub token, boat API key) are denied to every command.
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
@@ -15,7 +16,15 @@ import { DEFAULT_DENY_READ, expandHome, type Obj } from "../core/settings.ts";
 import type { Role, RunCtx, Workspace } from "../core/types.ts";
 import { gitOut } from "../github/git.ts";
 
-export const CREDENTIAL_ENV_VARS = ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "FACTORY_GIT_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "AWS_SECRET_ACCESS_KEY"];
+export const CREDENTIAL_ENV_VARS = ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "FACTORY_GIT_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "AWS_SECRET_ACCESS_KEY", "BOAT_API_KEY", "PARALLEL_API_KEY"];
+
+/** The env vars and files the run's credential references name (GitHub identity, boat API key): denied in the sandbox. */
+export function credentialLocations(config: Record<string, any>): { envVars: string[]; files: string[] } {
+	const refs = [config.github?.identity?.tokenRef, config.github?.identity?.privateKeyRef, config.boat?.apiKey, config.webSearch?.apiKey].filter((r): r is string => typeof r === "string");
+	const envVars = refs.filter((r) => r.startsWith("env:")).map((r) => r.slice(4));
+	const files = refs.filter((r) => r.startsWith("file:")).map((r) => expandHome(r.slice(5)));
+	return { envVars: [...new Set([...CREDENTIAL_ENV_VARS, ...envVars])], files };
+}
 
 type EnvRecord = {
 	envId: string;
@@ -26,6 +35,8 @@ type EnvRecord = {
 	scratch: string;
 	sandbox: { enabled: boolean; allowedDomains: string[]; deniedDomains: string[]; denyRead: string[]; extraWrite: string[]; unixSockets: string };
 	setup?: { script: string; exitCode: number };
+	/** Credential env vars and key files named by the run's config (missing on records written before). */
+	credentials?: { envVars: string[]; files: string[] };
 };
 
 const shellQuote = (argv: readonly string[]) => argv.map((a) => `'${a.replace(/'/g, `'\\''`)}'`).join(" ");
@@ -213,7 +224,7 @@ export class Sandbox {
 	}
 
 	private policy(rec: EnvRecord) {
-		const deny = rec.sandbox.denyRead.map((p) => real(expandHome(p)));
+		const deny = [...rec.sandbox.denyRead.map(expandHome), ...(rec.credentials?.files ?? [])].map((p) => real(p));
 		const builder = rec.role === "builder";
 		const writeRoots = [rec.scratch, ...(builder ? [rec.worktree, ...(rec.gitCommonDir ? [rec.gitCommonDir] : []), ...rec.sandbox.extraWrite.map(expandHome)] : [])].map(real);
 		const denyWrite = builder && rec.gitCommonDir ? [join(rec.gitCommonDir, "hooks"), join(rec.gitCommonDir, "config")].map(real) : [];
@@ -249,7 +260,7 @@ export class Sandbox {
 				undefined,
 				{
 					filesystem: fsConfig,
-					credentials: { envVars: CREDENTIAL_ENV_VARS.map((name) => ({ name, mode: "deny" as const })) },
+					credentials: { envVars: (rec.credentials?.envVars ?? CREDENTIAL_ENV_VARS).map((name) => ({ name, mode: "deny" as const })) },
 				} as any,
 				signal,
 			);
@@ -282,6 +293,7 @@ export class Sandbox {
 				extraWrite: sb.extraWrite ?? [],
 				unixSockets: sb.unixSockets ?? "auto",
 			},
+			credentials: credentialLocations(rc.config),
 		};
 		const common = await gitOut(ws.path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).catch(() => "");
 		if (common) rec.gitCommonDir = common;

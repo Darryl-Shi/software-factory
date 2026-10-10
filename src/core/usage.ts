@@ -27,7 +27,7 @@ const max = (a: UsageSum, b: UsageSum | undefined): UsageSum => (b ? (Object.fro
 
 /** Round and sequence number a role's cost records carry. */
 export function roundSeq(d: RunDocState, role: Role): { round: number; seq: number } {
-	if (role === "reviewer") return { round: d.counters.reviewRound, seq: d.counters.reviewSeq };
+	if (role === "reviewer" || role === "qa") return { round: d.counters.reviewRound, seq: d.counters.reviewSeq };
 	if (role === "builder") return { round: d.counters.reviewRound, seq: d.counters.buildSeq };
 	return { round: d.counters.discussionSeq, seq: d.counters.discussionSeq };
 }

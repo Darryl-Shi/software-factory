@@ -6,6 +6,8 @@ import { createServer } from "node:net";
 import { dirname, join } from "node:path";
 import type { Models } from "@earendil-works/pi-ai";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
+import { Boat } from "./boat/boat.ts";
+import { BoatApiBackend, type BoatBackend, LocalBoatBackend } from "./boat/backend.ts";
 import { Factory } from "./core/core.ts";
 import { expandHome } from "./core/settings.ts";
 import { GitHub } from "./github/github.ts";
@@ -17,6 +19,8 @@ export interface ProcessOptions {
 	configPath?: string;
 	/** Use a fake GitHub on the local disk (bare remotes + local CI runner) instead of github.com. */
 	fakeGithub?: string;
+	/** Use a fake boat.dev on the local disk (a VM is a directory, a stub cua-driver) instead of boat's API. */
+	fakeBoat?: string;
 	/** Register the scripted dry-run agents as provider "scripted" (no credentials needed). */
 	scripted?: boolean;
 	/** Port of the web UI (overrides web.port; 0 picks a free port). */
@@ -40,6 +44,16 @@ export async function createModels(scripted: boolean): Promise<Models> {
 		models.setProvider(scriptedProvider(DRY_RUN_SCRIPTS).provider);
 	}
 	return models;
+}
+
+/** Boat on boat.dev's API, or on a LocalBoatBackend under `fake` (dry runs, tests). */
+export function createBoat(configPath: string, fake?: string): Boat {
+	let local: BoatBackend | undefined;
+	return new Boat({
+		stateDir: join(factoryHome(configPath), "qa-vms"),
+		backend: fake ? () => (local ??= new LocalBoatBackend(expandHome(fake))) : (key) => new BoatApiBackend(key),
+		...(fake ? { retryDelayMs: 100, bootWaitMs: 1000 } : {}),
+	});
 }
 
 export interface FactoryProcess {
@@ -73,6 +87,7 @@ export async function startFactoryProcess(opts: ProcessOptions = {}): Promise<Fa
 		models: await createModels(!!opts.scripted),
 		github: new GitHub(host),
 		sandbox: new Sandbox({ stateDir: join(factoryHome(configPath), "environments") }),
+		boat: createBoat(configPath, opts.fakeBoat),
 		...(opts.ciPollMs ? { ciPollMs: opts.ciPollMs } : {}),
 		log,
 	});

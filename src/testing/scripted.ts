@@ -29,7 +29,7 @@ export interface ScriptContext {
 export type Script = ((ctx: ScriptContext) => AssistantMessage | Promise<AssistantMessage>) & {
 	onMessage?: (ctx: ScriptContext) => AssistantMessage | Promise<AssistantMessage> | undefined;
 };
-const BRIDGE_TOOLS = ["ask_human", "submit_spec", "report_done", "submit_review"];
+const BRIDGE_TOOLS = ["ask_human", "submit_spec", "report_done", "submit_review", "submit_qa"];
 /** The human's own text of a message (without the factory's header and situation note). */
 export const humanText = (full: string) => parseMessage(full)?.text ?? full;
 
@@ -49,7 +49,7 @@ const textOf = (m: any): string =>
 export function scriptedProvider(scripts: Record<string, Script>, providerId = "scripted") {
 	const faux = fauxProvider({
 		provider: providerId,
-		models: Object.keys(scripts).map((id) => ({ id, reasoning: true, contextWindow: 400_000, maxTokens: 32_000, cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 } })),
+		models: Object.keys(scripts).map((id) => ({ id, reasoning: true, input: (id.endsWith("-textonly") ? ["text"] : ["text", "image"]) as ("text" | "image")[], contextWindow: 400_000, maxTokens: 32_000, cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 } })),
 	});
 	const step = async (context: any, _opts: unknown, _state: unknown, model: { id: string }) => {
 		const messages = (context.messages ?? []) as Message[];

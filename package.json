@@ -14,11 +14,12 @@
   "license": "UNLICENSED",
   "dependencies": {
     "@anthropic-ai/sandbox-runtime": "0.0.79",
+    "@boatdev/sdk": "1.9.2",
     "@earendil-works/chord": "1.1.0",
     "@earendil-works/pi-ai": "1.1.0",
     "@earendil-works/pi-durable": "1.1.0",
-    "yaml": "2.9.1",
-    "tsx": "4.23.15"
+    "tsx": "4.23.15",
+    "yaml": "2.9.1"
   },
   "devDependencies": {
     "@types/node": "26.6.4",

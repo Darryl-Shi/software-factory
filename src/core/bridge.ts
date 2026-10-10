@@ -2,10 +2,10 @@
 // is waiting on; they never call layer-2 code. The core turns what they commit into state transitions.
 import { Type } from "@earendil-works/pi-ai";
 import { defineDoc, defineExtension, defineTool, type ToolRegistration } from "@earendil-works/pi-durable";
-import { validateResponses, validateReview } from "./findings.ts";
+import { validateQa, validateResponses, validateReview } from "./findings.ts";
 import type { Role } from "./types.ts";
 
-export type BridgeTool = "ask_human" | "submit_spec" | "report_done" | "submit_review";
+export type BridgeTool = "ask_human" | "submit_spec" | "report_done" | "submit_review" | "submit_qa";
 
 export type BridgeState = {
 	runId?: string;
@@ -35,10 +35,21 @@ export const EnvDoc = defineDoc<EnvBinding>({
 	initial: () => ({}),
 });
 
+/** Screenshots the QA agent took in its VM (§3.7), stored by the core; the ids its findings may cite. */
+export const ScreenshotsDoc = defineDoc<{ ids: string[] }>({
+	kind: "factory.screenshots",
+	version: 1,
+	scope: "conversation",
+	history: "latest",
+	fork: "initial",
+	initial: () => ({ ids: [] }),
+});
+
 export const ROLE_TOOLS: Record<Role, BridgeTool[]> = {
 	architect: ["ask_human", "submit_spec"],
 	builder: ["report_done"],
 	reviewer: ["submit_review"],
+	qa: ["submit_qa"],
 	helper: [],
 };
 
@@ -48,7 +59,7 @@ function bridgeTool<P extends Parameters<typeof defineTool>[0]["parameters"]>(
 	name: BridgeTool,
 	description: string,
 	parameters: P,
-	check: (args: any, expect: NonNullable<BridgeState["expect"]>) => { ok: true; payload: unknown; reply: string } | { ok: false; problems: string[] },
+	check: (args: any, expect: NonNullable<BridgeState["expect"]>, taken: string[]) => { ok: true; payload: unknown; reply: string } | { ok: false; problems: string[] },
 ): ToolRegistration {
 	return defineTool({
 		name,
@@ -67,7 +78,8 @@ function bridgeTool<P extends Parameters<typeof defineTool>[0]["parameters"]>(
 					return existing.tool === name && JSON.stringify(existing.payload) === JSON.stringify(args)
 						? { reply: "Already recorded." }
 						: { error: `Already submitted ${existing.tool} for this turn; one submission at a time. Stop and wait.` };
-				const checked = check(args, expect as NonNullable<BridgeState["expect"]>);
+				const taken = name === "submit_qa" ? [...((await tx.doc(ScreenshotsDoc, api.conversationId)).ids ?? [])] : [];
+				const checked = check(args, expect as NonNullable<BridgeState["expect"]>, taken);
 				if (!checked.ok) return { error: `Rejected by the factory:\n- ${checked.problems.join("\n- ")}\nFix these and call ${name} again.` };
 				doc.results[expect.key] = { tool: name, payload: checked.payload as any, at: Date.now() };
 				return { reply: checked.reply };
@@ -81,11 +93,21 @@ function bridgeTool<P extends Parameters<typeof defineTool>[0]["parameters"]>(
 const FindingSchema = Type.Object({
 	severity: Type.String({ description: "critical | major | minor | nit" }),
 	blocking: Type.Boolean({ description: "Only blocking findings fail a round" }),
-	// specRef and evidence are required; the factory's own validator enforces that with an actionable message.
-	specRef: Type.Optional(Type.String({ description: "REQUIRED: the spec clause this finding rests on (e.g. an acceptance behaviour)" })),
+	specRef: Type.Optional(Type.String({ description: "The spec clause this finding rests on, when there is one (code-quality and security findings often have none)" })),
 	description: Type.String(),
-	evidence: Type.Optional(Type.String({ description: "REQUIRED: what you observed yourself: the exact command and its output, or a screenshot path" })),
+	// evidence is required; the factory's own validator enforces that with an actionable message.
+	evidence: Type.Optional(Type.String({ description: "REQUIRED: what you observed yourself: the exact command and its output, or the code you point to (file and lines)" })),
 	source: Type.Optional(Type.String({ description: 'Always "reviewer" (default)' })),
+});
+
+const QaFindingSchema = Type.Object({
+	severity: Type.String({ description: "critical | major | minor | nit" }),
+	blocking: Type.Boolean({ description: "Only blocking findings fail a round" }),
+	specRef: Type.Optional(Type.String({ description: "The spec clause (e.g. an acceptance behaviour) this finding rests on, when there is one" })),
+	description: Type.String(),
+	evidence: Type.Optional(Type.String({ description: "REQUIRED: the UI steps you took and what you saw" })),
+	screenshots: Type.Optional(Type.Array(Type.String(), { description: "REQUIRED: ids of screenshots you took this round (from the computer tool) that show it" })),
+	source: Type.Optional(Type.String({ description: 'Always "qa" (default)' })),
 });
 
 export const askHuman = bridgeTool(
@@ -133,11 +155,21 @@ export const reportDone = bridgeTool(
 
 export const submitReview = bridgeTool(
 	"submit_review",
-	'Submit your review verdict. "fail" if and only if at least one finding is blocking. Every finding needs specRef and evidence you observed.',
+	'Submit your review verdict. "fail" if and only if at least one finding is blocking. Every finding needs evidence you observed (a command and its output, or file and lines); specRef when a spec clause applies. Blocking findings may be spec violations, failing/deleted/weakened tests, or code-quality and security problems serious enough to stop delivery.',
 	Type.Object({ verdict: Type.Union([Type.Literal("pass"), Type.Literal("fail")]), findings: Type.Array(FindingSchema) }),
 	(args) => {
 		const checked = validateReview(args);
 		return checked.ok ? { ok: true, payload: checked.review, reply: "Review submitted." } : checked;
+	},
+);
+
+export const submitQa = bridgeTool(
+	"submit_qa",
+	'Submit your QA verdict after using the product like its user. "fail" if and only if at least one finding is blocking. Every finding needs evidence (the UI steps you took and what you saw) and at least one screenshot id you took this round.',
+	Type.Object({ verdict: Type.Union([Type.Literal("pass"), Type.Literal("fail")]), findings: Type.Array(QaFindingSchema) }),
+	(args, _expect, taken) => {
+		const checked = validateQa(args, taken);
+		return checked.ok ? { ok: true, payload: checked.review, reply: "QA verdict submitted." } : checked;
 	},
 );
 
@@ -146,6 +178,7 @@ const ALL: Record<BridgeTool, ToolRegistration> = {
 	submit_spec: submitSpec,
 	report_done: reportDone,
 	submit_review: submitReview,
+	submit_qa: submitQa,
 };
 
 export const Bridge = defineExtension({ name: "factory.bridge", tools: Object.values(ALL) });
