@@ -13,6 +13,24 @@ export interface Shown {
 	body?: string;
 }
 
+/**
+ * A SetupUi for tests: each prompt shifts one queued answer, and everything shown is recorded in `shown`.
+ *
+ * Answers: a plain value is returned as is; a function is called with the prompt options and its result is used;
+ * `CANCEL` throws SetupCancelled; `WAIT_FOR_ABORT` rejects when the prompt's signal aborts. When the answers run out,
+ * the prompt throws `ScriptedUi: no answer for <kind> "<message>"`.
+ *
+ * Like clack, `text` and `password` re-prompt while `validate` rejects the answer: each rejection is recorded as
+ * `validate` and the next answer is shifted.
+ *
+ * `shown` kinds, in order of occurrence (`message` is the prompt message unless noted):
+ * - `text`, `password`, `confirm`: one entry per prompt (not per re-prompt);
+ * - `select`, `multiselect`: also `options`, the option values;
+ * - `validate`: `message` is the validation message;
+ * - `note`: `message` is the title ("" when absent), `body` the note body;
+ * - `log.info`, `log.warn`, `log.error`, `log.success`, `intro`, `outro`: `message` is the text;
+ * - `spinner`: `message` is `start: <m>` or `stop: <m>`.
+ */
 export class ScriptedUi implements SetupUi {
 	readonly shown: Shown[] = [];
 	private readonly answers: unknown[];
@@ -76,14 +94,22 @@ export class ScriptedUi implements SetupUi {
 		this.shown.push({ kind, message });
 	}
 
-	private async ask(kind: string, o: { message: string; signal?: AbortSignal }, options?: string[]): Promise<unknown> {
+	private async ask(
+		kind: string,
+		o: { message: string; signal?: AbortSignal; validate?: (v: string) => string | undefined },
+		options?: string[],
+	): Promise<unknown> {
 		this.shown.push(options ? { kind, message: o.message, options } : { kind, message: o.message });
-		if (this.answers.length === 0) throw new Error(`ScriptedUi: no answer for ${kind} "${o.message}"`);
-		const next = this.answers.shift();
-		const answer = typeof next === "function" ? await next(o) : next;
-		if (answer === CANCEL) throw new SetupCancelled();
-		if (answer === WAIT_FOR_ABORT) return waitForAbort(kind, o);
-		return answer;
+		for (;;) {
+			if (this.answers.length === 0) throw new Error(`ScriptedUi: no answer for ${kind} "${o.message}"`);
+			const next = this.answers.shift();
+			const answer = typeof next === "function" ? await next(o) : next;
+			if (answer === CANCEL) throw new SetupCancelled();
+			if (answer === WAIT_FOR_ABORT) return waitForAbort(kind, o);
+			const invalid = typeof answer === "string" ? o.validate?.(answer) : undefined;
+			if (invalid === undefined) return answer;
+			this.shown.push({ kind: "validate", message: invalid });
+		}
 	}
 }
 

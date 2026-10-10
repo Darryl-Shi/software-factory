@@ -105,6 +105,21 @@ describe("ScriptedUi", () => {
 		await expect(ui.text({ message: "Name" })).rejects.toThrow('ScriptedUi: no answer for text "Name"');
 	});
 
+	test("validate rejections are shown and the next answer is used; exhaustion still throws", async () => {
+		const ui = new ScriptedUi(["", "anthropic", "my-endpoint", ""]);
+		const validate = (v: string) => (v === "" ? "required" : v === "anthropic" ? "collides with a built-in" : undefined);
+		expect(await ui.text({ message: "Endpoint id", validate })).toBe("my-endpoint");
+		await expect(ui.password({ message: "Key", validate })).rejects.toThrow('ScriptedUi: no answer for password "Key"');
+		expect(ui.shown.map((s) => [s.kind, s.message])).toEqual([
+			["text", "Endpoint id"],
+			["validate", "required"],
+			["validate", "collides with a built-in"],
+			["password", "Key"],
+			["validate", "required"],
+		]);
+		expect(ui.remaining()).toBe(0);
+	});
+
 	test("records notes and logs", () => {
 		const ui = new ScriptedUi([]);
 		ui.intro("factory setup");
