@@ -1,6 +1,6 @@
 // Secret store (spec §2.2): `<factoryHome>/secrets.json`, mode 0600 in a 0700 dir, read fresh on every access
 // so external edits are seen; writes go through a temp file + rename. Referenced from settings as `store:<key>`.
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 export const SECRET_KEY = /^[a-z0-9-]+$/;
@@ -32,6 +32,8 @@ export class SecretStore {
 		mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
 		const tmp = `${this.path}.${process.pid}.tmp`;
 		writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n", { mode: 0o600 });
+		// `mode` applies only when the file is created: a stale temp file keeps its old mode.
+		chmodSync(tmp, 0o600);
 		renameSync(tmp, this.path);
 	}
 

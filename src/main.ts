@@ -85,7 +85,10 @@ export async function startFactoryProcess(opts: ProcessOptions = {}): Promise<Fa
 	}
 	const log = opts.log ?? ((m: string) => console.error(`[factory] ${m}`));
 	const home = factoryHome(configPath);
-	setDefaultSecretStore(new SecretStore(secretsPath(home)));
+	const secrets = new SecretStore(secretsPath(home));
+	// spec §5: refuse a loose or unparseable secrets.json before anything starts (a missing one is fine).
+	secrets.keys();
+	setDefaultSecretStore(secrets);
 	const modelHost = await createModelHost({ factoryHome: home, ...(opts.scripted ? { scripted: true } : {}) });
 	for (const d of modelHost.diagnostics) log(`extension: ${d.message}`);
 	const ghHost: GitHubHost = opts.fakeGithub ? new LocalGitHubHost(expandHome(opts.fakeGithub)) : new GhApiHost();
