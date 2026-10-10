@@ -59,3 +59,9 @@ test("after stop(), process.exit(0) exits 0 without the cancel message", async (
 	expect(out).not.toContain(MESSAGE);
 	expect(code).toBe(0);
 }, 30_000);
+
+test("a login's spinner ended by authInteraction close() lets process.exit(0) exit 0 without the cancel message", async () => {
+	const { code, out } = await child("auth-close");
+	expect(out).not.toContain(MESSAGE);
+	expect(code).toBe(0);
+}, 30_000);

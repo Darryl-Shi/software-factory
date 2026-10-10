@@ -136,9 +136,16 @@ export class ClackUi implements SetupUi {
 	}
 }
 
+/**
+ * An AuthInteraction for one login. `close()` stops the spinner a final `progress` event left running; call it in a
+ * `finally` around the login, which may end (or fail) right after such an event.
+ */
+export type SetupAuthInteraction = AuthInteraction & { close(): void };
+
 /** Adapts SetupUi to pi-ai's login protocol (spec §3.2). */
-export function authInteraction(ui: SetupUi): AuthInteraction {
-	// `progress` events drive one lazily started spinner; it stops before anything else is shown.
+export function authInteraction(ui: SetupUi): SetupAuthInteraction {
+	// `progress` events drive one lazily started spinner; it stops before anything else is shown. pi-ai's OAuth flows
+	// emit `progress` last, so the caller ends it with close(): a ClackUi spinner left running turns exit 0 into 130.
 	let spin: ReturnType<SetupUi["spinner"]> | undefined;
 	let spinning: string | undefined;
 	const settle = () => {
@@ -147,6 +154,8 @@ export function authInteraction(ui: SetupUi): AuthInteraction {
 	};
 
 	return {
+		close: settle,
+
 		async prompt(p: AuthPrompt): Promise<string> {
 			settle();
 			switch (p.type) {

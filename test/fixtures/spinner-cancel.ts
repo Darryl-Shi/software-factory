@@ -1,8 +1,15 @@
 // Child process for the spinner cancel tests (spec §5): starts a ClackUi spinner, then exits the way clack's block()
 // does on Ctrl-C in raw mode (`exit`), after stopping the spinner (`stop`), or waits for a signal (`wait`).
-import { ClackUi } from "../../src/setup/ui.ts";
+// `auth-close`: a login's final `progress` event starts authInteraction's spinner, close() ends it, then exit 0.
+import { authInteraction, ClackUi } from "../../src/setup/ui.ts";
 
 const mode = process.argv[2];
+if (mode === "auth-close") {
+	const auth = authInteraction(new ClackUi());
+	auth.notify({ type: "progress", message: "Exchanging authorization code for tokens..." });
+	auth.close();
+	process.exit(0);
+}
 const spin = new ClackUi().spinner();
 spin.start("checking the network");
 if (mode === "stop") spin.stop("network ok");
