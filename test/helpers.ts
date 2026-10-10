@@ -2,6 +2,8 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createModels } from "@earendil-works/pi-ai/models";
+import { Boat } from "../src/boat/boat.ts";
+import { LocalBoatBackend } from "../src/boat/backend.ts";
 import { Factory } from "../src/core/core.ts";
 import type { RunView } from "../src/core/types.ts";
 import { GitHub } from "../src/github/github.ts";
@@ -36,10 +38,20 @@ export interface Control {
 	/** The architect calls web_search before writing the spec; the tool results land here. */
 	searchFirst?: boolean;
 	searchResults: string[];
+	/** The builder also ships scripts/run.sh (a launchable product, so AQ testing applies). */
+	runScript?: boolean;
+	/** Per QA agent: pass | fail | no-screenshot-then-pass (default pass). */
+	qa: string[];
+	qaInputs: string[];
+	/** Hang the QA agent after its screenshot (crash tests). */
+	qaHang?: boolean;
+	/** Hang the helper after its first write (crash tests). */
+	helperHang?: boolean;
+	helperRuns: number;
 }
 
 export function newControl(): Control {
-	return { reviews: [], builderNoProgress: false, builderHang: false, askFirst: false, responsePlan: [], architectDouble: false, architectNoAB: false, reviewerInputs: [], builderInputs: [], architectInputs: [], reviewerModels: [], messagesSeen: [], searchResults: [] };
+	return { reviews: [], builderNoProgress: false, builderHang: false, askFirst: false, responsePlan: [], architectDouble: false, architectNoAB: false, reviewerInputs: [], builderInputs: [], architectInputs: [], reviewerModels: [], messagesSeen: [], searchResults: [], qa: [], qaInputs: [], helperRuns: 0 };
 }
 
 const SPEC = (v: number) => `# Spec v${v}\n\nA tiny product.\n\n## Acceptance behaviours\n\n- running it prints hello\n`;
@@ -106,6 +118,8 @@ export function scripts(control: Control): Record<string, Script> {
 		if (control.builderSubagent && ctx.turn === 1 && ctx.inputs.length === 1) return call("write", { path: "round-1.txt", content: "round 1\n" });
 		if (ctx.turn === 0) {
 			const noProgress = control.builderNoProgress || (control.noProgressFromInput !== undefined && ctx.inputs.length >= control.noProgressFromInput);
+			if (!noProgress && control.runScript && ctx.inputs.length === 1)
+				return calls(["write", { path: `round-${ctx.inputs.length}.txt`, content: `round ${ctx.inputs.length}\n` }], ["write", { path: "scripts/run.sh", content: "echo product up\nsleep 60\n" }]);
 			if (!noProgress) return call("write", { path: `round-${ctx.inputs.length}.txt`, content: `round ${ctx.inputs.length}\n` });
 		}
 		const ids = [...ctx.inputs.at(-1)!.matchAll(/\[(F\d+)\] \([a-z]+, BLOCKING/g)].map((m) => m[1]!);
@@ -127,10 +141,37 @@ export function scripts(control: Control): Record<string, Script> {
 	return {
 		architect,
 		builder,
-		helper: (ctx) => {
+		"builder-textonly": builder,
+		helper: async (ctx) => {
 			if (!control.builderSubagent) return say("helper");
-			if (ctx.turn === 0) return calls(["bash", { command: "ls | wc -l" }], ["write", { path: "helper.txt", content: "x" }]);
+			if (ctx.turn === 0) {
+				control.helperRuns += 1;
+				return calls(["bash", { command: "ls | wc -l" }], ["write", { path: "helper.txt", content: "x" }]);
+			}
+			while (control.helperHang) await new Promise((r) => setTimeout(r, 50));
 			return say(`helper saw: ${ctx.results.map((r) => `${r.name}:${r.isError ? "error" : "ok"}`).join(", ")}`);
+		},
+		qa: async (ctx) => {
+			if (ctx.turn === 0) {
+				control.qaInputs.push(ctx.input);
+				return call("computer", { action: "get_window_state", args: { pid: 1, window_id: 1 } });
+			}
+			while (control.qaHang) await new Promise((r) => setTimeout(r, 50));
+			// the latest screenshot id in the whole transcript (a "[factory]" note after a crash counts as a new input)
+			const all = ctx.messages.filter((m: any) => m.role === "toolResult" && m.toolName === "computer").map((m: any) => (m.content ?? []).map((p: any) => p.text ?? "").join(""));
+			const shot = [...all.join("\n").matchAll(/Screenshot (r\d+-s\d+)/g)].at(-1)?.[1] ?? "none";
+			if (ctx.results.filter((r) => r.name === "submit_qa" && r.isError).length >= 3) return say("giving up");
+			const plan = control.qa[0] ?? "pass";
+			if (plan === "no-screenshot-then-pass" && !ctx.results.some((r) => r.name === "submit_qa")) {
+				return call("submit_qa", { verdict: "fail", findings: [{ severity: "major", blocking: true, description: "the page is blank", evidence: "opened it" }] });
+			}
+			control.qa.shift();
+			if (plan === "fail")
+				return call("submit_qa", {
+					verdict: "fail",
+					findings: [{ severity: "major", blocking: true, specRef: "Acceptance behaviours #1", description: "the hello screen is blank", evidence: "opened the app; the window is empty", screenshots: [shot] }],
+				});
+			return call("submit_qa", { verdict: "pass", findings: [{ severity: "minor", blocking: false, description: "the font is small", evidence: "looked at the window", screenshots: [shot] }] });
 		},
 		reviewer: reviewer("reviewer"),
 		"reviewer-strict": reviewer("reviewer-strict"),
@@ -140,6 +181,7 @@ export function scripts(control: Control): Record<string, Script> {
 export interface TestEnv {
 	dir: string;
 	host: LocalGitHubHost;
+	boat: LocalBoatBackend;
 	factory: Factory;
 	control: Control;
 	configPath: string;
@@ -162,12 +204,17 @@ roles:
   builder: { model: scripted/builder }
   helper: { model: scripted/helper }
   reviewer: { model: scripted/reviewer }
+  qa: { model: scripted/qa }
+qa: { enabled: false }
+boat: { apiKey: env:SF_TEST_BOAT_KEY }
 sandbox: { enabled: false }
 ci: { noChecksTimeout: 300ms }
 policy:
   approvals: []
 `,
 	);
+	process.env.SF_TEST_BOAT_KEY ??= "test-boat-key";
+	const boatBackend = new LocalBoatBackend(join(dir, "boat"));
 	const build = async () => {
 		const sp = scriptedProvider(scripts(control));
 		const models = createModels();
@@ -177,6 +224,8 @@ policy:
 			models,
 			github: new GitHub(host),
 			sandbox: new Sandbox({ stateDir: join(dir, "state", "environments") }),
+			boat: new Boat({ stateDir: join(dir, "state", "qa-vms"), backend: () => boatBackend, retryDelayMs: 10, bootWaitMs: 300 }),
+			artifactsDir: join(dir, "state", "artifacts"),
 			storage: opts.storage === "sqlite" ? { sqlite: join(dir, "factory.sqlite") } : "memory",
 			ciPollMs: 50,
 			log: (m) => process.env.SF_DEBUG && console.error(m),
@@ -187,6 +236,7 @@ policy:
 	const env: TestEnv = {
 		dir,
 		host,
+		boat: boatBackend,
 		control,
 		configPath,
 		factory: await build(),

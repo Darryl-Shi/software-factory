@@ -485,7 +485,7 @@ describe("cancel, failure, retry", () => {
 });
 
 describe("roles and isolation", () => {
-	test("read-only roles are not offered write/edit; only the builder gets report_done; helpers get no bridge tools", async () => {
+	test("fixed tool sets: read-only roles get no write/edit; only the builder gets report_done and subagent; the reviewer has no browser", async () => {
 		await setup();
 		const run = await start();
 		const v = await until(t!.factory, run, done);
@@ -493,7 +493,7 @@ describe("roles and isolation", () => {
 		const tools = async (id: string) => (await (await h.conversation(id as never, {} as never))!.agent({} as never)).tools.map((x) => x.name).sort();
 		expect(await tools(v.conversations.architect!)).toEqual(["ask_human", "bash", "read", "submit_spec", "web_search"]);
 		expect(await tools(v.conversations.builder!)).toEqual(["bash", "edit", "read", "report_done", "run_tests", "subagent", "web_search", "write"]);
-		expect(await tools(v.conversations.reviewers[0]!.id)).toEqual(["bash", "http_request", "read", "run_tests", "submit_review", "web_search"]);
+		expect(await tools(v.conversations.reviewers[0]!.id)).toEqual(["bash", "read", "run_tests", "submit_review", "web_search"]);
 	});
 
 	test("delivered artifacts: AGENTS.md pointer is the builder's job; docs/spec.md is committed by the core at SPEC_READY", async () => {

@@ -109,6 +109,17 @@ describe("settings layering", () => {
 			[G, "policy.nonsense", 1, /unknown setting/],
 			[{ project: "nope" }, "policy.reviewRoundCap", 2, /does not exist/],
 			[G, "github.identity.kind", "app", /needs identity.appId/],
+			[G, "boat.ttl", "30s", /out of range \(10m to 24h\)/],
+			[{ project: "p" }, "boat.ttl", "25h", /out of range/],
+			[G, "boat.ttl", "later", /not a duration/],
+			[G, "boat.runScripts", [], /at least one path/],
+			[G, "boat.runScripts", ["/usr/bin/run"], /repo-relative path/],
+			[G, "boat.runScripts", ["../run.sh"], /repo-relative path/],
+			[G, "boat.apiKey", "bk_live_123", /secret reference/],
+			[G, "boat.size", "huge", /expected one of small, default, large/],
+			[G, "roles.qa.model", "scripted/builder-textonly", /does not accept image input/],
+			[G, "policy.messages", ["qa"], /expected one of architect, builder, reviewer/],
+			[G, "policy.messages", ["helper"], /expected one of architect, builder, reviewer/],
 		];
 		for (const [scope, path, value, re] of bad) {
 			await expect(f.setSetting(scope, path, value), `${path}=${JSON.stringify(value)}`).rejects.toThrow(re);
@@ -133,7 +144,9 @@ describe("settings layering", () => {
 	test("settingsSchema is the fixed core schema", async () => {
 		t = await makeFactory();
 		const schema = t.factory.settingsSchema();
-		expect(Object.keys(schema)).toEqual(["version", "workdir", "roles", "policy", "github", "ci", "sandbox", "web", "webSearch", "storage"]);
+		expect(Object.keys(schema)).toEqual(["version", "workdir", "roles", "policy", "github", "ci", "sandbox", "qa", "boat", "web", "webSearch", "storage"]);
+		expect(Object.keys((schema.roles as any).fields)).toEqual(["architect", "builder", "helper", "reviewer", "qa"]);
+		expect(Object.keys((schema.boat as any).fields)).toEqual(["apiKey", "size", "ttl", "runScripts"]);
 		expect(Object.keys((schema.ci as any).fields)).toEqual(["mode", "fixRounds", "checks", "noChecksTimeout"]);
 		expect(Object.keys((schema.sandbox as any).fields)).toEqual(["enabled", "allowedDomains", "deniedDomains", "denyRead", "extraWrite", "unixSockets", "setupScripts"]);
 	});
@@ -168,10 +181,44 @@ describe("settings layering", () => {
 		await expect(makeFactory({ config: mixed })).rejects.toThrow(/^config uses removed sections \(workers\); move .*webSearch\.\*\. Also: config uses removed keys \(roles\.reviewer\.extensions\)/);
 	});
 
+	test("AQ testing and boat defaults: QA on, sonnet at medium, boat key by reference; a config without qa/boat keys gets them", async () => {
+		t = await makeFactory({ config: "version: 1\n" });
+		const s = await t.factory.getSettings(G);
+		expect(s["qa.enabled"]).toEqual({ value: true, source: "default" });
+		expect(s["boat.apiKey"]).toEqual({ value: "env:BOAT_API_KEY", source: "default" });
+		expect(s["boat.size"].value).toBe("default");
+		expect(s["boat.ttl"].value).toBe("1h");
+		expect(s["boat.runScripts"].value).toEqual(["scripts/run.sh", "bin/run"]);
+		expect(s["roles.qa.model"]).toEqual({ value: "anthropic/claude-sonnet-5-5", source: "default" });
+		expect(s["roles.qa.thinking"].value).toBe("medium");
+	});
+
+	test("roles.helper unset takes the builder's effective model and thinking (globally and per project); set, it is its own", async () => {
+		t = await makeFactory();
+		const f = t.factory;
+		await f.createProject("p", "me/p");
+		await f.unsetSetting(G, "roles.helper.model");
+		let s = await f.getSettings({ project: "p" });
+		expect(s["roles.helper.model"]).toEqual({ value: "scripted/builder", source: "default" });
+		expect(s["roles.helper.thinking"]).toEqual({ value: "high", source: "default" });
+		await f.setSetting({ project: "p" }, "roles.builder.model", "scripted/builder-textonly");
+		await f.setSetting({ project: "p" }, "roles.builder.thinking", "low");
+		s = await f.getSettings({ project: "p" });
+		expect(s["roles.helper.model"].value).toBe("scripted/builder-textonly");
+		expect(s["roles.helper.thinking"].value).toBe("low");
+		await f.setSetting(G, "roles.helper.model", "scripted/helper");
+		s = await f.getSettings({ project: "p" });
+		expect(s["roles.helper.model"]).toEqual({ value: "scripted/helper", source: "global" });
+		expect(s["roles.helper.thinking"]).toEqual({ value: "low", source: "default" });
+	});
+
 	test("roles have fixed tool sets", async () => {
 		t = await makeFactory();
 		expect(Object.keys((t.factory.settingsSchema().roles as any).fields.builder.fields)).toEqual(["model", "thinking"]);
-		expect(ROLE_TOOLS.reviewer.map((e) => e.name)).toEqual(["role-reviewer", "coding-readonly", "test-runner", "browser", "web-search"]);
+		expect(ROLE_TOOLS.reviewer.map((e) => e.name)).toEqual(["role-reviewer", "coding-readonly", "test-runner", "web-search"]);
+		expect(ROLE_TOOLS.helper.map((e) => e.name)).toEqual(["role-helper", "coding", "test-runner", "web-search"]);
+		expect(ROLE_TOOLS.qa.map((e) => e.name)).toEqual(["role-qa", "coding-readonly", "computer", "web-search"]);
+		expect(ROLE_TOOLS.builder.map((e) => e.name)).toEqual(["role-builder", "coding", "subagent", "test-runner", "web-search"]);
 	});
 
 	test("projects: createProject is idempotent, validates names and repo bindings, and rejects rebinding", async () => {

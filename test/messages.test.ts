@@ -54,6 +54,11 @@ describe("routing and validation", () => {
 		expect(at("AWAITING_APPROVAL", "delivery")).toEqual({ role: "builder", conversationId: "b" });
 		expect(at("ESCALATED")).toEqual({ role: "builder", conversationId: "b" });
 		expect(messageTarget({ state: "PREPARING", conversations: { reviewers: [] }, counters: { reviewSeq: 0 } } as never)).toEqual({ role: "architect" });
+		// the QA agent and the builder's helpers never take messages: while reviewing, a message goes to the reviewer
+		const withQa = { ...conversations, qa: [{ id: "q1", seq: 1 }] };
+		for (const state of ["REVIEWING", "BUILDING", "AWAITING_APPROVAL", "ESCALATED", "DELIVERING", "AWAITING_CI"])
+			expect(messageTarget({ state, gate: "delivery", conversations: withQa, counters: { reviewSeq: 1 } } as never).role).not.toMatch(/^(qa|helper)$/);
+		expect(messageTarget({ state: "REVIEWING", conversations: withQa, counters: { reviewSeq: 1 } } as never)).toEqual({ role: "reviewer", conversationId: "r1" });
 	});
 
 	test("invalid, not_found and conflict cases; a pending discussion question takes an answer, not a message", async () => {

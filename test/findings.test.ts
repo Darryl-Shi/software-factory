@@ -1,6 +1,6 @@
 // Findings/evidence enforcement (spec §2 "Findings", §3.4).
 import { afterEach, describe, expect, test } from "vitest";
-import { humanFindings, validateResponses, validateReview } from "../src/core/findings.ts";
+import { formatFinding, humanFindings, validateQa, validateResponses, validateReview } from "../src/core/findings.ts";
 import { makeFactory, type TestEnv } from "./helpers.ts";
 
 const ok = { severity: "major", blocking: true, specRef: "AB1", description: "broken", evidence: "$ npm test\n1 failing" };
@@ -22,12 +22,16 @@ describe("validateReview", () => {
 		const r = validateReview({ verdict: "pass", findings: [ok] });
 		expect(!r.ok && r.problems.join()).toMatch(/not allowed with blocking findings/);
 	});
-	test("every reviewer finding needs evidence and a specRef", () => {
+	test("every reviewer finding needs evidence; specRef is optional (code-quality and security findings often have none)", () => {
 		const r = validateReview({ verdict: "fail", findings: [{ ...ok, evidence: "" }, { ...ok, specRef: undefined }, { ...ok, evidence: "   " }] });
 		expect(r.ok).toBe(false);
 		const p = !r.ok ? r.problems : [];
 		expect(p.filter((x) => /evidence is required/.test(x)).length).toBe(2);
-		expect(p.filter((x) => /specRef/.test(x)).length).toBe(1);
+		expect(p.filter((x) => /specRef/.test(x)).length).toBe(0);
+		// a blocking security finding with no spec clause fails the round on its own
+		const sec = validateReview({ verdict: "fail", findings: [{ severity: "critical", blocking: true, description: "SQL injection in /search", evidence: "src/db.js:12-14 builds the query by string concatenation" }] });
+		expect(sec.ok && sec.review.findings[0]).toMatchObject({ blocking: true, source: "reviewer" });
+		expect(sec.ok && "specRef" in sec.review.findings[0]!).toBe(false);
 	});
 	test("severity, blocking and description are required; reviewers cannot pose as humans", () => {
 		const r = validateReview({ verdict: "fail", findings: [{ blocking: "yes", evidence: "x", specRef: "x" }, { ...ok, source: "human" }] });
@@ -38,6 +42,26 @@ describe("validateReview", () => {
 		expect(p).toMatch(/source "reviewer"/);
 		expect(validateReview({ verdict: "maybe", findings: [] }).ok).toBe(false);
 		expect(validateReview({ verdict: "pass" }).ok).toBe(false);
+	});
+});
+
+describe("validateQa", () => {
+	const qa = { severity: "major", blocking: true, description: "the save button does nothing", evidence: "clicked Save; the list stayed empty", screenshots: ["r1-s1"] };
+	test("a valid QA fail: source qa, screenshots kept", () => {
+		const r = validateQa({ verdict: "fail", findings: [qa] }, ["r1-s1", "r1-s2"]);
+		expect(r.ok && r.review.findings[0]).toMatchObject({ source: "qa", screenshots: ["r1-s1"] });
+	});
+	test("every QA finding needs evidence and at least one screenshot the agent took this round", () => {
+		const r = validateQa({ verdict: "fail", findings: [{ ...qa, screenshots: [] }, { ...qa, evidence: "" }, { ...qa, screenshots: ["r0-s9"] }] }, ["r1-s1"]);
+		const p = !r.ok ? r.problems.join("\n") : "";
+		expect(p).toMatch(/findings\[0\]: cite at least one screenshot/);
+		expect(p).toMatch(/findings\[1\]: evidence is required/);
+		expect(p).toMatch(/findings\[2\]: screenshot r0-s9 is not one you took this round/);
+		expect(validateQa({ verdict: "fail", findings: [{ ...qa, blocking: false }] }, ["r1-s1"]).ok).toBe(false);
+		expect(validateQa({ verdict: "pass", findings: [{ ...qa, source: "reviewer" }] }, ["r1-s1"]).ok).toBe(false);
+	});
+	test("formatFinding lists screenshot ids", () => {
+		expect(formatFinding({ ...qa, id: "F3", source: "qa" })).toContain("screenshots: r1-s1");
 	});
 });
 
@@ -115,7 +139,7 @@ describe("helpers (subagent)", () => {
 		await t?.factory.close().catch(() => {});
 		t = undefined;
 	});
-	test("the builder's helper runs with the helper role: its model, read tools incl. bash, no write tools, no bridge tools", async () => {
+	test("the builder's helper writes code in the builder's worktree: its model, write tools, no subagent, no bridge tools", async () => {
 		t = await makeFactory();
 		t.control.builderSubagent = true;
 		await t.factory.createProject("p", "me/p");
@@ -128,10 +152,17 @@ describe("helpers (subagent)", () => {
 		const results = h.items.filter((i) => i.toolResult).map((i) => [i.toolResult!.name, i.toolResult!.isError]);
 		expect(results.sort()).toEqual([
 			["bash", false],
-			["write", true],
+			["write", false],
 		]);
 		const sub = tr.items.find((i) => i.toolResult?.name === "subagent")!.toolResult!;
-		expect(sub.text).toMatch(/helper saw: (bash:ok, write:error|write:error, bash:ok)/);
+		expect(sub.text).toMatch(/helper saw: (bash:ok, write:ok|write:ok, bash:ok)/);
+		// the helper's file is in the round's diff, was reviewed, and is in the delivered repo
+		expect(t.control.reviewerInputs[0]).toContain("helper.txt");
+		const { git } = await import("../src/github/git.ts");
+		expect((await git(t.host.bare("me/p"), ["show", "main:helper.txt"])).stdout).toBe("x");
+		const agent = await (await t.factory.harnessForTests.conversation(tr.helpers[0] as never, {} as never))!.agent({} as never);
+		expect(agent.model).toEqual({ provider: "scripted", modelId: "helper" });
+		expect(agent.tools.map((x) => x.name).sort()).toEqual(["bash", "edit", "read", "run_tests", "web_search", "write"]);
 		// ids handed back as strings (CLI/JSON) work too
 		expect((await t.factory.getConversation(run, String(tr.helpers[0]))).items.length).toBe(h.items.length);
 	});

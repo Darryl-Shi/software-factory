@@ -20,7 +20,10 @@ async function crashChild(dir: string, mode: string): Promise<{ run: string; bef
 	child.stderr.on("data", (d) => (err += d));
 	const deadline = Date.now() + 30_000;
 	while (!existsSync(join(dir, "ready"))) {
-		if (Date.now() > deadline || child.exitCode !== null) throw new Error(`child did not get ready (exit ${child.exitCode}): ${err}`);
+		if (Date.now() > deadline || child.exitCode !== null) {
+			child.kill("SIGKILL");
+			throw new Error(`child did not get ready (exit ${child.exitCode}): ${err}`);
+		}
 		await new Promise((r) => setTimeout(r, 50));
 	}
 	child.kill("SIGKILL");
@@ -80,4 +83,66 @@ test("graceful close and reopen mid-discussion keeps the pending discussion ques
 	expect(v2.pendingAsk).toEqual(v1.pendingAsk);
 	await t.factory.answer(run, v2.pendingAsk!.id, "TypeScript");
 	expect((await t.factory.waitForState(run, (x) => x.state === "DELIVERED")).conversations.architect).toBe(v1.conversations.architect);
+});
+
+test("kill -9 while a helper is mid-task, after its write landed: the file survives, the same helper Conversation carries on, the run goes on to review", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "sf-crash-"));
+	const { run, before } = await crashChild(dir, "helper");
+	const helper = (before as any).helper as string;
+	expect(before.state).toBe("BUILDING");
+	expect(existsSync(join(before.workspace!.path, "helper.txt"))).toBe(true);
+	const control = newControl();
+	control.builderSubagent = true;
+	control.reviews = ["pass"];
+	t = await makeFactory({ dir, storage: "sqlite", control });
+	const v = await t.factory.waitForState(run, (x) => ["DELIVERED", "FAILED"].includes(x.state));
+	expect(v.state).toBe("DELIVERED");
+	expect(v.history.map((h) => h.to)).toEqual(["RECEIVED", "PREPARING", "DISCUSSING", "SPEC_READY", "BUILDING", "REVIEWING", "DELIVERING", "AWAITING_CI", "DELIVERED"]);
+	// the same helper Conversation resumed from its transcript: it did not start over (no new first turn)
+	const tr = await t.factory.getConversation(run, v.conversations.builder!);
+	expect(tr.helpers.map(String)).toEqual([helper]);
+	expect(control.helperRuns).toBe(0);
+	const h = await t.factory.getConversation(run, helper);
+	expect(h.items.filter((i) => i.toolResult?.name === "write").map((i) => i.toolResult!.isError)).toEqual([false]);
+	expect(readFileSync(join(v.workspace!.path, "helper.txt"), "utf8")).toBe("x");
+	expect(control.reviewerInputs[0]).toContain("helper.txt");
+});
+
+test("kill -9 while the QA agent works: the run resumes in REVIEWING with the same VM and QA Conversation, keeps the reviewer's submission, and leaves no VM", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "sf-crash-"));
+	const { run, before } = await crashChild(dir, "qa");
+	expect(before.state).toBe("REVIEWING");
+	expect(before.reviews[0]!.submitted).toEqual({ review: true, qa: false });
+	const control = newControl();
+	control.runScript = true;
+	t = await makeFactory({ dir, storage: "sqlite", control });
+	const v = await t.factory.waitForState(run, (x) => ["DELIVERED", "FAILED"].includes(x.state));
+	expect(v.state).toBe("DELIVERED");
+	expect(v.conversations.qa.map((x) => x.id)).toEqual(before.conversations.qa.map((x) => x.id));
+	expect(control.reviewerInputs).toEqual([]); // the review submitted before the crash was kept
+	expect(control.qaInputs).toEqual([]); // the QA agent carried on from its transcript
+	const creates = t.boat.state().calls.filter((c) => c.op === "create");
+	expect(creates).toHaveLength(1); // same VM (same idempotency key)
+	expect(v.reviews[0]).toMatchObject({ qaStatus: "ran", screenshots: ["r1-s1"], vm: { attempt: 1, state: "disposed" } });
+	expect((await t.boat.list()).filter((x) => x.name?.includes(run))).toEqual([]);
+});
+
+test("a QA VM deleted by hand while the factory is down is replaced on resume, and the QA agent is told", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "sf-crash-"));
+	const { run, before } = await crashChild(dir, "qa");
+	const { LocalBoatBackend } = await import("../src/boat/backend.ts");
+	const boat = new LocalBoatBackend(join(dir, "boat"));
+	const vm = (await boat.list()).find((x) => x.name === `factory-${run}-1`)!;
+	await boat.delete(vm.id);
+	const control = newControl();
+	control.runScript = true;
+	t = await makeFactory({ dir, storage: "sqlite", control });
+	const v = await t.factory.waitForState(run, (x) => ["DELIVERED", "FAILED"].includes(x.state));
+	expect(v.state).toBe("DELIVERED");
+	expect(t.boat.state().calls.filter((c) => c.op === "create")).toHaveLength(2);
+	expect(v.reviews[0]!.vm).toMatchObject({ attempt: 2, state: "disposed" });
+	expect(v.conversations.qa.map((x) => x.id)).toEqual(before.conversations.qa.map((x) => x.id));
+	const tr = await t.factory.getConversation(run, v.conversations.qa[0]!.id);
+	expect(tr.items.some((i) => i.role === "user" && /has been replaced/.test(i.text ?? ""))).toBe(true);
+	expect((await t.boat.list()).filter((x) => x.name?.includes(run))).toEqual([]);
 });

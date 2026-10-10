@@ -110,6 +110,27 @@ describe("access", () => {
 	});
 });
 
+describe("screenshots", () => {
+	test("a QA screenshot is served at /api/runs/<run>/screenshots/<id> behind the token", async () => {
+		t = await makeFactory();
+		t.control.runScript = true;
+		await t.factory.createProject("p", "me/p");
+		await t.factory.setSetting({ project: "p" }, "qa.enabled", true);
+		const run = await t.factory.startRun("p", { source: "t", title: "x", body: "x" });
+		await until(t.factory, run, inState("DELIVERED"));
+		const { port, token } = await serve();
+		const ok = await http(port, "GET", `/api/runs/${run}/screenshots/r1-s1`, { headers: { authorization: `Bearer ${token}` } });
+		expect(ok.status).toBe(200);
+		expect(ok.headers["content-type"]).toBe("image/png");
+		expect((await http(port, "GET", `/api/runs/${run}/screenshots/r1-s1`)).status).toBe(401);
+		expect((await http(port, "GET", `/api/runs/${run}/screenshots/r9-s9`, { headers: { authorization: `Bearer ${token}` } })).status).toBe(404);
+		expect((await http(port, "GET", `/api/runs/${run}/screenshots/..%2Fx`, { headers: { authorization: `Bearer ${token}` } })).status).toBe(404);
+		const viaOp = JSON.parse((await op(port, token, "getScreenshot", [run, "r1-s1"])).body);
+		expect(viaOp.result.mime).toBe("image/png");
+		expect(Buffer.from(viaOp.result.bytes, "base64").subarray(1, 4).toString()).toBe("PNG");
+	});
+});
+
 describe("operations and events", () => {
 	test("operations go through the allowlist; core errors map to HTTP statuses with their codes", async () => {
 		const { port, token } = await serve();
