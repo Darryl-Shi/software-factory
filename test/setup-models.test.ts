@@ -11,6 +11,7 @@ import { agentDirOf } from "../src/models/host.ts";
 import { discoverModels, providersInUse, readModelsJson, writeModelsJson } from "../src/setup/steps/endpoints.ts";
 import { packageChange, step } from "../src/setup/steps/models.ts";
 import { SetupCancelled } from "../src/setup/ui.ts";
+import { runSetup } from "../src/setup/wizard.ts";
 import { testContext } from "./setup-context.ts";
 import { CANCEL } from "./setup-helpers.ts";
 
@@ -19,6 +20,8 @@ afterEach(() => setDefaultSecretStore(undefined));
 const TRUST =
 	"Packages are code that runs inside the factory process, outside the sandbox, with access to its credentials. Review the source before installing.";
 const LOGIN_PKG = resolve("test/fixtures/login-provider");
+const OAUTH_PKG = resolve("test/fixtures/oauth-provider");
+const EXCHANGING = "Exchanging authorization code for tokens...";
 const PROVIDER_PKG = resolve("test/fixtures/provider-package");
 const BROKEN_PKG = resolve("test/fixtures/broken-package");
 
@@ -161,9 +164,45 @@ describe("models: logins", () => {
 		// sf-login has only an API-key login: no method prompt
 		expect(shownOf(ui, "password").map((s) => s.message)).toEqual(["SF Login key"]);
 		expect(shownOf(ui, "select").map((s) => s.message)).toEqual(["Model providers", "Log in to", "Model providers"]);
-		expect(shownOf(ui, "log.success").some((s) => s.message.includes("sf-login"))).toBe(true);
+		// the source as doctor names it
+		expect(shownOf(ui, "log.success").map((s) => s.message)).toEqual(["sf-login: logged in (auth.json (api key))"]);
 		// credentials apply live: a login needs no restart
 		expect(ctx.needsRestart).toBe(false);
+		expect(ui.remaining()).toBe(0);
+	});
+
+	test("an OAuth login whose last event is progress stops its spinner; setup exits 0", async () => {
+		const { ctx, ui, home } = testContext({ answers: ["login", "sf-oauth", "the-code", "done"] });
+		await (await ctx.host()).packages.installAndPersist(OAUTH_PKG);
+		await ctx.reloadHost();
+
+		expect(await runSetup(ctx, "models")).toBe(0);
+
+		expect(authJson(home)["sf-oauth"]).toMatchObject({ type: "oauth", access: "access-the-code" });
+		// only an OAuth login: no method prompt
+		expect(shownOf(ui, "select").map((s) => s.message)).toEqual(["Model providers", "Log in to", "Model providers"]);
+		expect(shownOf(ui, "spinner").map((s) => s.message)).toEqual([`start: ${EXCHANGING}`, `stop: ${EXCHANGING}`]);
+		const stopAt = ui.shown.findIndex((s) => s.kind === "spinner" && s.message.startsWith("stop:"));
+		const successAt = ui.shown.findIndex((s) => s.kind === "log.success");
+		expect(stopAt).toBeGreaterThan(-1);
+		expect(stopAt).toBeLessThan(successAt);
+		expect(shownOf(ui, "log.success").map((s) => s.message)).toEqual(["sf-oauth: logged in (auth.json (OAuth))"]);
+		expect(ui.remaining()).toBe(0);
+	});
+
+	test("an OAuth login failing after a progress event stops its spinner before the error and the Retry / Skip prompt", async () => {
+		const { ctx, ui, home } = testContext({ answers: ["login", "sf-oauth", "bad", "skip", "done"] });
+		await (await ctx.host()).packages.installAndPersist(OAUTH_PKG);
+		await ctx.reloadHost();
+		await step.run(ctx);
+		expect(authJson(home)["sf-oauth"]).toBeUndefined();
+		expect(ui.shown.map((s) => [s.kind, s.message]).slice(-5)).toEqual([
+			["spinner", `start: ${EXCHANGING}`],
+			["spinner", `stop: ${EXCHANGING}`],
+			["log.error", "sf-oauth: token exchange failed"],
+			["select", "Logging in to sf-oauth failed"],
+			["select", "Model providers"],
+		]);
 		expect(ui.remaining()).toBe(0);
 	});
 
@@ -264,6 +303,26 @@ describe("models: logins", () => {
 		expect(stored).toEqual(["sf-login"]);
 		expect(authJson(home)["sf-login"]).toBeUndefined();
 		expect(await (await ctx.host()).models.listCredentials()).toEqual([]);
+		expect(ui.remaining()).toBe(0);
+	});
+
+	test("a logout whose snapshot refresh fails still succeeds: the credential is deleted", async () => {
+		// pi deletes the credential, then refreshing its snapshot fails (CredentialSynchronizationError)
+		const logout = ModelRuntime.prototype.logout;
+		const spy = vi.spyOn(ModelRuntime.prototype, "logout").mockImplementationOnce(async function (this: ModelRuntime, ...args) {
+			await logout.apply(this, args);
+			throw new CredentialSynchronizationError(args[0], "logout", undefined, { cause: new Error("refresh failed") });
+		});
+		onTestFinished(() => spy.mockRestore());
+		const { ctx, ui, home } = testContext({ answers: ["logout", "orphan", "done"] });
+		writeAuthJson(home, { orphan: { type: "api_key", key: "k" } });
+
+		expect(await runSetup(ctx, "models")).toBe(0);
+
+		expect(spy).toHaveBeenCalledTimes(1);
+		expect(authJson(home).orphan).toBeUndefined();
+		expect(shownOf(ui, "log.success").map((s) => s.message)).toEqual(["logged out of orphan"]);
+		expect(shownOf(ui, "log.error")).toEqual([]);
 		expect(ui.remaining()).toBe(0);
 	});
 
@@ -748,6 +807,31 @@ describe("models: compatible endpoints", () => {
 		expect(ui.remaining()).toBe(0);
 	});
 
+	test("a progress event at the end of the endpoint's key login is stopped before the next prompt", async () => {
+		const srv = await server(endpoint(["a"]));
+		const login = ModelRuntime.prototype.login;
+		const spy = vi.spyOn(ModelRuntime.prototype, "login").mockImplementationOnce(async function (this: ModelRuntime, ...args) {
+			const credential = await login.apply(this, args);
+			args[2].notify({ type: "progress", message: "Saving the key" });
+			return credential;
+		});
+		onTestFinished(() => spy.mockRestore());
+		const { ctx, ui, home } = testContext({
+			fetch: realFetch,
+			answers: ["add-endpoint", "my-ep", "My EP", "openai-completions", srv.base, "key", "k1", ["a"], "", ...MODEL_DEFAULTS, false, "done"],
+		});
+		await step.run(ctx);
+		expect(authJson(home)["my-ep"]).toEqual({ type: "api_key", key: "k1" });
+		const shown = ui.shown.map((s) => [s.kind, s.message]);
+		const at = shown.findIndex(([k, m]) => k === "spinner" && m === "start: Saving the key");
+		expect(shown.slice(at, at + 3)).toEqual([
+			["spinner", "start: Saving the key"],
+			["spinner", "stop: Saving the key"],
+			["confirm", "Send a test request to my-ep/a?"],
+		]);
+		expect(ui.remaining()).toBe(0);
+	});
+
 	test("adding an endpoint clears a stale stored credential for its id", async () => {
 		const b = await server(endpoint(["a"], replyOk));
 		const { ctx, ui, home } = testContext({
@@ -811,6 +895,30 @@ describe("models: compatible endpoints", () => {
 		expect(ui.remaining()).toBe(0);
 	});
 
+	test("removing a models.json override of a built-in provider keeps the built-in's credential", async () => {
+		const { ctx, ui, home } = testContext({
+			answers: [
+				"remove-endpoint",
+				(o: Opts) => {
+					expect(o.options!.map((x) => x.value)).toEqual(["openrouter"]);
+					return "openrouter";
+				},
+				"done",
+			],
+		});
+		const oauth = { type: "oauth", access: "a", refresh: "r", expires: Date.now() + 86_400_000 };
+		writeModelsJson(agentDirOf(home), { providers: { openrouter: { baseUrl: "http://127.0.0.1:9/api/v1" } } });
+		writeAuthJson(home, { openrouter: oauth });
+		await ctx.reloadHost();
+		await step.run(ctx);
+		expect(readModelsJson(agentDirOf(home)).providers).toEqual({});
+		expect(authJson(home).openrouter).toEqual(oauth);
+		expect((await ctx.host()).models.getProvider("openrouter")).toBeDefined();
+		expect(shownOf(ui, "log.success").map((s) => s.message)).toEqual(["removed openrouter from models.json"]);
+		expect(ctx.needsRestart).toBe(true);
+		expect(ui.remaining()).toBe(0);
+	});
+
 	test("remove endpoint deletes its entry and keeps the others", async () => {
 		const { ctx, ui, home } = testContext({ answers: ["remove-endpoint", "my-ep", "done"] });
 		const other = { baseUrl: "http://127.0.0.1:9/v1", api: "openai-completions", models: [{ id: "x" }] };
@@ -842,8 +950,8 @@ describe("models: status", () => {
 		await (await ctx.host()).models.login("sf-login", "api_key", { prompt: async () => "k", notify: () => {} });
 		const s = await step.status(ctx);
 		expect(s.state).toBe("ok");
-		expect(s.detail).toContain("anthropic");
-		expect(s.detail).toContain("sf-login");
+		// sources as doctor names them
+		expect(s.detail).toBe("anthropic (env:ANTHROPIC_API_KEY), openai (env:OPENAI_API_KEY), sf-login (auth.json (api key))");
 	});
 });
 

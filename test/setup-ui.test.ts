@@ -96,6 +96,32 @@ describe("authInteraction", () => {
 		expect(body).toContain("Docs: https://docs.example");
 		expect(body).toContain("https://plain.example");
 	});
+
+	test("close() stops a spinner left running by a final progress event (pi-ai's OAuth flows end on one)", () => {
+		const ui = new ScriptedUi([]);
+		const auth = authInteraction(ui);
+		auth.notify({ type: "progress", message: "Exchanging authorization code for tokens..." });
+		auth.close();
+		auth.close(); // idempotent
+		expect(ui.shown.map((s) => [s.kind, s.message])).toEqual([
+			["spinner", "start: Exchanging authorization code for tokens..."],
+			["spinner", "stop: Exchanging authorization code for tokens..."],
+		]);
+	});
+
+	test("close() without a running spinner shows nothing", async () => {
+		const ui = new ScriptedUi(["k"]);
+		const auth = authInteraction(ui);
+		auth.close();
+		auth.notify({ type: "progress", message: "Checking" });
+		await auth.prompt({ type: "secret", message: "Key" });
+		auth.close();
+		expect(ui.shown.map((s) => [s.kind, s.message])).toEqual([
+			["spinner", "start: Checking"],
+			["spinner", "stop: Checking"],
+			["password", "Key"],
+		]);
+	});
 });
 
 describe("ScriptedUi", () => {

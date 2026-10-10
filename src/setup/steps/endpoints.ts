@@ -325,7 +325,12 @@ export async function addEndpoint(ctx: SetupContext): Promise<void> {
 	if (key !== undefined) {
 		for (;;) {
 			try {
-				await next.models.login(id, "api_key", prefilledKey(authInteraction(ui), key));
+				const auth = authInteraction(ui);
+				try {
+					await next.models.login(id, "api_key", prefilledKey(auth, key));
+				} finally {
+					auth.close();
+				}
 				break;
 			} catch (e) {
 				const cancel = cancelOf(e);
@@ -373,7 +378,10 @@ export async function addEndpoint(ctx: SetupContext): Promise<void> {
 	ui.log.success(`added ${id} with ${ids.length} model${ids.length === 1 ? "" : "s"}`);
 }
 
-/** Remove a compatible endpoint: refused while a role uses it. */
+/**
+ * Remove a compatible endpoint: refused while a role uses it. models.json may also hold a hand-written override of a
+ * built-in id (`openrouter: { baseUrl }`); the credential then belongs to the built-in, which remains, so it stays.
+ */
 export async function removeEndpoint(ctx: SetupContext): Promise<void> {
 	const { ui } = ctx;
 	const host = await ctx.host();
@@ -392,11 +400,11 @@ export async function removeEndpoint(ctx: SetupContext): Promise<void> {
 		ui.log.error(inUseMessage(id, paths));
 		return;
 	}
-	// Its stored key goes too: left behind, it would be sent to the next provider that takes this id.
-	const keyRemoved = await clearCredential(host.models, id);
 	delete doc.providers[id];
 	writeModelsJson(host.agentDir, doc);
 	ctx.needsRestart = true;
-	await ctx.reloadHost();
+	const next = await ctx.reloadHost();
+	// Its stored key goes too: left behind, it would be sent to the next provider that takes this id.
+	const keyRemoved = !next.models.getProvider(id) && (await clearCredential(next.models, id));
 	ui.log.success(`removed ${id} from models.json${keyRemoved ? " and its key from auth.json" : ""}`);
 }

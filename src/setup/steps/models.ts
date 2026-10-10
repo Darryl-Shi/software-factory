@@ -4,12 +4,14 @@ import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type { AuthType } from "@earendil-works/pi-ai";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { authSource } from "../../doctor.ts";
 import type { ModelHost } from "../../models/host.ts";
 import type { SetupContext, Step, StepStatus } from "../context.ts";
 import { authInteraction } from "../ui.ts";
 import {
 	addEndpoint,
 	cancelOf,
+	clearCredential,
 	errorMessage,
 	inUseMessage,
 	ModelsJsonError,
@@ -86,10 +88,15 @@ async function login(ctx: SetupContext, id: string): Promise<boolean> {
 	for (;;) {
 		try {
 			const models = (await ctx.host()).models;
-			await models.login(id, type, authInteraction(ui));
+			const auth = authInteraction(ui);
+			try {
+				await models.login(id, type, auth);
+			} finally {
+				auth.close();
+			}
 			const check = await models.checkAuth(id);
 			if (!check) throw new Error("the login finished, but no credentials resolve");
-			ui.log.success(`${id}: logged in (${check.source ?? check.type})`);
+			ui.log.success(`${id}: logged in (${authSource(check) ?? check.type})`);
 			return true;
 		} catch (e) {
 			const cancel = cancelOf(e);
@@ -135,7 +142,8 @@ async function logout(ctx: SetupContext): Promise<void> {
 	});
 	const paths = providersInUse(await ctx.settings()).get(id);
 	if (paths?.length && !(await ui.confirm({ message: `${id} is used by ${paths.join(", ")}; log out anyway?`, initial: false }))) return;
-	await models.logout(id);
+	// tolerates a failed snapshot refresh after the delete, like an endpoint removal
+	await clearCredential(models, id);
 	ui.log.success(`logged out of ${id}`);
 }
 
@@ -323,7 +331,7 @@ async function status(ctx: SetupContext): Promise<StepStatus> {
 	const missing: string[] = [];
 	for (const id of roleProviders(await ctx.settings())) {
 		const check = await models.checkAuth(id).catch(() => undefined);
-		if (check) ok.push(`${id} (${check.source ?? check.type})`);
+		if (check) ok.push(`${id} (${authSource(check) ?? check.type})`);
 		else missing.push(id);
 	}
 	if (missing.length) return { state: "missing", detail: `no credentials for ${missing.join(", ")}` };

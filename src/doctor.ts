@@ -23,8 +23,11 @@ export function formatDoctorLine(l: DoctorLine): string {
 	return `${l.level === "ok" ? "ok  " : l.level}  ${l.text}`;
 }
 
-/** Where a provider's credential comes from: `env:NAME`, `auth.json (api key)`, `auth.json (OAuth)` or pi's label. */
-function authSource(a: AuthCheck): string | undefined {
+/**
+ * Where a provider's credential comes from: `env:NAME`, `auth.json (api key)`, `auth.json (OAuth)` or pi's label.
+ * Setup's login messages and models status use it too, so both name sources alike (spec §3.1).
+ */
+export function authSource(a: AuthCheck): string | undefined {
 	if (a.type === "oauth") return "auth.json (OAuth)";
 	if (a.source === "stored credential") return "auth.json (api key)";
 	if (a.source && /^[A-Z][A-Z0-9_]*$/.test(a.source)) return `env:${a.source}`;
