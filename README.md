@@ -96,8 +96,9 @@ bin/factory serve        # starts the factory in the background and prints the w
 ```
 
 If setup installed the service, the factory is already running and setup prints the link instead; skip
-`bin/factory serve`. Open the link. **Create** a ticket with a project name, its repo (`owner/name`; created at the first delivery if it
-doesn't exist) and the request, then answer the architect's questions and the approvals in the run view.
+`bin/factory serve`. Open the link. **Create** a ticket with a project name, its repo (`owner/name`; created at the
+first delivery if it doesn't exist) and the request, then answer the architect's questions and the approvals in the
+run view.
 
 ## Commands
 

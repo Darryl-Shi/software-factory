@@ -132,7 +132,7 @@ All of these live under `sandbox`.
 | `enabled` | `true` | Wrap every command in `@anthropic-ai/sandbox-runtime`. Turn it off only where no sandbox is available. |
 | `allowedDomains` | `[registry.npmjs.org, pypi.org, files.pythonhosted.org, proxy.golang.org]` | Only these domains are reachable. |
 | `deniedDomains` | `[]` | Always denied; overrides allows. |
-| `denyRead` | `[~/.factory, ~/.ssh, ~/.config/gh]` | Paths hidden from every role. `~/.factory`, `~/.ssh` and the factory home are always hidden as well, so `secrets.json` and `pi/` (with `auth.json`) stay hidden when `--config` points elsewhere. |
+| `denyRead` | `[~/.factory, ~/.ssh, ~/.config/gh]` | Paths hidden from every role. The factory home is always hidden as well, so `secrets.json` and `pi/` (with `auth.json`) stay hidden when `--config` points elsewhere. |
 | `extraWrite` | `[]` | Extra writable paths for the builder. Rejected if it would make home or `/` writable, or overlap a denied path. |
 | `unixSockets` | `auto` | Linux only: `block`, `allow`, or `auto`, which relaxes the setting if the host forbids nested user namespaces (DEVIATIONS.md §7). |
 | `setupScripts` | `[scripts/setup.sh, setup.sh, bin/setup]` | The first one that exists in the worktree runs when the builder's environment is provisioned (sandboxed, with the builder's rights). |
@@ -373,7 +373,8 @@ machine is to leave `webSearch.apiKey` unresolved (for the default `env:PARALLEL
 `factory doctor` prints the same message as a `FAIL` line. Any other unknown key fails validation on save as before.
 
 A config without `qa` or `boat` keys takes their defaults, so **AQ testing is on and needs a boat.dev key**
-(`factory setup qa`, or `BOAT_API_KEY`) after upgrading. Set `qa: { enabled: false }` (globally or per project) to keep the old behaviour. Runs already in flight
+(`factory setup qa`, or `BOAT_API_KEY`) after upgrading. Set `qa: { enabled: false }` (globally or per project) to
+keep the old behaviour. Runs already in flight
 keep their pinned config and stay QA-off. An unset `roles.helper` now means the builder's model.
 
 **Finish or cancel in-flight runs before upgrading.** Runs started before this change are not migrated: their pinned
