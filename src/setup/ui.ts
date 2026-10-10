@@ -16,6 +16,9 @@ export interface SetupUi {
 	spinner(): { start(m: string): void; stop(m: string): void };
 }
 
+/** Printed when the user cancels setup (spec §5). */
+export const CANCEL_MESSAGE = "setup cancelled; completed sections were saved";
+
 /** The user cancelled a prompt (Ctrl-C). */
 export class SetupCancelled extends Error {
 	constructor() {
@@ -92,18 +95,41 @@ export class ClackUi implements SetupUi {
 		return unwrap(r);
 	}
 
-	/** Starting a running spinner again updates its message. */
+	/**
+	 * Starting a running spinner again updates its message. Ctrl-C while it runs ends setup with 130 and the cancel
+	 * message (spec §5): in raw mode clack's block() calls process.exit(0), caught by the exit listener; otherwise
+	 * clack's SIGINT handler only stops the spinner, so onCancel exits.
+	 */
 	spinner(): { start(m: string): void; stop(m: string): void } {
-		const s = clack.spinner();
+		const cancel = () => {
+			process.removeListener("exit", onExit);
+			s.cancel(clack.settings.messages.cancel);
+			clack.log.warn(CANCEL_MESSAGE);
+			process.exitCode = 130;
+		};
+		// Only a clean exit is a cancel; a crash keeps its own exit code.
+		const onExit = (code: number) => {
+			if (code === 0) cancel();
+		};
+		const s = clack.spinner({
+			onCancel: () => {
+				cancel();
+				process.exit(130);
+			},
+		});
 		let running = false;
 		return {
 			start(m: string) {
-				if (running) s.message(m);
-				else s.start(m);
+				if (running) return s.message(m);
+				// Registered before clack's own exit listener, so the spinner line ends as cancelled.
+				process.on("exit", onExit);
+				s.start(m);
 				running = true;
 			},
 			stop(m: string) {
-				if (running) s.stop(m);
+				if (!running) return;
+				process.removeListener("exit", onExit);
+				s.stop(m);
 				running = false;
 			},
 		};
