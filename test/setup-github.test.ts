@@ -11,7 +11,9 @@ import { setDefaultSecretStore } from "../src/core/settings.ts";
 import { GhApiHost } from "../src/github/host.ts";
 import { runCommand } from "../src/setup/context.ts";
 import { step } from "../src/setup/steps/github.ts";
+import { SetupCancelled } from "../src/setup/ui.ts";
 import { testContext } from "./setup-context.ts";
+import { CANCEL } from "./setup-helpers.ts";
 
 afterEach(() => {
 	setDefaultSecretStore(undefined);
@@ -71,6 +73,8 @@ process.exit(r.status >= 400 ? 1 : 0);
 }
 
 const octo = { status: 200, body: { login: "octo" }, headers: { "x-oauth-scopes": "repo, read:org" } };
+const octoAll = { status: 200, body: { login: "octo" }, headers: { "x-oauth-scopes": "repo, workflow" } };
+const BAD_ROLE = "version: 1\nroles:\n  builder:\n    model: nope/x\n";
 const messages = (shown: { kind: string; message: string }[], kind: string) => shown.filter((s) => s.kind === kind).map((s) => s.message);
 
 describe("GhApiHost.whoami", () => {
@@ -95,10 +99,10 @@ describe("GhApiHost.whoami", () => {
 });
 
 describe("setup github", () => {
-	test("pasted token is trimmed, stored as store:github, verified, workflow warning shown", async () => {
+	test("pasted token is trimmed, stored as store:github, verified, workflow warning shown, save anyway saves", async () => {
 		const gh = fakeGh();
 		gh.route("GET /user", octo);
-		const { ctx, ui } = testContext({ answers: ["pat", "paste", "", "  ghp_abc\n", "private"], env: { PATH: gh.path }, run: runCommand });
+		const { ctx, ui } = testContext({ answers: ["pat", "paste", "", "  ghp_abc\n", "save", "private"], env: { PATH: gh.path }, run: runCommand });
 		await step.run(ctx);
 		expect(ctx.secrets.get("github")).toBe("ghp_abc");
 		const raw = (await ctx.settings()).raw();
@@ -159,9 +163,14 @@ describe("setup github", () => {
 	test("env choice keeps env:GH_TOKEN", async () => {
 		const gh = fakeGh();
 		gh.route("GET /user", octo);
-		const { ctx, ui } = testContext({ answers: ["pat", "env", "private"], env: { PATH: gh.path, GH_TOKEN: "ghp_fromenv" }, run: runCommand });
+		gh.route("GET /user", octoAll);
+		let sourceOptions: { value: string; hint?: string }[] = [];
+		const pickEnv = (o: { options: { value: string; hint?: string }[] }) => ((sourceOptions = o.options), "env");
+		const { ctx, ui } = testContext({ answers: ["pat", pickEnv, "private"], env: { PATH: gh.path, GH_TOKEN: "ghp_fromenv" }, run: runCommand });
 		await step.run(ctx);
 		expect(ui.shown.filter((s) => s.kind === "select")[1]!.options).toEqual(["paste", "env"]);
+		expect(sourceOptions.find((o) => o.value === "env")!.hint).toBe("not seen by a service");
+		expect(messages(ui.shown, "log.warn")).toEqual([]);
 		expect((await ctx.settings()).raw().github.identity).toEqual({ kind: "pat", tokenRef: "env:GH_TOKEN" });
 		expect(ctx.secrets.get("github")).toBeUndefined();
 		expect(gh.calls().find((c) => c.args[0] === "api")!.token).toBe("ghp_fromenv");
@@ -222,6 +231,73 @@ describe("setup github", () => {
 			srv.close();
 		}
 	});
+
+	test("a gho_ token imported from gh is scope-checked; retry asks again, skip leaves everything unchanged", async () => {
+		const gh = fakeGh();
+		gh.authToken("gho_imported");
+		gh.route("GET /user", { status: 200, body: { login: "octo" }, headers: { "x-oauth-scopes": "read:org" } });
+		const { ctx, ui, home } = testContext({ answers: ["pat", "gh", "retry", "gh", "skip"], env: { PATH: gh.path }, run: runCommand });
+		await step.run(ctx);
+		const warns = messages(ui.shown, "log.warn");
+		expect(warns.filter((w) => /\brepo scope\b/.test(w))).toHaveLength(2);
+		expect(warns.filter((w) => /\bworkflow scope\b/.test(w))).toHaveLength(2);
+		const selects = ui.shown.filter((s) => s.kind === "select");
+		expect(selects.map((s) => s.options)).toEqual([["pat", "bot", "app"], ["paste", "gh"], ["retry", "save", "skip"], ["paste", "gh"], ["retry", "save", "skip"]]);
+		expect(ctx.secrets.get("github")).toBeUndefined();
+		expect(readFileSync(join(home, "config.yaml"), "utf8")).toBe("version: 1\n");
+		expect(ui.remaining()).toBe(0);
+	});
+
+	test("Ctrl-C at the missing-scopes choice cancels the step; nothing is written", async () => {
+		const gh = fakeGh();
+		gh.authToken("gho_imported");
+		gh.route("GET /user", { status: 200, body: { login: "octo" }, headers: { "x-oauth-scopes": "read:org" } });
+		const { ctx, ui, home } = testContext({ answers: ["pat", "gh", CANCEL], env: { PATH: gh.path }, run: runCommand });
+		await expect(step.run(ctx)).rejects.toBeInstanceOf(SetupCancelled);
+		expect(ui.shown.filter((s) => s.kind === "select").at(-1)!.message).toBe("The token is missing scopes");
+		expect(messages(ui.shown, "log.error")).toEqual([]);
+		expect(ctx.secrets.keys()).toEqual([]);
+		expect(readFileSync(join(home, "config.yaml"), "utf8")).toBe("version: 1\n");
+	});
+
+	test("Ctrl-C at the verification-failed choice cancels the step", async () => {
+		const gh = fakeGh();
+		gh.route("GET /user", { status: 401, body: { message: "Bad credentials" } });
+		const { ctx, home } = testContext({ answers: ["pat", "paste", "ghp_bad", CANCEL], env: { PATH: gh.path }, run: runCommand });
+		await expect(step.run(ctx)).rejects.toBeInstanceOf(SetupCancelled);
+		expect(ctx.secrets.keys()).toEqual([]);
+		expect(readFileSync(join(home, "config.yaml"), "utf8")).toBe("version: 1\n");
+	});
+
+	test("a token with every scope saves without asking", async () => {
+		const gh = fakeGh();
+		gh.authToken("gho_imported");
+		gh.route("GET /user", octoAll);
+		const { ctx, ui } = testContext({ answers: ["pat", "gh", "private"], env: { PATH: gh.path }, run: runCommand });
+		await step.run(ctx);
+		expect(ctx.secrets.get("github")).toBe("gho_imported");
+		expect(messages(ui.shown, "log.warn")).toEqual([]);
+		expect(ui.remaining()).toBe(0);
+	});
+
+	for (const previous of ["ghp_old", undefined]) {
+		test(`a save the config rejects restores the secret (${previous ? "previously set" : "previously absent"}) and returns normally`, async () => {
+			const gh = fakeGh();
+			gh.route("GET /user", octoAll);
+			const { ctx, ui, home } = testContext({ answers: ["pat", "paste", "ghp_new", "public"], config: BAD_ROLE, env: { PATH: gh.path }, run: runCommand });
+			if (previous) ctx.secrets.set("github", previous);
+			await expect(step.run(ctx)).resolves.toBeUndefined();
+			expect(ctx.secrets.get("github")).toBe(previous);
+			expect(ctx.secrets.keys()).toEqual(previous ? ["github"] : []);
+			expect(readFileSync(join(home, "config.yaml"), "utf8")).toBe(BAD_ROLE);
+			const errors = messages(ui.shown, "log.error");
+			expect(errors).toHaveLength(1);
+			expect(errors[0]).toContain("roles.builder.model: nope/x");
+			expect(errors[0]).toContain("fix the problem (e.g. factory setup roles), then run factory setup github");
+			expect(messages(ui.shown, "log.success")).not.toContain(expect.stringContaining("Saved"));
+			expect(ui.remaining()).toBe(0);
+		});
+	}
 
 	test("status: missing names the ref when the credential does not resolve", async () => {
 		const { ctx } = testContext({ answers: [] });

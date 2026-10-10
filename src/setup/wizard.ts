@@ -67,6 +67,12 @@ function runningUrl(ctx: SetupContext): string | undefined {
 	return readFileSync(file, "utf8").trim() || undefined;
 }
 
+/** Whether the service section reports the service installed and active (its only `ok` state). */
+async function serviceActive(ctx: SetupContext, steps: Step[]): Promise<boolean> {
+	const step = steps.find((s) => s.name === "service");
+	return step !== undefined && (await statusOf(step, ctx)).state === "ok";
+}
+
 /** Refusals before any prompt: legacy config sections, and a secrets.json with a bad mode or that does not parse. */
 function precheck(ctx: SetupContext): string | undefined {
 	try {
@@ -116,7 +122,7 @@ export async function runSetup(ctx: SetupContext, section?: string, steps: Step[
 		}
 		ui.note((await ctx.doctor()).map(formatDoctorLine).join("\n"), "Checks");
 		const url = runningUrl(ctx);
-		const end = url ? `factory is running: ${url}` : "next: factory serve";
+		const end = url ? `factory is running: ${url}` : (await serviceActive(ctx, steps)) ? "the service is starting; factory web prints the link" : "next: factory serve";
 		ui.outro(restartPending && ctx.daemon.pid() !== undefined ? `${end}\nrestart the factory to load the new providers` : end);
 		return 0;
 	} catch (e) {

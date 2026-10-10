@@ -47,6 +47,16 @@ describe("SecretStore", () => {
 		expect(readFileSync(file, "utf8")).toBe("{oops");
 	});
 
+	test("a stale 0644 temp file does not make secrets.json 0644", () => {
+		const file = secretsPath(tmp());
+		writeFileSync(`${file}.${process.pid}.tmp`, "stale", { mode: 0o644 });
+		chmodSync(`${file}.${process.pid}.tmp`, 0o644);
+		const store = new SecretStore(file);
+		store.set("github", "t");
+		expect(statSync(file).mode & 0o777).toBe(0o600);
+		expect(store.get("github")).toBe("t");
+	});
+
 	test("rejects bad keys", () => {
 		const store = new SecretStore(secretsPath(tmp()));
 		expect(() => store.set("Bad_Key", "v")).toThrow();

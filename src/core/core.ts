@@ -687,7 +687,7 @@ export class Factory implements FactoryCore {
 			if (!isObj(r) || r.model === undefined) continue;
 			const [provider, ...rest] = String(r.model ?? "").split("/");
 			if (!provider || rest.length === 0) problems.push(`roles.${role}.model: expected provider/modelId`);
-			else if (!this.opts.models.getModel(provider, rest.join("/"))) problems.push(`roles.${role}.model: ${r.model} is not a model createModels() knows`);
+			else if (!this.opts.models.getModel(provider, rest.join("/"))) problems.push(`roles.${role}.model: ${r.model} is not a model the model host knows (log in or add it with factory setup models)`);
 			else if (role === "qa" && !this.acceptsImages(String(r.model))) problems.push(`roles.qa.model: ${r.model} does not accept image input (the QA agent works from screenshots)`);
 		}
 		if (isObj(eff.boat)) problems.push(...boatProblems(eff.boat).map((p) => `boat.${p}`));

@@ -4,8 +4,10 @@
 import { readFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { resolveSecret } from "../../core/settings.ts";
+import { FactoryError } from "../../core/types.ts";
 import { GhApiHost, type Identity } from "../../github/host.ts";
 import type { SetupContext, Step } from "../context.ts";
+import { SetupCancelled } from "../ui.ts";
 
 type Kind = "pat" | "bot" | "app";
 type Visibility = "private" | "public";
@@ -47,10 +49,10 @@ function currentGithub(raw: Record<string, any>): { identity: Identity; visibili
 	return { identity: (raw.github?.identity ?? {}) as Identity, visibility: raw.github?.visibility === "public" ? "public" : "private" };
 }
 
-/** Retry / Save anyway / Skip after a failed check (spec §3.4); Retry is the default. */
-async function afterFailure(ctx: SetupContext): Promise<"retry" | "save" | "skip"> {
+/** Retry / Save anyway / Skip after a failed check (spec §3.4, §5); Retry is the default. */
+async function afterFailure(ctx: SetupContext, message = "Verification failed"): Promise<"retry" | "save" | "skip"> {
 	return ctx.ui.select({
-		message: "Verification failed",
+		message,
 		options: [
 			{ value: "retry", label: "Retry" },
 			{ value: "save", label: "Save anyway" },
@@ -84,7 +86,7 @@ async function tokenCredential(ctx: SetupContext, kind: "pat" | "bot", current: 
 	const ghToken = gh.code === 0 ? gh.stdout.trim() : "";
 	if (ghToken) options.push({ value: "gh", label: "Import from gh auth token", hint: "the token gh is logged in with" });
 	const envToken = ctx.env.GH_TOKEN?.trim();
-	if (envToken) options.push({ value: "env", label: "Keep env:GH_TOKEN", hint: "read from the environment at use" });
+	if (envToken) options.push({ value: "env", label: "Keep env:GH_TOKEN", hint: "not seen by a service" });
 	const source = await ctx.ui.select({
 		message: "Where does the token come from?",
 		options,
@@ -95,8 +97,12 @@ async function tokenCredential(ctx: SetupContext, kind: "pat" | "bot", current: 
 	return { collected: { identity: { kind, tokenRef: "store:github" }, secrets: { github: token } }, token };
 }
 
-/** Verifies a PAT with `GET /user`; warns about missing classic scopes, lists fine-grained permissions. */
-async function verifyToken(ctx: SetupContext, token: string): Promise<void> {
+/**
+ * Verifies a token with `GET /user` and lists a fine-grained token's permissions. When GitHub reports the token's
+ * scopes (a classic `ghp_` token, a `gho_` token from gh), a missing `repo` or `workflow` scope is warned about and
+ * the result is false.
+ */
+async function verifyToken(ctx: SetupContext, token: string): Promise<boolean> {
 	const spin = ctx.ui.spinner();
 	spin.start("Checking the token");
 	let me: { login: string; scopes: string[] | undefined };
@@ -106,12 +112,20 @@ async function verifyToken(ctx: SetupContext, token: string): Promise<void> {
 		spin.stop("Checked the token");
 	}
 	ctx.ui.log.success(`Authenticated as ${me.login}`);
-	if (token.startsWith("ghp_") && me.scopes) {
-		if (!me.scopes.includes("repo")) ctx.ui.log.warn("the token lacks the repo scope; the factory cannot create private repos or push");
-		if (!me.scopes.includes("workflow")) ctx.ui.log.warn("the token lacks the workflow scope; pushing changes to .github/workflows will fail");
-	}
 	if (token.startsWith("github_pat_"))
 		ctx.ui.note(["A fine-grained token needs these repository permissions:", ...FINE_GRAINED_PERMISSIONS.map((p) => `- ${p}`)].join("\n"), "Fine-grained token");
+	// A fine-grained token has permissions, not scopes (listed above), whatever the header says.
+	if (!me.scopes || token.startsWith("github_pat_")) return true;
+	let ok = true;
+	if (!me.scopes.includes("repo")) {
+		ctx.ui.log.warn("the token lacks the repo scope; the factory cannot create private repos or push");
+		ok = false;
+	}
+	if (!me.scopes.includes("workflow")) {
+		ctx.ui.log.warn("the token lacks the workflow scope; pushing changes to .github/workflows will fail");
+		ok = false;
+	}
+	return ok;
 }
 
 /** Resolves a user-entered path: `~` against the user's home, relative paths against the working directory. */
@@ -148,7 +162,7 @@ async function appCredential(ctx: SetupContext, current: Identity): Promise<{ co
 }
 
 /** Verifies an App by minting an installation token; the key is read from the file, so nothing is stored yet. */
-async function verifyApp(ctx: SetupContext, id: Identity, keyFile: string): Promise<void> {
+async function verifyApp(ctx: SetupContext, id: Identity, keyFile: string): Promise<boolean> {
 	const spin = ctx.ui.spinner();
 	spin.start("Minting an installation token");
 	try {
@@ -157,13 +171,15 @@ async function verifyApp(ctx: SetupContext, id: Identity, keyFile: string): Prom
 		spin.stop("Minted an installation token");
 	}
 	ctx.ui.log.success(`GitHub App ${id.appId} can act on installation ${id.installationId}`);
+	return true;
 }
 
 /** Collects and verifies a credential; undefined when the user skips. */
 async function credential(ctx: SetupContext, kind: Kind, current: Identity): Promise<Collected | undefined> {
 	for (;;) {
 		let collected: Collected;
-		let verify: () => Promise<void>;
+		/** True when verified; false (after warning) when the credential works but lacks a scope; throws on failure. */
+		let verify: () => Promise<boolean>;
 		if (kind === "app") {
 			const app = await appCredential(ctx, current);
 			collected = app.collected;
@@ -173,16 +189,20 @@ async function credential(ctx: SetupContext, kind: Kind, current: Identity): Pro
 			collected = pat.collected;
 			verify = () => verifyToken(ctx, pat.token);
 		}
+		// Only the check is guarded: a prompt's SetupCancelled (Ctrl-C) must propagate.
+		let verified: boolean | Error;
 		try {
-			await verify();
-			return collected;
+			verified = await verify();
 		} catch (e) {
-			ctx.ui.log.error(message(e));
-			const next = await afterFailure(ctx);
-			if (next === "save") return collected;
-			if (next === "skip") return undefined;
-			current = collected.identity;
+			if (e instanceof SetupCancelled) throw e;
+			verified = e instanceof Error ? e : new Error(message(e));
 		}
+		if (verified === true) return collected;
+		if (verified instanceof Error) ctx.ui.log.error(verified.message);
+		const next = verified === false ? await afterFailure(ctx, "The token is missing scopes") : await afterFailure(ctx);
+		if (next === "save") return collected;
+		if (next === "skip") return undefined;
+		current = collected.identity;
 	}
 }
 
@@ -217,10 +237,20 @@ export const step: Step = {
 			],
 			initial: current.visibility,
 		});
+		// The config validates as a whole, so an unrelated problem (e.g. an unknown role model) can reject the save:
+		// the secrets written for it are put back, and the remaining sections still run.
+		const previous = Object.keys(collected.secrets).map((key) => [key, ctx.secrets.get(key)] as const);
 		for (const [key, value] of Object.entries(collected.secrets)) ctx.secrets.set(key, value);
 		const cfg = await ctx.settings();
-		cfg.set({ global: true }, "github.identity", collected.identity);
-		cfg.set({ global: true }, "github.visibility", visibility);
+		try {
+			cfg.set({ global: true }, "github.identity", collected.identity);
+			cfg.set({ global: true }, "github.visibility", visibility);
+		} catch (e) {
+			if (!(e instanceof FactoryError)) throw e;
+			for (const [key, value] of previous) value === undefined ? ctx.secrets.delete(key) : ctx.secrets.set(key, value);
+			ctx.ui.log.error(`${e.message}; fix the problem (e.g. factory setup roles), then run factory setup github`);
+			return;
+		}
 		ctx.ui.log.success(`Saved github.identity (${kind}) and github.visibility (${visibility})`);
 	},
 };

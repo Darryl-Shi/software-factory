@@ -98,7 +98,7 @@ describe("settings layering", () => {
 			[G, "ci.noChecksTimeout", "soon", /not a duration/],
 			[G, "policy.approvals", ["spec", "deploy"], /expected one of spec, delivery, merge/],
 			[G, "policy.approvals", ["spec", "spec"], /duplicate gate/],
-			[G, "roles.reviewer.model", "openai/no-such-model", /not a model createModels\(\) knows/],
+			[G, "roles.reviewer.model", "openai/no-such-model", /openai\/no-such-model is not a model the model host knows \(log in or add it with factory setup models\)/],
 			[G, "roles.reviewer.thinking", "extreme", /expected one of off, low, medium, high/],
 			[G, "roles.builder.extensions", ["coding"], /unknown setting/],
 			[G, "github.identity.tokenRef", "ghp_abc123", /secret reference/],

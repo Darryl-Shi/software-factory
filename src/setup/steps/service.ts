@@ -184,6 +184,54 @@ async function install(ctx: SetupContext, kind: Kind, active: boolean): Promise<
 	}
 }
 
+/** An env var name, as pi reports a provider credential read from the environment (`checkAuth().source`). */
+const ENV_NAME = /^[A-Z][A-Z0-9_]*$/;
+
+/**
+ * The credentials the factory reads from the environment, which a service started by systemd or launchd won't have
+ * (its unit sets only PATH): one line per credential, naming the setup section that stores it instead.
+ */
+async function envCredentials(ctx: SetupContext): Promise<string[]> {
+	const line = (name: string, what: string, section: string) =>
+		`${name} (${what}) is read from the environment, which the service won't have; run factory setup ${section} to store it`;
+	const lines: string[] = [];
+	const eff = (await ctx.settings()).effective({ global: true });
+	const id = eff.github?.identity ?? {};
+	const refs: [string, unknown, string][] = [
+		id.kind === "app" ? ["github.identity.privateKeyRef", id.privateKeyRef, "github"] : ["github.identity.tokenRef", id.tokenRef ?? "env:GH_TOKEN", "github"],
+		// With AQ testing off globally, the boat key is not used.
+		...(eff.qa?.enabled === false ? [] : [["boat.apiKey", eff.boat?.apiKey, "qa"] as [string, unknown, string]]),
+		["webSearch.apiKey", eff.webSearch?.apiKey, "search"],
+	];
+	for (const [path, ref, section] of refs) {
+		const name = typeof ref === "string" && ref.startsWith("env:") ? ref.slice(4) : undefined;
+		if (name && ctx.env[name]) lines.push(line(name, path, section));
+	}
+	const providers = new Set<string>();
+	for (const r of Object.values(eff.roles ?? {}) as { model?: unknown }[]) if (typeof r?.model === "string") providers.add(r.model.split("/")[0]!);
+	const { models } = await ctx.host();
+	for (const p of providers) {
+		const auth = await models.checkAuth(p).catch(() => undefined);
+		if (auth?.type === "api_key" && auth.source && ENV_NAME.test(auth.source)) lines.push(line(auth.source, `provider ${p}`, "models"));
+	}
+	return lines;
+}
+
+/** Warns about credentials the service won't see; true to install anyway (the default). */
+async function confirmEnvCredentials(ctx: SetupContext): Promise<boolean> {
+	let lines: string[];
+	try {
+		lines = await envCredentials(ctx);
+	} catch (e) {
+		// A broken config or model host must not block the install; it only skips the warning.
+		ctx.ui.log.warn(`could not check which credentials come from the environment: ${(e as Error).message}`);
+		return true;
+	}
+	if (lines.length === 0) return true;
+	ctx.ui.log.warn(lines.join("\n"));
+	return ctx.ui.confirm({ message: "Install the service anyway?", initial: true });
+}
+
 async function remove(ctx: SetupContext, kind: Kind, active: boolean): Promise<void> {
 	const file = fileOf(ctx, kind);
 	if (kind === "systemd") {
@@ -223,7 +271,9 @@ export const step: Step = {
 		if (installed) options.push({ value: "remove", label: "Remove" });
 		options.push({ value: "skip", label: "Skip" });
 		const action = await ctx.ui.select({ message: "Run the factory as a service?", options, initial: installed ? "skip" : "install" });
-		if (action === "install") await install(ctx, kind, active);
+		if (action === "install") {
+			if (await confirmEnvCredentials(ctx)) await install(ctx, kind, active);
+		}
 		else if (action === "remove") await remove(ctx, kind, active);
 	},
 };
