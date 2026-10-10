@@ -52,6 +52,11 @@ src/
   - helper: coding-readonly, web-search
   - reviewer: coding-readonly, test-runner, browser, web-search
 
+  > Superseded by [design-spec.md §3.3](../../design-spec.md#33-worker-extensions-layer-3-the-agents-environment). The reviewer
+  > has no `browser`. Helpers write code: they get `coding`, `test-runner` and `web-search` (no `subagent`, no bridge tools)
+  > and run in the builder's sandbox environment, the same worktree with the same write rules. Their
+  > `roles.helper.{model, thinking}` default to the builder's (default, changeable). The builder is still the only role the core talks to.
+
   The `role-<role>` prompt is always added. These remain Pi Durable extensions internally (that is how Pi supplies
   tools), but are not selectable and have no name-based registry lookup.
 - **Web server:** `main.ts` calls `startWebServer(factory, { host, port, tokenFile, log })` directly.
