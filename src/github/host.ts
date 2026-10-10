@@ -84,7 +84,16 @@ export class GhApiHost implements GitHubHost {
 		return t;
 	}
 
-	private async api(id: Identity, method: string, path: string, body?: unknown): Promise<{ status: number; json: any }> {
+	/** The token's login, and its classic-token scopes from `X-OAuth-Scopes` (undefined when the header is absent). */
+	async whoami(id: Identity): Promise<{ login: string; scopes: string[] | undefined }> {
+		const r = await this.api(id, "GET", "/user");
+		if (r.status < 200 || r.status >= 300) throw new Error(`GitHub GET /user: ${r.status}`);
+		const header = r.headers["x-oauth-scopes"];
+		const scopes = header === undefined ? undefined : header.split(",").map((s) => s.trim()).filter(Boolean);
+		return { login: String(r.json?.login ?? ""), scopes };
+	}
+
+	private async api(id: Identity, method: string, path: string, body?: unknown): Promise<{ status: number; json: any; headers: Record<string, string> }> {
 		const token = await this.token(id);
 		const args = ["api", "-X", method, "-H", "Accept: application/vnd.github+json", "--include", path];
 		if (body !== undefined) args.push("--input", "-");
@@ -92,6 +101,11 @@ export class GhApiHost implements GitHubHost {
 		const text = r.stdout;
 		const status = Number(/^HTTP\/[\d.]+ (\d+)/m.exec(text)?.[1] ?? (r.code === 0 ? 200 : 500));
 		const split = text.indexOf("\r\n\r\n") >= 0 ? text.indexOf("\r\n\r\n") + 4 : text.indexOf("\n\n") + 2;
+		const headers: Record<string, string> = {};
+		for (const line of text.slice(0, split).split(/\r?\n/).slice(1)) {
+			const colon = line.indexOf(":");
+			if (colon > 0) headers[line.slice(0, colon).trim().toLowerCase()] = line.slice(colon + 1).trim();
+		}
 		const payload = text.slice(split).trim();
 		let json: any;
 		try {
@@ -99,7 +113,7 @@ export class GhApiHost implements GitHubHost {
 		} catch {
 			json = payload;
 		}
-		return { status, json };
+		return { status, json, headers };
 	}
 
 	private async ok(id: Identity, method: string, path: string, body?: unknown) {
