@@ -61,13 +61,14 @@ code differs from them is listed in [`DEVIATIONS.md`](DEVIATIONS.md).
   agent carries on.
 
 `bin/factory setup` checks the prerequisites and stores the credentials: tokens and keys in `secrets.json` (mode
-0600), model credentials in `pi/auth.json`, both next to the config file. Environment variables still work as before:
-`GH_TOKEN`, `BOAT_API_KEY`, `PARALLEL_API_KEY`, and the providers' keys that pi-ai reads, such as `ANTHROPIC_API_KEY`
-and `OPENAI_API_KEY` for the default roles.
+0600), model credentials in `pi/auth.json`, both next to the config file. Environment variables still work, but only
+for a factory started from a shell that has them: `GH_TOKEN`, `BOAT_API_KEY`, `PARALLEL_API_KEY`, and the providers'
+keys that pi-ai reads, such as `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` for the default roles. A service installed
+by setup gets only `PATH`, so setup warns before installing one when a credential would come from the environment.
 
-`bin/factory doctor` checks the config file, the model credentials, the sandbox, the GitHub identity and `gh`. Each
-credential line names where the credential comes from, and a credential or prerequisite problem ends with the
-`factory setup <section>` that fixes it.
+`bin/factory doctor` checks the config file, the provider packages' extensions, the model credentials, the sandbox,
+the GitHub identity, the boat.dev and Parallel keys, and `gh`. Each credential line names where the credential comes
+from, and a credential or prerequisite problem ends with the `factory setup <section>` that fixes it.
 
 ## Install
 
@@ -97,8 +98,8 @@ bin/factory serve        # starts the factory in the background and prints the w
 ```
 
 If setup installed the service, the service runs the factory: skip `bin/factory serve`. Setup's last line shows the
-link only if the web UI was already listening when setup finished (otherwise it says `next: factory serve`, which you
-can ignore); `bin/factory web` prints the link once the service is up.
+link only if the web UI was already listening when setup finished; otherwise, with the service active, it says
+`the service is starting; factory web prints the link`. `bin/factory web` prints the link once the service is up.
 
 Open the link. **Create** a ticket with a project name, its repo (`owner/name`; created at the first delivery if it
 doesn't exist) and the request, then answer the architect's questions and the approvals in the run view.
@@ -118,8 +119,8 @@ factory setup [section] [--config p]
   process that owns storage and the core.
   - `--foreground` keeps it attached to the terminal, for systemd/launchd and development. SIGINT or SIGTERM stops it.
   - It exits 1 with a one-line reason, and nothing keeps running, if the web port is taken, a factory already runs
-    for this config, or the config can't be parsed or still has the removed `stages`/`workers` sections or
-    `roles.<role>.extensions` keys (see [configuration](docs/configuration.md#old-config-files)). The factory never runs without its web UI.
+    for this config, `secrets.json` is readable by group or others or doesn't parse, or the config can't be parsed
+    or still has the removed `stages`/`workers` sections or `roles.<role>.extensions` keys (see [configuration](docs/configuration.md#old-config-files)). The factory never runs without its web UI.
   - Unknown options are refused.
 - **`stop`** stops the running factory and waits for it to exit.
 - **`status`** prints `running (pid N)` and the link, or `not running` (exit 1).
@@ -128,7 +129,8 @@ factory setup [section] [--config p]
 - **`setup`** is the interactive setup wizard. It needs a terminal: without one (stdin or stdout not a TTY) it exits 1
   with `factory setup is interactive; run it in a terminal`. There is no non-interactive mode.
   - With no section, it shows a status line per section, runs the sections in order (asking `Reconfigure <title>?`,
-    e.g. `Reconfigure GitHub?`, for those already set up), runs `doctor`'s checks, and ends with the web UI's link or
+    e.g. `Reconfigure GitHub?`, for those already set up), runs `doctor`'s checks, and ends with the web UI's link,
+    `the service is starting; factory web prints the link` (the service is active but has no link yet), or
     `next: factory serve`.
   - With a section, it runs only that one: `prereqs`, `github`, `models`, `roles`, `qa`, `search` or `service`. An
     unknown section exits 1 and lists them.
