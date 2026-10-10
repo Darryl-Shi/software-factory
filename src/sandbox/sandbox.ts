@@ -37,10 +37,23 @@ type EnvRecord = {
 	setup?: { script: string; exitCode: number };
 	/** Credential env vars and key files named by the run's config (missing on records written before). */
 	credentials?: { envVars: string[]; files: string[] };
+	/** The run's `storage.path` (the harness database), denied with its -wal/-shm/-journal files (missing on older records). */
+	storage?: string;
 };
+
+/**
+ * The factory home's entries that hold secrets or the factory's state. The whole home is denied as a directory (a tmpfs
+ * under bwrap, so a secrets.json renamed or created there later stays hidden) and only the environment's own roots inside
+ * it are re-allowed; these entries are denied again on their own (read and write), and no root may sit at or around the
+ * home or inside one of them.
+ * web-url and factory.log carry the web UI's token link; pi/ is the model agentDir (auth.json).
+ */
+export const FACTORY_HOME_PRIVATE = ["secrets.json", "pi", "web-token", "web-url", "factory.log", "factory.sqlite", "factory.sqlite-wal", "factory.sqlite-shm", "factory.sqlite-journal", "environments", "qa-vms"];
 
 const shellQuote = (argv: readonly string[]) => argv.map((a) => `'${a.replace(/'/g, `'\\''`)}'`).join(" ");
 const within = (p: string, root: string) => p === root || p.startsWith(root.endsWith(sep) ? root : root + sep);
+/** Length of the longest root that contains p (-1: none); the roots that contain p are nested, so longest = most specific. */
+const deepest = (p: string, roots: string[]) => roots.reduce((n, r) => (within(p, r) && r.length > n ? r.length : n), -1);
 
 function real(p: string): string {
 	// realpath of the nearest existing ancestor + the rest, so symlinks cannot smuggle a write out of a root.
@@ -65,7 +78,9 @@ class SandboxedEnv implements ExecutionEnv {
 		cwd: string,
 		private writeRoots: string[],
 		private denyWrite: string[],
+		private homeDeny: string[],
 		private denyRead: string[],
+		private allowRead: string[],
 		private shellEnv: Record<string, string>,
 		private wrap: (cmd: string, signal?: AbortSignal) => Promise<string>,
 	) {
@@ -82,12 +97,17 @@ class SandboxedEnv implements ExecutionEnv {
 	}
 	private readErr<T>(path: string): Result<T, FileError> | undefined {
 		const a = this.abs(path);
-		if (this.denyRead.some((d) => within(a, d))) return { ok: false, error: new FileError("permission_denied" as any, `sandbox: reading ${path} is denied`, path) };
+		// The most specific rule wins, as in the sandbox runtime: allowRead re-opens a root inside a denied directory, and a
+		// deny inside that root still denies. A deny and an allow on the same path: the allow (the runtime re-binds it).
+		if (deepest(a, this.denyRead) > deepest(a, this.allowRead)) return { ok: false, error: new FileError("permission_denied" as any, `sandbox: reading ${path} is denied`, path) };
 		return undefined;
 	}
 	private writeErr<T>(path: string): Result<T, FileError> | undefined {
 		const a = this.abs(path);
-		const allowed = this.writeRoots.some((r) => within(a, r)) && !this.denyWrite.some((d) => within(a, d));
+		// Inside a write root and outside every write deny (a deny wins over a root inside it, as in the sandbox runtime). In
+		// the factory home only where one of the env's own roots inside it is the more specific rule (a tie denies).
+		const root = deepest(a, this.writeRoots);
+		const allowed = root >= 0 && !this.denyWrite.some((d) => within(a, d)) && deepest(a, this.homeDeny) < root;
 		if (!allowed)
 			return {
 				ok: false,
@@ -145,15 +165,20 @@ class SandboxedEnv implements ExecutionEnv {
 	}
 }
 
-/** Rules on the `sandbox` settings section (core write limits, §3.3); problems are relative to the section. */
-export function sandboxProblems(sandbox: Obj): string[] {
+/**
+ * Rules on the `sandbox` settings section (core write limits, §3.3); problems are relative to the section. `factoryHome`
+ * is the directory of the config file: an extraWrite at, inside or around it is refused (the sandbox drops it anyway).
+ */
+export function sandboxProblems(sandbox: Obj, factoryHome?: string): string[] {
 	const problems: string[] = [];
 	// extraWrite may never widen into secrets, home or the filesystem root.
 	const home = homedir();
+	const fh = factoryHome ? real(resolve(expandHome(factoryHome))) : undefined;
 	const deny = [...(sandbox?.denyRead ?? DEFAULT_DENY_READ), "~/.factory", "~/.ssh"].map(expandHome);
 	for (const w of (sandbox?.extraWrite ?? []) as string[]) {
 		const p = resolve(expandHome(w));
 		if (p === "/" || p === home || within(home, p)) problems.push(`extraWrite: ${w} would make the home directory or the filesystem root writable`);
+		else if (fh && (within(real(p), fh) || within(fh, real(p)))) problems.push(`extraWrite: ${w} overlaps the factory home ${fh} (its config, secrets and state)`);
 		else if (deny.some((d) => within(p, d) || within(d, p))) problems.push(`extraWrite: ${w} overlaps a denied secret path`);
 	}
 	return problems;
@@ -224,11 +249,30 @@ export class Sandbox {
 	}
 
 	private policy(rec: EnvRecord) {
-		// The factory home (parent of stateDir) holds secrets.json; deny it whatever denyRead says.
-		const deny = [...rec.sandbox.denyRead.map(expandHome), ...(rec.credentials?.files ?? []), dirname(this.stateDir)].map((p) => real(p));
+		// The factory home (parent of stateDir) holds secrets.json and the factory's state: deny it whole, whatever denyRead
+		// says, and re-allow the environment's own roots inside it (the workdir may live there). Its private entries and the
+		// run's storage are denied again on their own, read and write.
+		const home = real(dirname(this.stateDir));
+		const homePrivate = [this.stateDir, ...FACTORY_HOME_PRIVATE.map((n) => join(home, n))].map(real);
+		const storage = rec.storage ? ["", "-wal", "-shm", "-journal"].map((s) => real(`${rec.storage}${s}`)) : [];
+		const deny = [...new Set([...[...rec.sandbox.denyRead.map(expandHome), ...(rec.credentials?.files ?? [])].map((p) => real(p)), home, ...homePrivate, ...storage])];
+		// A root at or around the home, around the storage, or inside a private entry or the storage is dropped, read and
+		// write. sandbox-runtime cannot re-allow a root inside a write deny (bwrap's deny ro-binds land after the allow binds;
+		// Seatbelt's deny rules follow its allows, and the last match wins), so it cannot write-deny the home and keep the
+		// env's roots inside it writable; and a read deny does not stop writes on macOS, nor the creation of an absent
+		// -wal/-journal next to the storage under bwrap. With no write root around them, nothing can write them.
+		const exposes = (r: string) => within(home, r) || [...homePrivate, ...storage].some((p) => within(r, p) || within(p, r));
+		const roots = [rec.worktree, ...(rec.gitCommonDir ? [rec.gitCommonDir] : []), ...rec.sandbox.extraWrite.map(expandHome)].map(real).filter((r) => !exposes(r));
+		const scratch = [real(rec.scratch)].filter((r) => !exposes(r));
+		const allowRead = [...new Set([...roots, ...scratch])].filter((r) => within(r, home));
 		const builder = rec.role === "builder";
-		const writeRoots = [rec.scratch, ...(builder ? [rec.worktree, ...(rec.gitCommonDir ? [rec.gitCommonDir] : []), ...rec.sandbox.extraWrite.map(expandHome)] : [])].map(real);
-		const denyWrite = builder && rec.gitCommonDir ? [join(rec.gitCommonDir, "hooks"), join(rec.gitCommonDir, "config")].map(real) : [];
+		const writeRoots = [...scratch, ...(builder ? roots : [])];
+		// The private entries and the storage are write-denied too (deny wins, nothing is allowed inside them); the home itself
+		// only for the file tools, with the env's roots inside it as the more specific rule (homeDeny): the runtime cannot
+		// express that, and no write root reaches the home from outside it.
+		const gitDeny = builder && rec.gitCommonDir ? [join(rec.gitCommonDir, "hooks"), join(rec.gitCommonDir, "config")].map(real) : [];
+		const denyWrite = [...new Set([...gitDeny, ...homePrivate, ...storage])];
+		const homeDeny = [home];
 		const shellEnv: Record<string, string> = {
 			PATH: process.env.PATH ?? "/usr/bin:/bin",
 			HOME: join(rec.scratch, "home"),
@@ -248,6 +292,7 @@ export class Sandbox {
 		for (const d of ["home", "tmp", "cache", "npm-cache"]) mkdirSync(join(rec.scratch, d), { recursive: true });
 		const fsConfig = {
 			denyRead: deny,
+			allowRead,
 			allowWrite: writeRoots,
 			denyWrite,
 		};
@@ -266,7 +311,7 @@ export class Sandbox {
 				signal,
 			);
 		};
-		return { deny, writeRoots, denyWrite, shellEnv, wrap };
+		return { deny, allowRead, writeRoots, denyWrite, homeDeny, shellEnv, wrap };
 	}
 
 	status(): { initialized: boolean; unixSockets?: string } {
@@ -295,6 +340,7 @@ export class Sandbox {
 				unixSockets: sb.unixSockets ?? "auto",
 			},
 			credentials: credentialLocations(rc.config),
+			...(typeof rc.config.storage?.path === "string" ? { storage: expandHome(rc.config.storage.path) } : {}),
 		};
 		const common = await gitOut(ws.path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).catch(() => "");
 		if (common) rec.gitCommonDir = common;
@@ -303,7 +349,7 @@ export class Sandbox {
 			const script = ((sb.setupScripts ?? []) as string[]).find((s) => existsSync(join(ws.path, s)));
 			if (script) {
 				const p = this.policy(rec);
-				const env = new SandboxedEnv(rec, ws.path, p.writeRoots, p.denyWrite, p.deny, p.shellEnv, p.wrap);
+				const env = new SandboxedEnv(rec, ws.path, p.writeRoots, p.denyWrite, p.homeDeny, p.deny, p.allowRead, p.shellEnv, p.wrap);
 				let log = "";
 				const r = await env.exec(`bash ${shellQuote([script])}`, { timeout: 900, onOutput: (t) => (log += t) }, BACKGROUND_CONTEXT);
 				rec.setup = { script, exitCode: r.ok ? r.value.exitCode : -1 };
@@ -319,7 +365,7 @@ export class Sandbox {
 	env(input: { conversationId: string; cwd?: string; envId: string }): ExecutionEnv {
 		const rec = this.load(input.envId);
 		const p = this.policy(rec);
-		return new SandboxedEnv(rec, input.cwd ?? rec.cwd, p.writeRoots, p.denyWrite, p.deny, p.shellEnv, p.wrap);
+		return new SandboxedEnv(rec, input.cwd ?? rec.cwd, p.writeRoots, p.denyWrite, p.homeDeny, p.deny, p.allowRead, p.shellEnv, p.wrap);
 	}
 
 	async dispose(envId: string): Promise<void> {
