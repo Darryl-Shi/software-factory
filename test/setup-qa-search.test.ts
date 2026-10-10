@@ -1,6 +1,8 @@
 // Setup sections "qa" and "search" (spec §3.4, §6).
 import { afterEach, describe, expect, it } from "vitest";
-import { setDefaultSecretStore } from "../src/core/settings.ts";
+import { existsSync, readFileSync } from "node:fs";
+import { resolveSecret, setDefaultSecretStore } from "../src/core/settings.ts";
+import { FactoryError } from "../src/core/types.ts";
 import type { SetupContext } from "../src/setup/context.ts";
 import { step as qa } from "../src/setup/steps/qa.ts";
 import { step as search } from "../src/setup/steps/search.ts";
@@ -62,6 +64,17 @@ describe("setup qa", () => {
 		expect(ctx.secrets.keys()).toEqual([]);
 		expect(ui.shown.some((s) => s.kind === "note" && /project overrides may still turn it on/.test(s.body ?? ""))).toBe(true);
 		expect((await qa.status(ctx)).state).toBe("ok");
+	});
+
+	it("qa off shows no off note when the save fails", async () => {
+		const { ctx, ui } = testContext({ answers: ["off"], fakeBoat: true });
+		const cfg = await ctx.settings();
+		cfg.set = () => {
+			throw new FactoryError("invalid", "qa.enabled: rejected");
+		};
+		await qa.run(ctx);
+		expect(ui.shown.filter((s) => s.kind === "log.error").map((s) => s.message)).toEqual(["qa.enabled: rejected"]);
+		expect(ui.shown.filter((s) => s.kind === "note")).toEqual([]);
 	});
 
 	it("qa verify failure + skip writes nothing", async () => {
@@ -153,6 +166,31 @@ describe("setup search", () => {
 		await expect(search.run(ctx)).rejects.toBeInstanceOf(SetupCancelled);
 		expect(ctx.secrets.keys()).toEqual([]);
 		expect((await ctx.settings()).raw().webSearch).toBeUndefined();
+		const prior = testContext({ answers: ["paste", "pk_bad", true, CANCEL], fetch: stubFetch(401) });
+		prior.ctx.secrets.set("parallel", "pk_old");
+		await expect(search.run(prior.ctx)).rejects.toBeInstanceOf(SetupCancelled);
+		expect(prior.ctx.secrets.get("parallel")).toBe("pk_old");
+	});
+
+	it("search never writes the candidate key to secrets.json before the user commits", async () => {
+		let onDisk: string | undefined = "unread";
+		let duringFetch: string | undefined;
+		const inner = stubFetch(200);
+		const probe = (async (url: any, init: any) => {
+			onDisk = existsSync(path) ? readFileSync(path, "utf8") : undefined;
+			duringFetch = resolveSecret("store:parallel");
+			return inner(url, init);
+		}) as typeof fetch;
+		const { ctx } = testContext({ answers: ["paste", "pk_new", true], fetch: probe });
+		ctx.secrets.set("parallel", "pk_old");
+		const path = ctx.secrets.path;
+		await search.run(ctx);
+		expect(duringFetch).toBe("pk_new");
+		expect(onDisk).toContain("pk_old");
+		expect(onDisk).not.toContain("pk_new");
+		// After the search the process default store is the real one again, and the committed key is on disk.
+		expect(resolveSecret("store:parallel")).toBe("pk_new");
+		expect(ctx.secrets.get("parallel")).toBe("pk_new");
 	});
 
 	it("search test failure + save anyway stores the key", async () => {
