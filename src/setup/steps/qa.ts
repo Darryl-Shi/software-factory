@@ -67,7 +67,7 @@ export const step: Step = {
 	},
 	async run(ctx) {
 		const options: { value: Choice; label: string; hint?: string }[] = [{ value: "enable", label: "Enable AQ testing with a boat.dev key" }];
-		if (ctx.env.BOAT_API_KEY) options.push({ value: "env", label: "Keep env:BOAT_API_KEY", hint: "BOAT_API_KEY is set" });
+		if (ctx.env.BOAT_API_KEY) options.push({ value: "env", label: "Keep env:BOAT_API_KEY", hint: "not seen by a service" });
 		options.push({ value: "off", label: "Turn AQ testing off" });
 		const choice = await ctx.ui.select<Choice>({ message: "AQ testing (boat.dev)", options, initial: "enable" });
 

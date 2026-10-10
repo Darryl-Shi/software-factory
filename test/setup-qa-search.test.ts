@@ -107,7 +107,8 @@ describe("setup qa", () => {
 		await qa.run(b.ctx);
 		expect(calls).toEqual(["env:BOAT_API_KEY"]);
 		expect((await b.ctx.settings()).raw().boat).toBeUndefined();
-		const c = testContext({ answers: ["env"], env: { BOAT_API_KEY: "bk_env" }, fakeBoat: true });
+		const envHint = (o: any) => (expect(o.options.find((x: any) => x.value === "env").hint).toBe("not seen by a service"), "env");
+		const c = testContext({ answers: [envHint], env: { BOAT_API_KEY: "bk_env" }, fakeBoat: true });
 		await qa.run(c.ctx);
 		const raw = (await c.ctx.settings()).raw();
 		expect(raw.boat.apiKey).toBe("env:BOAT_API_KEY");
@@ -203,7 +204,14 @@ describe("setup search", () => {
 	it("search offers env:PARALLEL_API_KEY when it is set", async () => {
 		const reqs: Req[] = [];
 		const { ctx } = testContext({
-			answers: [(o: any) => (expect(o.options.map((x: any) => x.value)).toEqual(["paste", "env", "skip"]), "env"), true],
+			answers: [
+				(o: any) => (
+					expect(o.options.map((x: any) => x.value)).toEqual(["paste", "env", "skip"]),
+					expect(o.options.find((x: any) => x.value === "env").hint).toBe("not seen by a service"),
+					"env"
+				),
+				true,
+			],
 			env: { PARALLEL_API_KEY: "pk_env" },
 			fetch: stubFetch(200, reqs),
 		});

@@ -60,7 +60,7 @@ export const step: Step = {
 	},
 	async run(ctx) {
 		const options: { value: Choice; label: string; hint?: string }[] = [{ value: "paste", label: "Paste a Parallel key" }];
-		if (ctx.env.PARALLEL_API_KEY) options.push({ value: "env", label: "Keep env:PARALLEL_API_KEY", hint: "PARALLEL_API_KEY is set" });
+		if (ctx.env.PARALLEL_API_KEY) options.push({ value: "env", label: "Keep env:PARALLEL_API_KEY", hint: "not seen by a service" });
 		options.push({ value: "skip", label: "Skip", hint: "web search stays unconfigured" });
 		const choice = await ctx.ui.select<Choice>({ message: "Web search (Parallel)", options, initial: "paste" });
 		if (choice === "skip") return;
