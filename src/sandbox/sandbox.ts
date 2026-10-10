@@ -37,17 +37,22 @@ type EnvRecord = {
 	setup?: { script: string; exitCode: number };
 	/** Credential env vars and key files named by the run's config (missing on records written before). */
 	credentials?: { envVars: string[]; files: string[] };
+	/** The run's `storage.path` (the harness database), denied with its -wal/-shm/-journal files (missing on older records). */
+	storage?: string;
 };
 
 /**
- * The factory home's entries that hold secrets or the factory's state, denied to every role whatever denyRead says. The rest
- * of the home stays readable: the workdir (agents' worktrees and scratch dirs) may live inside it. config.yaml holds only
- * refs and stays readable. web-url and factory.log carry the web UI's token link; pi/ is the model agentDir (auth.json).
+ * The factory home's entries that hold secrets or the factory's state. The whole home is denied as a directory (a tmpfs
+ * under bwrap, so a secrets.json renamed or created there later stays hidden) and only the environment's own roots inside
+ * it are re-allowed; these entries are denied again on their own, and no root may sit at the home or inside one of them.
+ * web-url and factory.log carry the web UI's token link; pi/ is the model agentDir (auth.json).
  */
 export const FACTORY_HOME_PRIVATE = ["secrets.json", "pi", "web-token", "web-url", "factory.log", "factory.sqlite", "factory.sqlite-wal", "factory.sqlite-shm", "factory.sqlite-journal", "environments", "qa-vms"];
 
 const shellQuote = (argv: readonly string[]) => argv.map((a) => `'${a.replace(/'/g, `'\\''`)}'`).join(" ");
 const within = (p: string, root: string) => p === root || p.startsWith(root.endsWith(sep) ? root : root + sep);
+/** Length of the longest root that contains p (-1: none); the roots that contain p are nested, so longest = most specific. */
+const deepest = (p: string, roots: string[]) => roots.reduce((n, r) => (within(p, r) && r.length > n ? r.length : n), -1);
 
 function real(p: string): string {
 	// realpath of the nearest existing ancestor + the rest, so symlinks cannot smuggle a write out of a root.
@@ -73,6 +78,7 @@ class SandboxedEnv implements ExecutionEnv {
 		private writeRoots: string[],
 		private denyWrite: string[],
 		private denyRead: string[],
+		private allowRead: string[],
 		private shellEnv: Record<string, string>,
 		private wrap: (cmd: string, signal?: AbortSignal) => Promise<string>,
 	) {
@@ -89,7 +95,9 @@ class SandboxedEnv implements ExecutionEnv {
 	}
 	private readErr<T>(path: string): Result<T, FileError> | undefined {
 		const a = this.abs(path);
-		if (this.denyRead.some((d) => within(a, d))) return { ok: false, error: new FileError("permission_denied" as any, `sandbox: reading ${path} is denied`, path) };
+		// The most specific rule wins, as in the sandbox runtime: allowRead re-opens a root inside a denied directory, and a
+		// deny inside that root still denies. A deny and an allow on the same path: the allow (the runtime re-binds it).
+		if (deepest(a, this.denyRead) > deepest(a, this.allowRead)) return { ok: false, error: new FileError("permission_denied" as any, `sandbox: reading ${path} is denied`, path) };
 		return undefined;
 	}
 	private writeErr<T>(path: string): Result<T, FileError> | undefined {
@@ -231,13 +239,19 @@ export class Sandbox {
 	}
 
 	private policy(rec: EnvRecord) {
-		// The factory home (parent of stateDir) holds secrets.json and the factory's state; deny those entries (and the
-		// environment records themselves) whatever denyRead says, but not the whole home, which may contain the workdir.
-		const home = dirname(this.stateDir);
-		const homePrivate = [this.stateDir, ...FACTORY_HOME_PRIVATE.map((n) => join(home, n))];
-		const deny = [...new Set([...rec.sandbox.denyRead.map(expandHome), ...(rec.credentials?.files ?? []), ...homePrivate].map((p) => real(p)))];
+		// The factory home (parent of stateDir) holds secrets.json and the factory's state: deny it whole, whatever denyRead
+		// says, and re-allow the environment's own roots inside it (the workdir may live there). Its private entries and the
+		// run's storage are denied again on their own, and a root at the home or inside them is dropped, read and write.
+		const home = real(dirname(this.stateDir));
+		const homePrivate = [this.stateDir, ...FACTORY_HOME_PRIVATE.map((n) => join(home, n))].map(real);
+		const storage = rec.storage ? ["", "-wal", "-shm", "-journal"].map((s) => real(`${rec.storage}${s}`)) : [];
+		const deny = [...new Set([...[...rec.sandbox.denyRead.map(expandHome), ...(rec.credentials?.files ?? [])].map((p) => real(p)), home, ...homePrivate, ...storage])];
+		const exposes = (r: string) => r === home || [...homePrivate, ...storage].some((p) => within(r, p));
+		const roots = [rec.worktree, ...(rec.gitCommonDir ? [rec.gitCommonDir] : []), ...rec.sandbox.extraWrite.map(expandHome)].map(real).filter((r) => !exposes(r));
+		const scratch = [real(rec.scratch)].filter((r) => !exposes(r));
+		const allowRead = [...new Set([...roots, ...scratch])].filter((r) => within(r, home));
 		const builder = rec.role === "builder";
-		const writeRoots = [rec.scratch, ...(builder ? [rec.worktree, ...(rec.gitCommonDir ? [rec.gitCommonDir] : []), ...rec.sandbox.extraWrite.map(expandHome)] : [])].map(real);
+		const writeRoots = [...scratch, ...(builder ? roots : [])];
 		const denyWrite = builder && rec.gitCommonDir ? [join(rec.gitCommonDir, "hooks"), join(rec.gitCommonDir, "config")].map(real) : [];
 		const shellEnv: Record<string, string> = {
 			PATH: process.env.PATH ?? "/usr/bin:/bin",
@@ -258,6 +272,7 @@ export class Sandbox {
 		for (const d of ["home", "tmp", "cache", "npm-cache"]) mkdirSync(join(rec.scratch, d), { recursive: true });
 		const fsConfig = {
 			denyRead: deny,
+			allowRead,
 			allowWrite: writeRoots,
 			denyWrite,
 		};
@@ -276,7 +291,7 @@ export class Sandbox {
 				signal,
 			);
 		};
-		return { deny, writeRoots, denyWrite, shellEnv, wrap };
+		return { deny, allowRead, writeRoots, denyWrite, shellEnv, wrap };
 	}
 
 	status(): { initialized: boolean; unixSockets?: string } {
@@ -305,6 +320,7 @@ export class Sandbox {
 				unixSockets: sb.unixSockets ?? "auto",
 			},
 			credentials: credentialLocations(rc.config),
+			...(typeof rc.config.storage?.path === "string" ? { storage: expandHome(rc.config.storage.path) } : {}),
 		};
 		const common = await gitOut(ws.path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).catch(() => "");
 		if (common) rec.gitCommonDir = common;
@@ -313,7 +329,7 @@ export class Sandbox {
 			const script = ((sb.setupScripts ?? []) as string[]).find((s) => existsSync(join(ws.path, s)));
 			if (script) {
 				const p = this.policy(rec);
-				const env = new SandboxedEnv(rec, ws.path, p.writeRoots, p.denyWrite, p.deny, p.shellEnv, p.wrap);
+				const env = new SandboxedEnv(rec, ws.path, p.writeRoots, p.denyWrite, p.deny, p.allowRead, p.shellEnv, p.wrap);
 				let log = "";
 				const r = await env.exec(`bash ${shellQuote([script])}`, { timeout: 900, onOutput: (t) => (log += t) }, BACKGROUND_CONTEXT);
 				rec.setup = { script, exitCode: r.ok ? r.value.exitCode : -1 };
@@ -329,7 +345,7 @@ export class Sandbox {
 	env(input: { conversationId: string; cwd?: string; envId: string }): ExecutionEnv {
 		const rec = this.load(input.envId);
 		const p = this.policy(rec);
-		return new SandboxedEnv(rec, input.cwd ?? rec.cwd, p.writeRoots, p.denyWrite, p.deny, p.shellEnv, p.wrap);
+		return new SandboxedEnv(rec, input.cwd ?? rec.cwd, p.writeRoots, p.denyWrite, p.deny, p.allowRead, p.shellEnv, p.wrap);
 	}
 
 	async dispose(envId: string): Promise<void> {

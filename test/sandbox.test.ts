@@ -1,6 +1,6 @@
 // Sandbox: role-fixed write access, denyRead, network allowlist and credential hiding, enforced by
 // @anthropic-ai/sandbox-runtime for processes and by the ExecutionEnv for in-process file tools.
-import { mkdirSync, mkdtempSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT as c } from "@earendil-works/chord/context";
@@ -91,6 +91,34 @@ describe.skipIf(!available)("Sandbox (bubblewrap)", () => {
 		expect((await exec(reviewer, "cat scripts/setup.sh")).out).toContain("setup-ran");
 		expect((await reviewer.readTextFile(join(ws.path, "scripts/setup.sh"), c)).ok).toBe(true);
 	});
+
+	test("secrets renamed or created in the factory home while a command runs stay hidden from it", async () => {
+		const tmp = join(workdir, "scratch", "r1-reviewer", "tmp");
+		rmSync(join(tmp, "started"), { force: true });
+		rmSync(join(tmp, "go"), { force: true });
+		const run = exec(
+			reviewer,
+			`touch "$TMPDIR/started"; while [ ! -e "$TMPDIR/go" ]; do sleep 0.05; done; cat ${join(dir, "secrets.json")} ${join(dir, "pi", "models.json")} 2>/dev/null; echo LS; ls -a ${dir}; echo DONE`,
+		);
+		for (let i = 0; i < 400 && !existsSync(join(tmp, "started")); i++) await new Promise((r) => setTimeout(r, 50));
+		expect(existsSync(join(tmp, "started"))).toBe(true);
+		// SecretStore.write: secrets.json.<pid>.tmp, then rename over secrets.json; and a file the home did not have yet
+		writeFileSync(join(dir, "secrets.json.9.tmp"), "RENAMED_SECRET");
+		renameSync(join(dir, "secrets.json.9.tmp"), join(dir, "secrets.json"));
+		writeFileSync(join(dir, "secrets.json.10.tmp"), "LEFT_TMP");
+		writeFileSync(join(dir, "pi", "models.json"), "NEW_SECRET");
+		writeFileSync(join(tmp, "go"), "");
+		const r = await run;
+		expect(r.out).toContain("DONE");
+		for (const s of ["RENAMED_SECRET", "NEW_SECRET", "HOME_SECRET"]) expect(r.out).not.toContain(s);
+		// the home is an empty directory inside the sandbox but for the mount points of the roots it re-allows
+		const listed = r.out.split("LS\n")[1]!.split("DONE")[0]!;
+		expect(listed).not.toMatch(/secrets\.json|\.tmp/);
+		console.log(`home inside the sandbox: ${listed.trim().split("\n").join(" ")}`);
+		// a later command (and the file tools) cannot see them either
+		expect((await exec(reviewer, `cat ${join(dir, "secrets.json.10.tmp")} 2>/dev/null; ls ${dir}`)).out).not.toMatch(/LEFT_TMP|secrets/);
+		expect((await reviewer.readTextFile(join(dir, "secrets.json.10.tmp"), c)).ok).toBe(false);
+	}, 40_000);
 
 	test("credentials in the factory's environment are not visible inside the sandbox", async () => {
 		process.env.GH_TOKEN = "ghp_should_not_leak";
