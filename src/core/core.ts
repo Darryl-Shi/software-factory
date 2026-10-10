@@ -60,7 +60,7 @@ export const PI_DURABLE_VERSION: string = require("@earendil-works/pi-durable/pa
 export interface CoreOptions {
 	/** Path of the config file (§5). */
 	configPath: string;
-	/** pi-ai models (createModels() with providers) — injected platform service (§3.1). */
+	/** pi-ai models (the model host's ModelRuntime, src/models/host.ts) — injected platform service (§3.1). */
 	models: Models;
 	/** GitHub: workspaces, delivery, CI and merges. */
 	github: GitHub;

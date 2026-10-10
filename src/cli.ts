@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // `factory` command. `factory serve` starts the process that owns the storage and the core (detached, unless
 // --foreground); the web UI is the interface. `stop` and `status` manage it, `web` prints the web UI link and
-// `doctor` checks the setup.
+// `doctor` checks the setup (src/doctor.ts).
 
 const argv = process.argv.slice(2);
 const flags: Record<string, string | true> = {};
@@ -23,6 +23,7 @@ const HELP = `factory — software factory on Pi Durable
   factory status [--config p]
   factory web [--config p]          print the web UI's link
   factory doctor [--config p]
+  factory setup [section] [--config p]
 `;
 const SERVE_FLAGS = ["config", "port", "fake-github", "fake-boat", "scripted", "ci-poll-ms", "foreground", "help"];
 
@@ -115,76 +116,8 @@ async function serve() {
 }
 
 async function doctor() {
-	const { Factory } = await import("./core/core.ts");
-	const { createBoat, createModels, DEFAULT_CONFIG, factoryHome } = await import("./main.ts");
-	const { SandboxManager } = await import("@anthropic-ai/sandbox-runtime");
-	const { assertNoLegacySections, expandHome } = await import("./core/settings.ts");
-	const { GitHub } = await import("./github/github.ts");
-	const { GhApiHost, resolveSecret } = await import("./github/host.ts");
-	const { Sandbox } = await import("./sandbox/sandbox.ts");
-	const { existsSync } = await import("node:fs");
-	const { join } = await import("node:path");
-	const configPath = expandHome(typeof flags.config === "string" ? flags.config : (process.env.FACTORY_CONFIG ?? DEFAULT_CONFIG));
-	const models = await createModels(!!flags.scripted);
-	const f = new Factory({
-		configPath,
-		models,
-		github: new GitHub(new GhApiHost()),
-		sandbox: new Sandbox({ stateDir: join(factoryHome(configPath), "environments") }),
-		boat: createBoat(configPath),
-	});
-	const eff = existsSync(configPath) ? f.config.effective({ global: true }) : f.config.effective({ global: true }, { version: 1 });
-	const line = (ok: boolean | "warn", s: string) => console.log(`${ok === true ? "ok  " : ok === "warn" ? "warn" : "FAIL"}  ${s}`);
-	line(true, `config ${configPath}${existsSync(configPath) ? "" : " (missing: defaults)"}`);
-	if (existsSync(configPath)) {
-		try {
-			assertNoLegacySections(configPath);
-		} catch (e) {
-			line(false, e instanceof Error ? e.message : String(e));
-		}
-	}
-	const raw = existsSync(configPath) ? f.config.raw() : {};
-	const helperSet = raw.roles?.helper?.model !== undefined || Object.values((raw.projects ?? {}) as Record<string, any>).some((p) => p?.roles?.helper?.model !== undefined);
-	for (const role of ["architect", "builder", "helper", "reviewer", "qa"]) {
-		// roles.helper.model unset = the builder's model, already checked
-		if (role === "helper" && !helperSet) continue;
-		const ref = String(eff.roles[role].model);
-		const [p, ...rest] = ref.split("/");
-		const known = !!models.getModel(p!, rest.join("/"));
-		const available = known ? (await models.getAvailable(p!)).some((m) => m.id === rest.join("/")) : false;
-		line(known && available ? true : known ? "warn" : false, `roles.${role}.model ${ref}: ${known ? (available ? "known, credentials configured" : "known, NO credentials configured") : "unknown model"}`);
-	}
-	const deps = SandboxManager.checkDependencies();
-	line(deps.errors.length === 0, `sandbox runtime: ${deps.errors.join("; ") || "bubblewrap/socat present"}`);
-	const id = eff.github.identity ?? {};
-	const tokenOk = id.kind === "app" ? !!resolveSecret(id.privateKeyRef) : !!resolveSecret(id.tokenRef ?? "env:GH_TOKEN");
-	line(tokenOk ? true : "warn", `GitHub identity (${id.kind ?? "pat"}): ${tokenOk ? "credential found" : `no credential at ${id.kind === "app" ? id.privateKeyRef : (id.tokenRef ?? "env:GH_TOKEN")}`}`);
-	// AQ testing: a FAIL for every scope where QA is on and the boat key does not resolve; a warn if boat's limits call fails
-	const scopes: { label: string; eff: any }[] = [{ label: "global", eff }];
-	if (existsSync(configPath)) for (const p of f.config.projects()) scopes.push({ label: `project ${p.name}`, eff: f.config.effective({ project: p.name }) });
-	const checkedRefs = new Set<string>();
-	for (const s of scopes) {
-		if (s.eff.qa?.enabled !== true) {
-			line(true, `AQ testing (${s.label}): off`);
-			continue;
-		}
-		const ref = String(s.eff.boat?.apiKey ?? "env:BOAT_API_KEY");
-		if (!resolveSecret(ref)) {
-			line(false, `AQ testing (${s.label}): qa.enabled is on but boat.apiKey (${ref}) does not resolve; set the key or qa.enabled: false`);
-			continue;
-		}
-		line(true, `AQ testing (${s.label}): boat key found (${ref})`);
-		if (checkedRefs.has(ref)) continue;
-		checkedRefs.add(ref);
-		try {
-			await createBoat(configPath).limits(ref);
-			line(true, `boat.dev API reachable with ${ref}`);
-		} catch (e) {
-			line("warn", `boat.dev limits call failed with ${ref}: ${e instanceof Error ? e.message : e}`);
-		}
-	}
-	const { run } = await import("./github/git.ts");
-	line((await run("gh", ["--version"])).code === 0 ? true : false, "gh CLI installed");
+	const { formatDoctorLine, runDoctorChecks } = await import("./doctor.ts");
+	for (const l of await runDoctorChecks(await configPath(), { scripted: !!flags.scripted })) console.log(formatDoctorLine(l));
 }
 
 main().catch((e) => {

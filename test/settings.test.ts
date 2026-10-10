@@ -2,6 +2,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { afterEach, describe, expect, test } from "vitest";
 import { ROLE_TOOLS } from "../src/agents/tools.ts";
+import { ConfigStore } from "../src/core/settings.ts";
 import { makeFactory, type TestEnv } from "./helpers.ts";
 
 let t: TestEnv | undefined;
@@ -241,5 +242,19 @@ describe("settings layering", () => {
 		const raw = readFileSync(t.configPath, "utf8");
 		expect(raw).toContain("# my factory");
 		expect(raw).toContain("reviewRoundCap: 4");
+	});
+
+	test("ConfigStore sees external writes and does not clobber them", async () => {
+		t = await makeFactory();
+		const schema = () => t!.factory.settingsSchema();
+		const a = new ConfigStore(t.configPath, schema);
+		const b = new ConfigStore(t.configPath, schema);
+		a.set(G, "ci.fixRounds", 1);
+		expect(b.effective(G).ci.fixRounds).toBe(1);
+		b.set(G, "ci.mode", "off");
+		const raw = readFileSync(t.configPath, "utf8");
+		expect(raw).toMatch(/fixRounds: 1/);
+		expect(raw).toMatch(/mode: off/);
+		expect(a.effective(G).ci).toMatchObject({ fixRounds: 1, mode: "off" });
 	});
 });
