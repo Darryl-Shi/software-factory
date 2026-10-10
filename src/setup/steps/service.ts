@@ -1,6 +1,6 @@
 // Setup section "service" (spec §3.4): runs the factory as a systemd user unit (linux) or a launchd agent (darwin).
 // Everything goes through ctx.run, ctx.platform, ctx.homedir and ctx.env; no credentials are written into the files.
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, rmSync, writeFileSync } from "node:fs";
 import { userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import { daemonFiles, stopDaemon } from "../../daemon.ts";
@@ -111,40 +111,57 @@ async function isActive(ctx: SetupContext, kind: Kind): Promise<boolean> {
 	return r.code === 0;
 }
 
-/** Runs the commands in order; on the first failure shows its output and the commands left to run by hand. */
-async function runAll(ctx: SetupContext, cmds: [string, string[]][]): Promise<boolean> {
+/** Runs the commands in order; on the first failure shows its output and the commands left to run by hand
+ * (those not run yet, then `after`, the steps that would have followed them). */
+async function runAll(ctx: SetupContext, cmds: [string, string[]][], after: string[] = []): Promise<boolean> {
 	const line = ([cmd, args]: [string, string[]]) => [cmd, ...args].join(" ");
 	for (const [i, c] of cmds.entries()) {
 		const r = await ctx.run(c[0], c[1]);
 		if (r.code === 0) continue;
 		const out = (r.stderr || r.stdout).trim();
 		ctx.ui.log.error(out ? `${line(c)} failed: ${out}` : `${line(c)} failed (exit ${r.code})`);
-		ctx.ui.log.info(`run it yourself: ${cmds.slice(i).map(line).join(" && ")}`);
+		ctx.ui.log.info(`run it yourself: ${[...cmds.slice(i).map(line), ...after].join(" && ")}`);
 		return false;
 	}
 	return true;
 }
 
 async function install(ctx: SetupContext, kind: Kind, active: boolean): Promise<void> {
+	// A `factory serve` left running makes the service fail with `already running` (and systemd gives up on it).
+	let daemonUp = false;
 	if (ctx.daemon.pid() !== undefined && !active) {
+		daemonUp = true;
 		if (await ctx.ui.confirm({ message: "Stop the running factory first?", initial: true })) {
 			try {
 				await stopDaemon(ctx.configPath);
+				daemonUp = false;
 			} catch (e) {
 				ctx.ui.log.error((e as Error).message);
 			}
 		}
 	}
+	const warnDaemonUp = () => {
+		if (!daemonUp) return;
+		const restart = kind === "systemd" ? `systemctl --user restart ${UNIT}` : `launchctl kickstart -k gui/${uid()}/${LABEL}`;
+		ctx.ui.log.warn(`the service will fail while the running factory is up; stop it, then run: ${restart}`);
+	};
 	const file = fileOf(ctx, kind);
 	const o = { node: process.execPath, repoRoot: ctx.repoRoot, configPath: ctx.configPath, path: ctx.env.PATH ?? "" };
 	mkdirSync(dirname(file), { recursive: true });
-	writeFileSync(file, kind === "systemd" ? systemdUnit(o) : launchdPlist({ ...o, log: daemonFiles(ctx.configPath).log }));
+	const log = daemonFiles(ctx.configPath).log;
+	writeFileSync(file, kind === "systemd" ? systemdUnit(o) : launchdPlist({ ...o, log }));
+	// The log gets the web UI link with its token; launchd would create it with the default umask.
+	mkdirSync(dirname(log), { recursive: true });
+	closeSync(openSync(log, "a", 0o600));
+	chmodSync(log, 0o600);
 
 	if (kind === "launchd") {
 		// A loaded agent keeps its old definition, and bootstrap refuses it: unload it first.
 		const cmds: [string, string[]][] = active ? [["launchctl", ["bootout", `gui/${uid()}/${LABEL}`]]] : [];
 		cmds.push(["launchctl", ["bootstrap", `gui/${uid()}`, file]]);
-		if (await runAll(ctx, cmds)) ctx.ui.log.success(`installed ${file}`);
+		if (!(await runAll(ctx, cmds))) return;
+		ctx.ui.log.success(`installed ${file}`);
+		warnDaemonUp();
 		return;
 	}
 
@@ -156,6 +173,7 @@ async function install(ctx: SetupContext, kind: Kind, active: boolean): Promise<
 	if (active) cmds.push(["systemctl", ["--user", "restart", UNIT]]);
 	if (!(await runAll(ctx, cmds))) return;
 	ctx.ui.log.success(`installed ${file}`);
+	warnDaemonUp();
 
 	const user = ctx.env.USER || userInfo().username;
 	const linger = await ctx.run("loginctl", ["show-user", user, "-p", "Linger"]);
@@ -169,12 +187,12 @@ async function install(ctx: SetupContext, kind: Kind, active: boolean): Promise<
 async function remove(ctx: SetupContext, kind: Kind, active: boolean): Promise<void> {
 	const file = fileOf(ctx, kind);
 	if (kind === "systemd") {
-		if (!(await runAll(ctx, [["systemctl", ["--user", "disable", "--now", UNIT]]]))) return;
+		if (!(await runAll(ctx, [["systemctl", ["--user", "disable", "--now", UNIT]]], [`rm ${file}`, "systemctl --user daemon-reload"]))) return;
 		rmSync(file, { force: true });
 		await runAll(ctx, [["systemctl", ["--user", "daemon-reload"]]]);
 	} else {
 		// bootout fails on an agent that is not loaded; only a loaded one needs it.
-		if (active && !(await runAll(ctx, [["launchctl", ["bootout", `gui/${uid()}/${LABEL}`]]]))) return;
+		if (active && !(await runAll(ctx, [["launchctl", ["bootout", `gui/${uid()}/${LABEL}`]]], [`rm ${file}`]))) return;
 		rmSync(file, { force: true });
 	}
 	ctx.ui.log.success(`removed ${file}`);

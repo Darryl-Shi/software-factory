@@ -1,5 +1,5 @@
 // Setup section "service" (spec §3.4): systemd user unit on linux, launchd agent on darwin. Commands are stubbed.
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import { setDefaultSecretStore } from "../src/core/settings.ts";
@@ -86,6 +86,43 @@ describe("setup service", () => {
 		expect(ui.remaining()).toBe(0);
 	});
 
+	test("declining to stop the running factory installs, then warns with the restart command", async () => {
+		const { calls, run } = stubRun({
+			"systemctl --user is-active software-factory": { code: 3 },
+			"loginctl show-user alice -p Linger": { stdout: "Linger=yes\n" },
+		});
+		const { ctx, ui } = testContext({ answers: ["install", false], run, env: { PATH: "/usr/bin", USER: "alice" }, daemonPid: 999_999_999 });
+		await step.run(ctx);
+		expect(calls).toContain("systemctl --user enable --now software-factory");
+		expect(ui.shown.filter((s) => s.kind === "log.warn").map((s) => s.message)).toEqual([
+			"the service will fail while the running factory is up; stop it, then run: systemctl --user restart software-factory",
+		]);
+		expect(ui.remaining()).toBe(0);
+	});
+
+	test("darwin: declining to stop warns with launchctl kickstart", async () => {
+		const { run } = stubRun({ [`launchctl print gui/${uid}/dev.software-factory`]: { code: 113 } });
+		const { ctx, ui } = testContext({ answers: ["install", false], run, platform: "darwin", env: { PATH: "/usr/bin" }, daemonPid: 999_999_999 });
+		await step.run(ctx);
+		expect(ui.shown.filter((s) => s.kind === "log.warn").map((s) => s.message)).toEqual([
+			`the service will fail while the running factory is up; stop it, then run: launchctl kickstart -k gui/${uid}/dev.software-factory`,
+		]);
+	});
+
+	test("remove failure keeps the unit and the manual command includes rm and daemon-reload", async () => {
+		const { calls, run } = stubRun({ "systemctl --user disable --now software-factory": { code: 1, stderr: "Failed to connect to bus\n" } });
+		const { ctx, ui } = testContext({ answers: ["remove"], run });
+		const unit = servicePaths(ctx.homedir).unit;
+		mkdirSync(dirname(unit), { recursive: true });
+		writeFileSync(unit, "x");
+		await step.run(ctx);
+		expect(existsSync(unit)).toBe(true);
+		expect(calls.at(-1)).toBe("systemctl --user disable --now software-factory");
+		expect(ui.shown.filter((s) => s.kind === "log.info").map((s) => s.message)).toEqual([
+			`run it yourself: systemctl --user disable --now software-factory && rm ${unit} && systemctl --user daemon-reload`,
+		]);
+	});
+
 	test("systemctl failure keeps the unit and shows the manual command", async () => {
 		const { calls, run } = stubRun({
 			"systemctl --user is-active software-factory": { code: 3 },
@@ -151,7 +188,9 @@ describe("setup service", () => {
 		expect(content).toContain("<key>SuccessfulExit</key>\n\t\t<false/>");
 		expect(content).toContain(`<key>StandardOutPath</key>\n\t<string>${join(home, "factory.log")}</string>`);
 		expect(calls).toEqual([`launchctl print gui/${uid}/dev.software-factory`, `launchctl bootstrap gui/${uid} ${plist}`]);
+		expect(statSync(join(home, "factory.log")).mode & 0o777).toBe(0o600);
 		expect(ui.shown.filter((s) => s.kind === "log.error")).toEqual([]);
+		expect(ui.shown.filter((s) => s.kind === "log.warn")).toEqual([]);
 		expect(ui.remaining()).toBe(0);
 	});
 
