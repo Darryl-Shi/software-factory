@@ -70,13 +70,52 @@ describe("prereqs", () => {
 	});
 
 	it("the confirm defaults to No", async () => {
+		const asked: { message: string; initial?: boolean }[] = [];
 		const { ctx } = testContext({
-			answers: ["continue", (o: { initial?: boolean }) => o.initial === true],
+			answers: [
+				"continue",
+				(o: { message: string; initial?: boolean }) => {
+					asked.push(o);
+					return false;
+				},
+			],
 			run: stubRun(["git", "gh"]).run,
 			env: { SF_TEST_SANDBOX_DEPS: JSON.stringify(["socat not installed"]) },
 		});
 		await step.run(ctx);
+		expect(asked).toHaveLength(1);
+		expect(asked[0]!.message).toBe(DISABLE);
+		expect(asked[0]!.initial).toBe(false);
 		expect((await ctx.settings()).raw().sandbox).toBeUndefined();
+	});
+
+	it("a missing ripgrep gets its install hint", async () => {
+		const { ctx, ui } = testContext({
+			answers: ["continue", false],
+			run: stubRun(["git", "gh", "which apt-get"]).run,
+			env: { SF_TEST_SANDBOX_DEPS: JSON.stringify(["ripgrep (rg) not found"]) },
+		});
+		await step.run(ctx);
+		const body = ui.shown.find((s) => s.kind === "note")!.body!;
+		expect(body).toContain("sandbox runtime: ripgrep (rg) not found\n  sudo apt install ripgrep");
+	});
+
+	it("bwrap errors other than not installed are listed without an install hint", async () => {
+		const errors = [
+			"bubblewrap (bwrap) not executable at /opt/bwrap",
+			"socat not executable at /opt/socat",
+			"sandbox cannot run as root without CAP_SETFCAP (bubblewrap: setting up uid map: Permission denied)",
+		];
+		const { ctx, ui } = testContext({
+			answers: ["continue", false],
+			run: stubRun(["git", "gh", "which apt-get"]).run,
+			env: { SF_TEST_SANDBOX_DEPS: JSON.stringify(errors) },
+		});
+		await step.run(ctx);
+		const body = ui.shown.find((s) => s.kind === "note")!.body!;
+		for (const e of errors) expect(body).toContain(`sandbox runtime: ${e}`);
+		expect(body).not.toContain("sudo apt install");
+		expect(ui.shown.some((s) => s.kind === "confirm" && s.message === DISABLE)).toBe(true);
 	});
 
 	it("all present → status ok", async () => {
@@ -128,6 +167,8 @@ describe("prereqs", () => {
 		expect(installHint("bubblewrap", "dnf")).toBe("sudo dnf install bubblewrap");
 		expect(installHint("gh", "pacman")).toBe("sudo pacman -S github-cli");
 		expect(installHint("git", "brew")).toBe("brew install git");
+		for (const pm of ["dnf", "pacman", "brew"] as const) expect(installHint("ripgrep", pm)).toContain(" ripgrep");
+		expect(installHint("ripgrep", "apt")).toBe("sudo apt install ripgrep");
 		expect(installHint("gh", undefined)).toBe("install gh with your package manager");
 	});
 });

@@ -4,7 +4,7 @@ import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
 import { FactoryError } from "../../core/types.ts";
 import type { SetupContext, Step, StepStatus } from "../context.ts";
 
-type Tool = "git" | "gh" | "bubblewrap" | "socat";
+type Tool = "git" | "gh" | "bubblewrap" | "socat" | "ripgrep";
 type PackageManager = "apt" | "dnf" | "pacman" | "brew";
 
 const DISABLE_SANDBOX = "Disable the sandbox (sandbox.enabled: false)? Agents' commands would run unconfined";
@@ -40,6 +40,17 @@ interface Missing {
 	sandbox: boolean;
 }
 
+/**
+ * The tool an error says is absent, matching checkDependencies()'s exact messages. Other errors (`bubblewrap (bwrap)
+ * not executable at <path>`, the uid-0/CAP_SETFCAP refusal) concern an installed tool and get no install hint.
+ */
+function notInstalled(error: string): Tool | undefined {
+	if (error === "bubblewrap (bwrap) not installed") return "bubblewrap";
+	if (error === "socat not installed") return "socat";
+	if (/^ripgrep \(.+\) not found$/.test(error)) return "ripgrep";
+	return undefined;
+}
+
 /** The sandbox runtime's errors: `SF_TEST_SANDBOX_DEPS` (a JSON array) in tests, else `checkDependencies()`. */
 function sandboxErrors(ctx: SetupContext): string[] {
 	const injected = ctx.env.SF_TEST_SANDBOX_DEPS;
@@ -62,7 +73,7 @@ async function check(ctx: SetupContext): Promise<Missing[]> {
 	if (!(await present(ctx, "git", ["--version"]))) missing.push({ name: "git", problem: "git not found", tool: "git", sandbox: false });
 	if (!(await present(ctx, "gh", ["--version"]))) missing.push({ name: "gh", problem: "gh not found", tool: "gh", sandbox: false });
 	for (const e of sandboxErrors(ctx)) {
-		const tool: Tool | undefined = /bubblewrap|bwrap/.test(e) ? "bubblewrap" : /socat/.test(e) ? "socat" : undefined;
+		const tool = notInstalled(e);
 		missing.push({ name: SANDBOX, problem: e, tool, sandbox: true });
 	}
 	if (ctx.platform === "darwin" && !(await present(ctx, "which", ["sandbox-exec"]))) {
