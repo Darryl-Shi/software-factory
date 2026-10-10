@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { homedir } from "node:os";
 import { dirname } from "node:path";
 import YAML from "yaml";
+import type { SecretStore } from "../secrets/store.ts";
 import { type EffectiveSettings, FactoryError, type Project, type Scope, type SettingField, type SettingSource } from "./types.ts";
 
 export type Obj = Record<string, any>;
@@ -14,15 +15,22 @@ export function expandHome(p: string): string {
 	return p === "~" ? homedir() : p.startsWith("~/") ? homedir() + p.slice(1) : p;
 }
 
-/** Resolve a `secretRef` setting (`env:NAME` or `file:/path`) where the secret is used; undefined when missing. */
-export function resolveSecret(ref: string | undefined): string | undefined {
+// Set once by each process entry point (main, doctor, setup) so `store:` refs resolve without threading a store (spec §2.2).
+let defaultSecretStore: SecretStore | undefined;
+export function setDefaultSecretStore(store: SecretStore | undefined): void {
+	defaultSecretStore = store;
+}
+
+/** Resolve a `secretRef` setting (`env:NAME`, `file:/path` or `store:key`) where the secret is used; undefined when missing. */
+export function resolveSecret(ref: string | undefined, store?: SecretStore): string | undefined {
 	if (!ref) return undefined;
 	if (ref.startsWith("env:")) return process.env[ref.slice(4)];
 	if (ref.startsWith("file:")) {
 		const p = expandHome(ref.slice(5));
 		return existsSync(p) ? readFileSync(p, "utf8").trim() : undefined;
 	}
-	return undefined; // store: references need a secret-store integration (not in v1)
+	if (ref.startsWith("store:")) return (store ?? defaultSecretStore)?.get(ref.slice(6));
+	return undefined;
 }
 
 // ---------------------------------------------------------------- the schema (web, storage and version are global-only)

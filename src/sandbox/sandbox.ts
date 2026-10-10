@@ -224,7 +224,8 @@ export class Sandbox {
 	}
 
 	private policy(rec: EnvRecord) {
-		const deny = [...rec.sandbox.denyRead.map(expandHome), ...(rec.credentials?.files ?? [])].map((p) => real(p));
+		// The factory home (parent of stateDir) holds secrets.json; deny it whatever denyRead says.
+		const deny = [...rec.sandbox.denyRead.map(expandHome), ...(rec.credentials?.files ?? []), dirname(this.stateDir)].map((p) => real(p));
 		const builder = rec.role === "builder";
 		const writeRoots = [rec.scratch, ...(builder ? [rec.worktree, ...(rec.gitCommonDir ? [rec.gitCommonDir] : []), ...rec.sandbox.extraWrite.map(expandHome)] : [])].map(real);
 		const denyWrite = builder && rec.gitCommonDir ? [join(rec.gitCommonDir, "hooks"), join(rec.gitCommonDir, "config")].map(real) : [];
