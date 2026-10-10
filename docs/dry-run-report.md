@@ -1,10 +1,10 @@
-# Dry run of spec §8 — 2026-10-09T16:46:46.620Z
+# Dry run of spec §8 — 2026-10-10T13:50:14.792Z
 
-Directory: /home/dshi/tmp-sf/dr6b. Scripted agents (no model credentials), sandbox OFF (DRYRUN_SANDBOX=0), fake GitHub with local CI runner, SQLite storage, a daemonized `factory serve` driven through the web HTTP API (`POST /api/op/<op>`, `GET /api/events`).
+Directory: /tmp/sf-dry1. Scripted agents (no model credentials), sandbox OFF (DRYRUN_SANDBOX=0), fake GitHub with local CI runner, SQLite storage, a daemonized `factory serve` driven through the web HTTP API (`POST /api/op/<op>`, `GET /api/events`).
 
 Dropped CLI-only checks: none. The terminal attach view check is replaced by the SSE event stream check.
 
-**54/54 checks passed.**
+**62/62 checks passed.**
 
 ## §8.1 zero-to-MVP: createProject todo → me/todo and startRun (repo does not exist)
 - ✅ repo did not exist before the run
@@ -27,6 +27,16 @@ Dropped CLI-only checks: none. The terminal attach view check is replaced by the
 - ✅ if-present on a repo without CI: finished and noted that there was no CI
 - ✅ cost per role per round recorded in the run Document
 - ✅ helper Conversation spawned by the builder is visible in the transcript view
+- ✅ the builder's helper wrote code: scripts/run.sh is on the delivered main
+
+## AQ testing on (fake) boat.dev VMs, beside each review
+- ✅ QA ran in both review rounds
+- ✅ round 1 QA failed for a real reason (remove) and cited a screenshot
+- ✅ the screenshot is served by the web server as image/png
+- ✅ every QA VM of the run was deleted after its round
+- ✅ QA cost (agent tokens + VM time) recorded per round
+- ✅ no screenshot was committed to the repo
+- ✅ the delivery notes record the QA status
 - ✅ the SSE event stream reported run.state → DELIVERED and builder and reviewer activity (conversation.updated)
 
 ## §8.4 invalid setting is rejected and the config file is unchanged

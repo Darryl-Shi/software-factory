@@ -38,6 +38,11 @@ roles:
   builder: { model: scripted/builder }
   helper: { model: scripted/helper }
   reviewer: { model: scripted/reviewer }
+  qa: { model: scripted/qa }
+qa:
+  enabled: true
+boat:
+  apiKey: env:DRYRUN_BOAT_KEY
 workdir: ${join(DIR, "work")}
 sandbox:
   enabled: ${SANDBOX}
@@ -70,7 +75,7 @@ async function factory(...args: string[]): Promise<string> {
 	try {
 		const { stdout, stderr } = await pexec(BIN, args, {
 			cwd: DIR,
-			env: { ...process.env, NO_COLOR: "1", DRYRUN_TURN_DELAY_MS: process.env.DRYRUN_TURN_DELAY_MS ?? "250" },
+			env: { ...process.env, NO_COLOR: "1", DRYRUN_BOAT_KEY: "fake-boat-key", DRYRUN_TURN_DELAY_MS: process.env.DRYRUN_TURN_DELAY_MS ?? "250" },
 			maxBuffer: 64 << 20,
 		});
 		appendFileSync(join(DIR, "serve.log"), `$ factory ${args.join(" ")}\n${stdout}${stderr}`);
@@ -87,7 +92,7 @@ const token = () => new URL(link).searchParams.get("token") ?? "";
 const auth = () => ({ authorization: `Bearer ${token()}` });
 
 async function serve() {
-	link = await factory("serve", "--config", CONFIG, "--fake-github", GH, "--scripted", "--ci-poll-ms", "200");
+	link = await factory("serve", "--config", CONFIG, "--fake-github", GH, "--fake-boat", join(DIR, "boat"), "--scripted", "--ci-poll-ms", "200");
 	if (!/^http:\/\/127\.0\.0\.1:\d+\/\?token=/.test(link)) throw new Error(`factory serve printed no link: ${link}`);
 }
 async function kill9(): Promise<number> {
@@ -298,6 +303,20 @@ async function main() {
 	check("if-present on a repo without CI: finished and noted that there was no CI", v1.noCi === true && v1.history.some((h) => h.to === "AWAITING_CI"));
 	check("cost per role per round recorded in the run Document", ["architect", "builder", "reviewer"].every((r) => v1.cost.some((c) => c.role === r)) && v1.cost.filter((c) => c.role === "reviewer").map((c) => c.round).join() === "1,2", JSON.stringify(v1.cost.map((c) => [c.role, c.round])));
 	check("helper Conversation spawned by the builder is visible in the transcript view", trB.helpers.length === 1);
+	check("the builder's helper wrote code: scripts/run.sh is on the delivered main", existsSync(join(c1, "scripts/run.sh")) && /demo-todo\.json/.test(readFileSync(join(c1, "scripts/run.sh"), "utf8")));
+	section("AQ testing on (fake) boat.dev VMs, beside each review");
+	check("QA ran in both review rounds", v1.reviews.length === 2 && v1.reviews.every((r) => r.qaStatus === "ran") && v1.qaStatus === "ran", JSON.stringify(v1.reviews.map((r) => r.qaStatus)));
+	const qa1 = v1.findingsLog.find((e) => e.kind === "qa" && e.reviewSeq === 1);
+	check("round 1 QA failed for a real reason (remove) and cited a screenshot", !!qa1 && qa1.findings.some((f) => f.blocking && /remove/i.test(f.description) && (f.screenshots?.length ?? 0) > 0), JSON.stringify(qa1));
+	const shotId = qa1?.findings[0]?.screenshots?.[0] ?? "r1-s1";
+	const shot = await fetch(new URL(`/api/runs/${run1}/screenshots/${shotId}`, link), { headers: auth() });
+	check("the screenshot is served by the web server as image/png", shot.status === 200 && shot.headers.get("content-type") === "image/png" && (await shot.arrayBuffer()).byteLength > 0);
+	const { LocalBoatBackend } = await import("../src/boat/backend.ts");
+	const vms = await new LocalBoatBackend(join(DIR, "boat")).list();
+	check("every QA VM of the run was deleted after its round", vms.filter((x) => x.name?.includes(run1)).length === 0, JSON.stringify(vms));
+	check("QA cost (agent tokens + VM time) recorded per round", v1.cost.filter((c) => c.role === "qa").some((c) => (c.vmSeconds ?? 0) > 0) && v1.cost.filter((c) => c.role === "qa" && c.usd !== undefined).length >= 2);
+	check("no screenshot was committed to the repo", !/\.png/.test((await pexec("git", ["ls-files"], { cwd: c1 })).stdout));
+	check("the delivery notes record the QA status", /QA status/.test(readFileSync(join(c1, "docs/delivery-notes.md"), "utf8")));
 	const states1 = stream1.got.flatMap((e) => (e.type === "run.state" ? [e.to] : []));
 	const active1 = new Set(stream1.got.flatMap((e) => (e.type === "conversation.updated" && e.run === run1 ? [e.role] : [])));
 	check(

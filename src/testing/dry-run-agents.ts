@@ -1,7 +1,8 @@
 // Scripted agents for the §8 dry run (no model credentials on this machine). They behave like a small, competent
 // team building a Node.js "todo" CLI: the architect asks grounded questions one at a time and writes a spec with
 // acceptance behaviours; the builder really writes, tests and commits code in the sandboxed worktree (and spawns a
-// helper); the reviewer really runs the test suite and the acceptance behaviours and reports evidence it observed.
+// helper that writes the QA run script); the reviewer really runs the test suite and the acceptance behaviours and
+// reports evidence it observed; the QA agent uses the product in the (fake) boat.dev VM and cites screenshots.
 // Round 1 of a new todo build deliberately ships without `remove`, so the first review fails for a real reason.
 import { call, calls, humanText, type Script, type ScriptContext, say } from "./scripted.ts";
 
@@ -417,7 +418,7 @@ export const builder: Script = async (ctx) => {
 		// initial build of this run
 		if (isMvp || /new repo/i.test(spec)) {
 			const opts = { remove: false, due: false, ci };
-			if (t === 0) return slow(call("subagent", { task: "List the files in the workspace and tell me whether AGENTS.md or a setup script exists. Reply in one short paragraph." }));
+			if (t === 0) return slow(call("subagent", { task: "Write scripts/run.sh: a run script that prepares a demo todo list (TODO_FILE=$HOME/demo-todo.json) with the CLI, for AQ testing. Then list the workspace files and say whether AGENTS.md exists. Reply in one short paragraph." }));
 			if (t === 1) return slow(writes(files(opts)));
 			if (t === 2) return slow(call("bash", { command: "npm test 2>&1 | tail -15" }));
 			if (t === 3) return slow(commit("feat: todo CLI with add/list/done, JSON storage, tests", "- round 1: built add/list/done with JSON storage and tests"));
@@ -462,10 +463,38 @@ export const builder: Script = async (ctx) => {
 	return respond();
 };
 
+const RUN_SH = `#!/bin/sh
+# Run script for AQ testing (boat.runScripts): seeds a demo list so the product has something to show.
+export TODO_FILE="$HOME/demo-todo.json"
+rm -f "$TODO_FILE"
+node bin/todo.js add "demo: buy milk" && node bin/todo.js add "demo: walk the dog" && node bin/todo.js list
+`;
+
+// The builder's helper writes code: the run script AQ testing launches in the VM.
 export const helper: Script = async (ctx) => {
-	if (ctx.turn === 0) return slow(call("bash", { command: "ls -la; test -f AGENTS.md && echo HAS-AGENTS || echo NO-AGENTS; ls scripts 2>/dev/null || echo NO-SETUP-SCRIPT" }));
+	if (ctx.turn === 0) return slow(call("write", { path: "scripts/run.sh", content: RUN_SH }));
+	if (ctx.turn === 1) return slow(call("bash", { command: "chmod +x scripts/run.sh; ls -la; test -f AGENTS.md && echo HAS-AGENTS || echo NO-AGENTS" }));
 	const r = lastResult(ctx, "bash")?.text ?? "";
-	return say(`Workspace summary: ${/NO-AGENTS/.test(r) ? "no AGENTS.md yet" : "AGENTS.md present"}; ${/NO-SETUP-SCRIPT/.test(r) ? "no setup script yet" : "a scripts/ dir exists"}. Files: ${r.split("\n").filter((l) => /^[-d]/.test(l)).length}.`);
+	return say(`Wrote scripts/run.sh (seeds a demo list). ${/NO-AGENTS/.test(r) ? "No AGENTS.md yet" : "AGENTS.md present"}; files: ${r.split("\n").filter((l) => /^[-d]/.test(l)).length}.`);
+};
+
+// ------------------------------------------------------------------ QA (AQ testing in the VM)
+// Uses the product as a user would (in the VM, from ~/app), takes a screenshot through the Cua Driver, and
+// cites it. Round 1 of the MVP has no `remove`, which QA reports as a blocking finding with the screenshot.
+export const qa: Script = async (ctx) => {
+	const t = ctx.turn;
+	const due = /--overdue/.test(first(ctx));
+	const use = due
+		? `export TODO_FILE=$HOME/qa-$RANDOM.json; node bin/todo.js add "pay rent" --due 2000-01-01; node bin/todo.js list --overdue`
+		: `export TODO_FILE=$HOME/qa-$RANDOM.json; node bin/todo.js add "qa item" && node bin/todo.js list; node bin/todo.js remove 1; echo "remove-exit=$?"`;
+	if (t === 0) return slow(call("bash", { command: use }));
+	if (t === 1) return slow(call("computer", { action: "get_window_state", args: { pid: 1, window_id: 1 } }));
+	const out = ctx.results[0]?.text ?? "";
+	const shot = /Screenshot (r\d+-s\d+)/.exec(lastResult(ctx, "computer")?.text ?? "")?.[1];
+	if (!shot) return slow(call("submit_qa", { verdict: "pass", findings: [] }));
+	if (!due && !/remove-exit=0/.test(out))
+		return slow(call("submit_qa", { verdict: "fail", findings: [{ severity: "major", blocking: true, description: "Removing an item fails: `todo remove 1` is rejected.", evidence: `$ ${use}\n${out.slice(-800)}`, screenshots: [shot] }] }));
+	return slow(call("submit_qa", { verdict: "pass", findings: [{ severity: "minor", blocking: false, description: "The list output has no header; a first-time user may not know what the columns mean.", evidence: `$ ${use}\n${out.slice(-600)}`, screenshots: [shot] }] }));
 };
 
 // ------------------------------------------------------------------ reviewer
@@ -511,6 +540,7 @@ export const DRY_RUN_SCRIPTS: Record<string, Script> = {
 	architect,
 	builder,
 	helper,
+	qa,
 	reviewer: reviewer(false),
 	"reviewer-strict": reviewer(true),
 	"reviewer-b": reviewer(false),
