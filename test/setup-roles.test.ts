@@ -1,9 +1,12 @@
 // Setup section "roles" (spec §3.4).
-import { resolve } from "node:path";
+import { readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import { setDefaultSecretStore } from "../src/core/settings.ts";
 import { step } from "../src/setup/steps/roles.ts";
+import { SetupCancelled } from "../src/setup/ui.ts";
 import { testContext, type TestContextOptions } from "./setup-context.ts";
+import { CANCEL } from "./setup-helpers.ts";
 
 afterEach(() => setDefaultSecretStore(undefined));
 
@@ -110,6 +113,71 @@ describe("setup roles", () => {
 		expect(ui.shown.filter((s) => s.kind === "log.warn").map((s) => s.message)).toEqual([FAMILY]);
 		expect((await ctx.settings()).raw().roles.reviewer).toEqual({ model: "scripted/reviewer", thinking: "high" });
 		expect(ui.remaining()).toBe(0);
+	});
+
+	test("an unknown current model is shown as (unknown model) and is not the default; a non-image qa model as (no image input)", async () => {
+		type Seen = { message: string; options: { value: string; label: string; hint?: string }[]; initial?: string };
+		const seen: Seen[] = [];
+		const keep = (o: Seen) => {
+			seen.push(o);
+			return o.initial;
+		};
+		const config = ALL_SCRIPTED.replace("model: scripted/builder", "model: nope/x").replace("model: scripted/qa", "model: sf-fixture/text-1");
+		const { ctx, ui } = await withFixture({ config, answers: Array(9).fill(keep) });
+		await step.run(ctx);
+		const builder = seen.find((o) => o.message === "Model for builder")!;
+		expect(builder.options[0]).toEqual({ value: "nope/x", label: "nope/x", hint: "(unknown model)" });
+		expect(builder.initial).toBe(builder.options[1]!.value);
+		const qa = seen.find((o) => o.message === "Model for qa")!;
+		expect(qa.options[0]).toEqual({ value: "sf-fixture/text-1", label: "Text 1", hint: "(no image input)" });
+		expect(qa.initial).toBe(qa.options[1]!.value);
+		expect(ui.shown.filter((s) => s.kind === "log.error")).toEqual([]);
+		const roles = (await ctx.settings()).raw().roles;
+		expect(roles.builder.model).toBe(builder.options[1]!.value);
+		expect(roles.qa.model).toBe(qa.options[1]!.value);
+		expect(ui.remaining()).toBe(0);
+	});
+
+	const BAD_BUILDER = ALL_SCRIPTED.replace("model: scripted/builder", "model: nope/x");
+	const PICK_BAD = ["scripted/architect", "low", "nope/x", "medium", "__builder__", "sf-fixture/text-1", "high", "scripted/qa", "off"];
+
+	test("a failed save keeps the choices and retries only the roles the error names", async () => {
+		const inits: Record<string, string | undefined> = {};
+		const keep = (o: { message: string; initial?: string }) => {
+			inits[o.message] = o.initial;
+			return o.initial;
+		};
+		const { ctx, ui, home } = await withFixture({ config: BAD_BUILDER, answers: [...PICK_BAD, "retry", "scripted/builder", keep, keep] });
+		const before = readFileSync(join(home, "config.yaml"), "utf8");
+		await step.run(ctx);
+		const errors = ui.shown.filter((s) => s.kind === "log.error").map((s) => s.message);
+		expect(errors).toHaveLength(1);
+		expect(errors[0]).toContain("roles.builder.model: nope/x");
+		const retry = ui.shown.findIndex((s) => s.kind === "select" && s.message === "Roles were not saved");
+		expect(ui.shown[retry]!.options).toEqual(["retry", "skip"]);
+		expect(ui.shown.slice(retry + 1).filter((s) => s.kind === "select").map((s) => s.message)).toEqual(["Model for builder", "Thinking for builder", "Model for helper"]);
+		expect(inits).toEqual({ "Thinking for builder": "medium", "Model for helper": "__builder__" });
+		expect(readFileSync(join(home, "config.yaml"), "utf8")).not.toBe(before);
+		expect((await ctx.settings()).raw().roles).toEqual({
+			architect: { model: "scripted/architect", thinking: "low" },
+			builder: { model: "scripted/builder", thinking: "medium" },
+			reviewer: { model: "sf-fixture/text-1", thinking: "high" },
+			qa: { model: "scripted/qa", thinking: "off" },
+		});
+		expect(ui.remaining()).toBe(0);
+	});
+
+	test("a failed save then Skip saves nothing", async () => {
+		const { ctx, ui, home } = await withFixture({ config: BAD_BUILDER, answers: [...PICK_BAD, "skip"] });
+		await step.run(ctx);
+		expect(readFileSync(join(home, "config.yaml"), "utf8")).toBe(BAD_BUILDER);
+		expect(ui.remaining()).toBe(0);
+	});
+
+	test("a cancel mid-section leaves the config unchanged", async () => {
+		const { ctx, home } = await withFixture({ config: ALL_SCRIPTED, answers: ["scripted/builder", "low", "sf-fixture/text-1", CANCEL] });
+		await expect(step.run(ctx)).rejects.toBeInstanceOf(SetupCancelled);
+		expect(readFileSync(join(home, "config.yaml"), "utf8")).toBe(ALL_SCRIPTED);
 	});
 
 	test("no available model is an error", async () => {
