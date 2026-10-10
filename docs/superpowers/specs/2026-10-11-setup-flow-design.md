@@ -131,10 +131,14 @@ class SecretStore {
   - `parallel`.
 - `resolveSecret(ref, store?)` in `src/core/settings.ts` resolves `store:<key>` through the store, and returns
   undefined when there is no store or no such key. `env:` and `file:` behave as before.
-- The store reaches the code that resolves secrets without a module-level global:
-  - `Factory` gets an optional `secrets: SecretStore` dependency;
-  - `GhApiHost`, `Boat` and `web-search` receive it from where they are built (`main.ts`) or from the `Factory`;
-  - `doctor` builds one.
+- The store reaches the code that resolves secrets through a **process default**:
+  - `setDefaultSecretStore(store)` in `settings.ts` is called once by each long-lived entry point
+    (`startFactoryProcess`, `createSetupContext`); `doctor` builds its own store and passes it explicitly;
+  - `resolveSecret(ref, store?)` uses an explicit store first, then the default.
+
+  The `web_search` tool is a static agent extension and `Boat`/`GhApiHost` resolve secrets deep inside, so passing
+  a store explicitly through all of them would be invasive. Tests reset the default in `afterEach`. (Amended during
+  planning.)
 - Validation is unchanged: `store:key` already passes as a `secretRef`.
 
 ### 2.3 Sandbox
@@ -202,8 +206,9 @@ class SetupCancelled extends Error {}
 interface SetupContext {
   configPath: string; factoryHome: string;
   ui: SetupUi;
-  settings: ConfigStore;              // the existing validated settings API (effective/raw, set/unset with validate-on-save)
-  host: () => Promise<ModelHost>;     // lazy; rebuilt after packages/models.json change
+  settings(): Promise<ConfigStore>;   // the existing validated settings API over the current host's models
+  host(): Promise<ModelHost>;         // lazy, cached
+  reloadHost(): Promise<ModelHost>;   // rebuild after packages/models.json change (settings() follows)
   secrets: SecretStore;
   run: (cmd: string, args: string[], opts?: { input?: string }) => Promise<{ code: number; stdout: string; stderr: string }>;
   platform: NodeJS.Platform; env: NodeJS.ProcessEnv; homedir: string;
@@ -211,6 +216,8 @@ interface SetupContext {
 }
 ```
 
+- `ConfigStore` reloads the file when its mtime or size changed before reading or writing. A running daemon then sees
+  setup's writes for new runs, and a later web-UI save does not overwrite them.
 - Settings are written through the same validated save the web UI uses. If validation fails, the error is shown and
   the prompt is asked again.
 - Setup works whether or not the factory is running.
@@ -291,8 +298,10 @@ A loop over these actions until **Done**:
      - `reasoning` (yes/no).
 
      Cost is written as zero.
-  4. Optional test call: one `completeSimple` with "Reply with OK" to the first model.
-  5. Write the provider to `models.json`, keeping the other entries.
+  4. Write the provider to `models.json` (without an `apiKey` field), keeping the other entries, and reload the host.
+     For key auth, store the key through `models.login(id, "api_key", /* prefilled with the key already typed */)`.
+     pi gives every `models.json` provider a generic API-key login that writes `auth.json`.
+  5. Optional test call: one `completeSimple` with "Reply with OK" to the first model.
 - **Remove a compatible endpoint.** Refused while a role setting uses it.
 
 Whenever packages or `models.json` changed and the factory is running, setup asks at the end of the section whether to
