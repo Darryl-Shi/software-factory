@@ -237,6 +237,40 @@ describe("setup service", () => {
 		expect(ui.remaining()).toBe(0);
 	});
 
+	test("BOAT_API_KEY is not listed when AQ testing is off globally", async () => {
+		const { run } = stubRun({ "systemctl --user is-active software-factory": { code: 3 }, "loginctl show-user alice -p Linger": { stdout: "Linger=yes\n" } });
+		const { ctx, ui } = testContext({
+			answers: ["install", true],
+			run,
+			config: "version: 1\nqa:\n  enabled: false\n",
+			env: { PATH: "/usr/bin", USER: "alice", BOAT_API_KEY: "bk", PARALLEL_API_KEY: "pk" },
+		});
+		await step.run(ctx);
+		expect(ui.shown.filter((s) => s.kind === "log.warn").map((s) => s.message)).toEqual([
+			"PARALLEL_API_KEY (webSearch.apiKey) is read from the environment, which the service won't have; run factory setup search to store it",
+		]);
+		expect(ui.remaining()).toBe(0);
+	});
+
+	test("a failing credential check warns and still installs", async () => {
+		const { calls, run } = stubRun({ "systemctl --user is-active software-factory": { code: 3 }, "loginctl show-user alice -p Linger": { stdout: "Linger=yes\n" } });
+		const { ctx, ui } = testContext({ answers: ["install"], run, env: { PATH: "/usr/bin", USER: "alice", GH_TOKEN: "ghp_x" } });
+		ctx.host = async () => {
+			throw new Error("extension exploded");
+		};
+		ctx.settings = async () => {
+			throw new Error("config.yaml: bad yaml");
+		};
+		await step.run(ctx);
+		expect(ui.shown.filter((s) => s.kind === "log.warn").map((s) => s.message)).toEqual([
+			"could not check which credentials come from the environment: config.yaml: bad yaml",
+		]);
+		expect(ui.shown.filter((s) => s.kind === "confirm")).toEqual([]);
+		expect(existsSync(servicePaths(ctx.homedir).unit)).toBe(true);
+		expect(calls).toContain("systemctl --user enable --now software-factory");
+		expect(ui.remaining()).toBe(0);
+	});
+
 	test("no warning when every credential is stored", async () => {
 		const { calls, run } = stubRun({
 			"systemctl --user is-active software-factory": { code: 3 },

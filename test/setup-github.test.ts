@@ -11,7 +11,9 @@ import { setDefaultSecretStore } from "../src/core/settings.ts";
 import { GhApiHost } from "../src/github/host.ts";
 import { runCommand } from "../src/setup/context.ts";
 import { step } from "../src/setup/steps/github.ts";
+import { SetupCancelled } from "../src/setup/ui.ts";
 import { testContext } from "./setup-context.ts";
+import { CANCEL } from "./setup-helpers.ts";
 
 afterEach(() => {
 	setDefaultSecretStore(undefined);
@@ -244,6 +246,27 @@ describe("setup github", () => {
 		expect(ctx.secrets.get("github")).toBeUndefined();
 		expect(readFileSync(join(home, "config.yaml"), "utf8")).toBe("version: 1\n");
 		expect(ui.remaining()).toBe(0);
+	});
+
+	test("Ctrl-C at the missing-scopes choice cancels the step; nothing is written", async () => {
+		const gh = fakeGh();
+		gh.authToken("gho_imported");
+		gh.route("GET /user", { status: 200, body: { login: "octo" }, headers: { "x-oauth-scopes": "read:org" } });
+		const { ctx, ui, home } = testContext({ answers: ["pat", "gh", CANCEL], env: { PATH: gh.path }, run: runCommand });
+		await expect(step.run(ctx)).rejects.toBeInstanceOf(SetupCancelled);
+		expect(ui.shown.filter((s) => s.kind === "select").at(-1)!.message).toBe("The token is missing scopes");
+		expect(messages(ui.shown, "log.error")).toEqual([]);
+		expect(ctx.secrets.keys()).toEqual([]);
+		expect(readFileSync(join(home, "config.yaml"), "utf8")).toBe("version: 1\n");
+	});
+
+	test("Ctrl-C at the verification-failed choice cancels the step", async () => {
+		const gh = fakeGh();
+		gh.route("GET /user", { status: 401, body: { message: "Bad credentials" } });
+		const { ctx, home } = testContext({ answers: ["pat", "paste", "ghp_bad", CANCEL], env: { PATH: gh.path }, run: runCommand });
+		await expect(step.run(ctx)).rejects.toBeInstanceOf(SetupCancelled);
+		expect(ctx.secrets.keys()).toEqual([]);
+		expect(readFileSync(join(home, "config.yaml"), "utf8")).toBe("version: 1\n");
 	});
 
 	test("a token with every scope saves without asking", async () => {

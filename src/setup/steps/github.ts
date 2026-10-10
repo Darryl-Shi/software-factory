@@ -7,6 +7,7 @@ import { resolveSecret } from "../../core/settings.ts";
 import { FactoryError } from "../../core/types.ts";
 import { GhApiHost, type Identity } from "../../github/host.ts";
 import type { SetupContext, Step } from "../context.ts";
+import { SetupCancelled } from "../ui.ts";
 
 type Kind = "pat" | "bot" | "app";
 type Visibility = "private" | "public";
@@ -188,14 +189,17 @@ async function credential(ctx: SetupContext, kind: Kind, current: Identity): Pro
 			collected = pat.collected;
 			verify = () => verifyToken(ctx, pat.token);
 		}
-		let next: "retry" | "save" | "skip";
+		// Only the check is guarded: a prompt's SetupCancelled (Ctrl-C) must propagate.
+		let verified: boolean | Error;
 		try {
-			if (await verify()) return collected;
-			next = await afterFailure(ctx, "The token is missing scopes");
+			verified = await verify();
 		} catch (e) {
-			ctx.ui.log.error(message(e));
-			next = await afterFailure(ctx);
+			if (e instanceof SetupCancelled) throw e;
+			verified = e instanceof Error ? e : new Error(message(e));
 		}
+		if (verified === true) return collected;
+		if (verified instanceof Error) ctx.ui.log.error(verified.message);
+		const next = verified === false ? await afterFailure(ctx, "The token is missing scopes") : await afterFailure(ctx);
 		if (next === "save") return collected;
 		if (next === "skip") return undefined;
 		current = collected.identity;

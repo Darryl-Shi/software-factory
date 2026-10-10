@@ -199,7 +199,8 @@ async function envCredentials(ctx: SetupContext): Promise<string[]> {
 	const id = eff.github?.identity ?? {};
 	const refs: [string, unknown, string][] = [
 		id.kind === "app" ? ["github.identity.privateKeyRef", id.privateKeyRef, "github"] : ["github.identity.tokenRef", id.tokenRef ?? "env:GH_TOKEN", "github"],
-		["boat.apiKey", eff.boat?.apiKey, "qa"],
+		// With AQ testing off globally, the boat key is not used.
+		...(eff.qa?.enabled === false ? [] : [["boat.apiKey", eff.boat?.apiKey, "qa"] as [string, unknown, string]]),
 		["webSearch.apiKey", eff.webSearch?.apiKey, "search"],
 	];
 	for (const [path, ref, section] of refs) {
@@ -218,7 +219,14 @@ async function envCredentials(ctx: SetupContext): Promise<string[]> {
 
 /** Warns about credentials the service won't see; true to install anyway (the default). */
 async function confirmEnvCredentials(ctx: SetupContext): Promise<boolean> {
-	const lines = await envCredentials(ctx);
+	let lines: string[];
+	try {
+		lines = await envCredentials(ctx);
+	} catch (e) {
+		// A broken config or model host must not block the install; it only skips the warning.
+		ctx.ui.log.warn(`could not check which credentials come from the environment: ${(e as Error).message}`);
+		return true;
+	}
 	if (lines.length === 0) return true;
 	ctx.ui.log.warn(lines.join("\n"));
 	return ctx.ui.confirm({ message: "Install the service anyway?", initial: true });
