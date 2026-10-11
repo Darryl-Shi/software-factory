@@ -1,9 +1,10 @@
 // The factory's web interface: a ticket board and full-screen run view in the browser, over the core's operations
 // and events (spec §3.6); the core knows nothing about it.
 //   POST /api/op/<op>   { args: [...] } → { ok, result } | { ok: false, error, code }   (the CORE_OPS allowlist)
-//   GET  /api/events?run=&project=&discussion=   server-sent events from core.subscribe (the same filter)
+//   GET  /api/events?run=&project=&discussion=&bundle=   server-sent events from core.subscribe (the same filter)
 //   GET  /api/runs/<run>/screenshots/<id> a QA screenshot (core.getScreenshot), as image/png
-//   GET  /, /app.js, /app.css            the UI (static files, no build step)
+//   GET  /api/bundles/<id>/screenshots/<sid> a bundle review's QA screenshot (core.getBundleScreenshot)
+//   GET  /, /app.js, /discussions.js, /bundles.js, /app.css   the UI (static files, no build step)
 // Access needs a token: `factory serve` prints a link carrying it, and the first visit swaps it for an HttpOnly,
 // SameSite=Strict cookie. The server binds to localhost by default and rejects foreign Host and Origin headers.
 import { randomBytes, timingSafeEqual } from "node:crypto";
@@ -18,6 +19,7 @@ const STATIC: Record<string, [string, string]> = {
 	"/": ["index.html", "text/html; charset=utf-8"],
 	"/app.js": ["app.js", "text/javascript; charset=utf-8"],
 	"/discussions.js": ["discussions.js", "text/javascript; charset=utf-8"],
+	"/bundles.js": ["bundles.js", "text/javascript; charset=utf-8"],
 	"/app.css": ["app.css", "text/css; charset=utf-8"],
 };
 const CSP = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
@@ -101,10 +103,10 @@ export async function startWebServer(core: FactoryCore, opts: WebOptions): Promi
 			const file = STATIC[url.pathname];
 			if (req.method === "GET" && file) return send(res, 200, readFileSync(join(UI_DIR, file[0]), "utf8"), file[1]);
 			if (req.method === "GET" && url.pathname === "/api/events") return events(req, res, url);
-			const shot = /^\/api\/runs\/([A-Za-z0-9._-]+)\/screenshots\/([A-Za-z0-9._-]+)$/.exec(url.pathname);
+			const shot = /^\/api\/(runs|bundles)\/([A-Za-z0-9._-]+)\/screenshots\/([A-Za-z0-9._-]+)$/.exec(url.pathname);
 			if (req.method === "GET" && shot) {
 				try {
-					const { mime, bytes } = await core.getScreenshot(shot[1]!, shot[2]!);
+					const { mime, bytes } = shot[1] === "bundles" ? await core.getBundleScreenshot(shot[2]!, shot[3]!) : await core.getScreenshot(shot[2]!, shot[3]!);
 					res.writeHead(200, { "content-type": mime, "cache-control": "private, max-age=86400", "x-content-type-options": "nosniff", "content-security-policy": "default-src 'none'" });
 					return res.end(Buffer.from(bytes));
 				} catch (e: any) {
@@ -144,8 +146,8 @@ export async function startWebServer(core: FactoryCore, opts: WebOptions): Promi
 	});
 
 	function events(req: IncomingMessage, res: ServerResponse, url: URL) {
-		const filter: { run?: string; project?: string; discussion?: string } = {};
-		for (const k of ["run", "project", "discussion"] as const) {
+		const filter: { run?: string; project?: string; discussion?: string; bundle?: string } = {};
+		for (const k of ["run", "project", "discussion", "bundle"] as const) {
 			const v = url.searchParams.get(k);
 			if (v) filter[k] = v;
 		}

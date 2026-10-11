@@ -8,6 +8,7 @@
 <link rel="stylesheet" href="/app.css">
 <script src="/app.js" defer></script>
 <script src="/discussions.js" defer></script>
+<script src="/bundles.js" defer></script>
 </head>
 <body>
 <div class="app" id="app">
@@ -69,10 +70,12 @@
       <span class="rv-key" id="rv-key"></span>
       <h2 class="rv-title" id="rv-title"></h2>
       <span id="rv-state"></span>
+      <span class="rv-links" id="rv-links"></span>
     </div>
     <div class="rv-progress" id="rv-progress" aria-label="Pipeline progress"></div>
     <div class="rv-actions">
       <span class="rv-disc-actions" id="rv-disc-actions"></span>
+      <span class="rv-extra" id="rv-extra"></span>
       <span class="rv-cost" id="rv-cost" title="Cost so far"></span>
       <button type="button" class="icon-btn" id="rv-details-btn" aria-label="Ticket details" aria-pressed="false" title="Ticket details"><svg viewBox="0 0 16 16"><path d="M2 2.5h12a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1zm.5 1.5v8h7V4zm8.5 0v8h2.5V4z"/></svg></button>
       <button type="button" class="rv-close" id="rv-close" aria-label="Close ticket" title="Close (Esc)"><svg viewBox="0 0 16 16"><path d="M13.53 3.53 5.56 11.5H10V13H3V6h1.5v4.44l7.97-7.97z"/></svg></button>

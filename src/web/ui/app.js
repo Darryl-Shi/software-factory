@@ -78,11 +78,18 @@ const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
 const same = (a, b) => a != null && b != null && String(a) === String(b);
 const TERMINAL = ["DELIVERED", "FAILED", "CANCELLED"];
 
-function toast(text, kind = "") {
+// `action` ({ label, onClick }) adds a button to the toast, e.g. a link that opens what was just created.
+function toast(text, kind = "", action) {
   const el = document.createElement("div");
   el.className = `toast ${kind}`; el.textContent = text;
+  if (action) {
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "toast-act"; b.textContent = action.label;
+    b.addEventListener("click", () => { el.remove(); action.onClick(); });
+    el.append(" ", b);
+  }
   $("#toasts").append(el);
-  setTimeout(() => el.remove(), kind === "error" ? 6000 : 3800);
+  setTimeout(() => el.remove(), kind === "error" ? 6000 : action ? 9000 : 3800);
 }
 async function act(fn, ok) {
   try { await fn(); if (ok) toast(ok); return true; }
@@ -95,7 +102,7 @@ function conn(down) {
 }
 
 // ===================================================================== client state (filled only from core reads and events)
-const ui = { runs: new Map(), discs: new Map(), mode: null, projects: [], schema: null, keys: new Map(), touched: new Map(), filter: { project: "", turn: false, active: false, closed: false, q: "" }, open: null, rendered: false };
+const ui = { runs: new Map(), discs: new Map(), bundles: new Map(), ship: [], mode: null, projects: [], schema: null, keys: new Map(), touched: new Map(), filter: { project: "", turn: false, active: false, closed: false, q: "" }, open: null, rendered: false };
 function computeKeys() {
   const by = {};
   [...ui.runs.values()].sort((a, b) => a.createdAt - b.createdAt).forEach((r) => {
@@ -112,7 +119,8 @@ const COLUMNS = [
   { key: "spec", name: "Spec approval", states: "AWAITING_APPROVAL · spec" },
   { key: "build", name: "Build", states: "BUILDING" },
   { key: "review", name: "Review", states: "REVIEWING" },
-  { key: "deliver", name: "Deliver", states: "AWAITING_APPROVAL · delivery, merge · DELIVERING · AWAITING_CI" },
+  { key: "ready", name: "Ready", states: "READY · tick tickets of one project, then Ship" },
+  { key: "deliver", name: "Deliver", states: "bundles · AWAITING_APPROVAL · delivery · DELIVERING · AWAITING_CI" },
   { key: "done", name: "Done", states: "DELIVERED" },
 ];
 function columnOf(r) {
@@ -124,14 +132,21 @@ function columnOf(r) {
   if (st === "AWAITING_APPROVAL") return r.gate === "spec" ? "spec" : "deliver";
   if (st === "BUILDING") return "build";
   if (st === "REVIEWING") return "review";
+  if (st === "READY") return inActiveBundle(r) ? "deliver" : "ready";
   return "deliver";
 }
-const PIPELINE = [["intake", "Intake"], ["discussion", "Discussion"], ["spec", "Spec approval"], ["build", "Build"], ["review", "Review"], ["deliver", "Deliver"], ["done", "Done"]];
+// Where a run sits on the board: a Ready run inside a bundle shown in Deliver is drawn inside that bundle's card.
+function boardColumn(r) {
+  const col = columnOf(r);
+  if (r.state === "READY" && col === "deliver" && ui.bundles.has(r.bundle) && bundleOnBoard(ui.bundles.get(r.bundle))) return null;
+  return col;
+}
+const PIPELINE = [["intake", "Intake"], ["discussion", "Discussion"], ["spec", "Spec approval"], ["build", "Build"], ["review", "Review"], ["ready", "Ready"], ["deliver", "Deliver"], ["done", "Done"]];
 function stateLabel(r) {
   const map = {
     RECEIVED: ["Received", ""], PREPARING: ["Preparing", ""], DISCUSSING: ["Discussing", "progress"], SPEC_READY: ["Spec ready", ""],
     AWAITING_APPROVAL: [`${r.gate ?? ""} approval`, "attention"], BUILDING: ["Building", "progress"], REVIEWING: ["Reviewing", "progress"],
-    ESCALATED: ["Escalated", "bad"], DELIVERING: ["Delivering", ""], AWAITING_CI: ["Awaiting CI", "progress"], DELIVERED: ["Delivered", "ok"],
+    ESCALATED: ["Escalated", "bad"], DELIVERING: ["Delivering", ""], READY: ["Ready", "ok"], AWAITING_CI: ["Awaiting CI", "progress"], DELIVERED: ["Delivered", "ok"],
     FAILED: ["Failed", "bad"], CANCELLED: ["Cancelled", ""],
   };
   const [text, cls] = map[r.state] ?? [r.state, ""];
@@ -155,12 +170,12 @@ function convLive(cid) {
   return Date.now() - (ui.touched.get(String(cid)) ?? 0) < 8000;
 }
 const runLive = (r) => !TERMINAL.includes(r.state) && convLive(r.conversations.active);
-const ROLE_LETTER = { architect: "A", builder: "B", helper: "H", reviewer: "R", qa: "Q" };
+const ROLE_LETTER = { architect: "A", builder: "B", helper: "H", reviewer: "R", qa: "Q", integrator: "I" };
 const ROLE_NAME = { qa: "QA" };
 const roleName = (role) => ROLE_NAME[role] ?? cap1(role);
 const avatar = (role, live) => `<span class="avatar ${role}${live ? " live" : ""}" title="${roleName(role)}${live ? " (working)" : ""}">${ROLE_LETTER[role] ?? "F"}</span>`;
-// QA screenshots: served by the web server from the run's artifacts (cookie-authenticated GET)
-const shotUrl = (run, id) => `/api/runs/${encodeURIComponent(run)}/screenshots/${encodeURIComponent(id)}`;
+// QA screenshots: served by the web server from the run's (or bundle's) artifacts (cookie-authenticated GET)
+const shotUrl = (owner, id) => `/api/${/^bundle-/.test(owner) ? "bundles" : "runs"}/${encodeURIComponent(owner)}/screenshots/${encodeURIComponent(id)}`;
 const shotsHtml = (run, ids) => (ids?.length ? `<div class="shots">${ids.map((id) => `<a href="${esc(shotUrl(run, id))}" target="_blank" rel="noopener noreferrer" title="Screenshot ${esc(id)}"><img src="${esc(shotUrl(run, id))}" alt="Screenshot ${esc(id)}" loading="lazy"><span class="meta mono">${esc(id)}</span></a>`).join("")}</div>` : "");
 const QA_LABEL = { ran: "QA ran", off: "QA off", skipped: "QA skipped · nothing to launch", unavailable: "QA unavailable" };
 function turnText(q) {
@@ -169,6 +184,94 @@ function turnText(q) {
   return "Your turn · escalation";
 }
 const pending = (r) => (r.pendingAsk && !r.pendingAsk.response ? r.pendingAsk : undefined);
+
+// ===================================================================== bundles (several Ready tickets of one project shipped as one PR)
+// The cache and board cards live here; the bundle view is bundles.js.
+const BUNDLE_RELEASED = ["MERGED", "CANCELLED"]; // a bundle in these no longer holds its members
+const BUNDLE_TERMINAL = ["MERGED", "FAILED", "CANCELLED"];
+const bundleOnBoard = (b) => !!b && !BUNDLE_RELEASED.includes(b.state);
+// A run's bundle holds it unless the bundle is known to be merged or cancelled.
+function inActiveBundle(r) {
+  if (!r?.bundle) return false;
+  const b = ui.bundles.get(r.bundle);
+  return !b || !BUNDLE_RELEASED.includes(b.state);
+}
+const memberKey = (m) => ui.keys.get(m.run) ?? m.key ?? m.run;
+const bundleTitle = (b) => (b.members.length === 1 ? b.members[0].title : `${b.members.length} tickets: ${b.members.map((m) => m.title).join(", ")}`);
+const BUNDLE_STATE = {
+  INTEGRATING: ["Integrating", "progress"], FIXING: ["Fixing", "progress"], REVIEWING: ["Reviewing", "progress"], DELIVERING: ["Delivering", ""],
+  AWAITING_CI: ["Awaiting CI", "progress"], AWAITING_MERGE: ["Ready to merge", "attention"], ESCALATED: ["Escalated", "bad"],
+  MERGED: ["Merged", "ok"], FAILED: ["Failed", "bad"], CANCELLED: ["Cancelled", ""],
+};
+function bundleStateLabel(b) {
+  const [text, cls] = BUNDLE_STATE[b.state] ?? [b.state, ""];
+  return `<span class="lozenge ${cls}" title="${esc(b.state)}">${esc(text)}</span>`;
+}
+function bundleRoleOf(b, cid) {
+  const c = b.conversations;
+  if (cid == null) return null;
+  if (same(cid, c.integrator)) return "integrator";
+  if ((c.reviewers ?? []).some((x) => same(x.id, cid))) return "reviewer";
+  if ((c.qa ?? []).some((x) => same(x.id, cid))) return "qa";
+  return "integrator";
+}
+const bundleTurnText = (q) => (q.kind === "merge" ? "Your turn · merge" : "Your turn · escalation");
+function bundleCardHtml(b) {
+  const pa = pending(b), role = bundleRoleOf(b, b.conversations.active), live = role && !BUNDLE_TERMINAL.includes(b.state) && convLive(b.conversations.active);
+  const d = b.delivery, chips = [];
+  if (d?.pr) chips.push(`<span class="rchip" title="Pull request">PR #${esc(d.pr.number)}</span>`);
+  if (b.reviews?.length) chips.push(`<span class="rchip${b.reviewRound >= b.caps.review ? " hot" : ""}" title="Review round ${b.reviewRound} of ${b.caps.review}">R${b.reviewRound}/${b.caps.review}</span>`);
+  if (b.ciFixes > 0 || b.state === "AWAITING_CI") chips.push(`<span class="rchip" title="CI fix rounds used">CI ${b.ciFixes}/${b.caps.ciFix}</span>`);
+  const cls = ["card", "bundle-card", pa ? "turn" : "", b.state === "ESCALATED" || b.state === "FAILED" ? "esc" : ""].join(" ");
+  return `<button type="button" class="${cls}" data-id="${esc(b.id)}" data-bundle="${esc(b.id)}">
+    <div class="card-row"><span class="bchip">${esc(b.id)}</span><span class="meta">${plural(b.members.length, "ticket")}</span></div>
+    <div class="card-row">${bundleStateLabel(b)}${pa ? `<span class="turn-badge">${esc(bundleTurnText(pa.question))}</span>` : ""}${b.mergeRequested && !pa ? `<span class="meta" title="Merge was clicked: it merges by itself when the update is clean and green">merging when green</span>` : ""}</div>
+    <div class="bmembers">${b.members.map((m) => `<div class="bmember"><span class="key">${esc(memberKey(m))}</span><span class="bm-title">${esc(m.title)}</span></div>`).join("")}</div>
+    <div class="card-foot">
+      <div class="card-row">${ui.filter.project ? "" : `<span class="pchip">${esc(b.project)}</span>`}<span class="rounds">${chips.join("")}</span></div>
+      <div class="card-row"><span class="meta">${money(totalUsd(b))} · ${ago(b.createdAt)}</span>${role ? avatar(role, live) : ""}</div>
+    </div>
+  </button>`;
+}
+function visibleBundles() {
+  const f = ui.filter, q = f.q.trim().toLowerCase();
+  return [...ui.bundles.values()].filter((b) => {
+    if (!bundleOnBoard(b)) return false; // merged members show in Done, cancelled ones are back in Ready
+    if (f.project && b.project !== f.project) return false;
+    if (f.turn && !pending(b)) return false;
+    if (f.active && b.state === "FAILED") return false;
+    if (q && !`${b.id} ${b.project} ${b.members.map((m) => `${m.title} ${memberKey(m)}`).join(" ")}`.toLowerCase().includes(q)) return false;
+    return true;
+  });
+}
+// Ready column: the ticked runs (in the order ticked) all belong to one project.
+const shipProject = () => ui.runs.get(ui.ship[0])?.project;
+function readyCardHtml(r) {
+  const proj = shipProject(), ticked = ui.ship.includes(r.id), other = proj != null && proj !== r.project;
+  const why = other ? `A bundle holds tickets of one project: ${proj} is ticked. Untick those to pick ${r.project}.` : `Pick ${keyOf(r.id)} to ship it`;
+  return `<div class="ship-wrap${ticked ? " ticked" : ""}"><label class="ship-tick${other ? " off" : ""}" title="${esc(why)}"><input type="checkbox" data-ship="${esc(r.id)}" aria-label="${esc(why)}"${ticked ? " checked" : ""}${other ? " disabled" : ""}></label>${cardHtml(r)}</div>`;
+}
+async function shipTickets(ids) {
+  const project = ui.runs.get(ids[0])?.project;
+  let id;
+  if (!(await act(async () => { id = await core.createBundle(project, ids); }))) return null;
+  ui.ship = ui.ship.filter((x) => !ids.includes(x));
+  ids.forEach(refreshRun); refreshBundle(id);
+  toast(`Shipping ${plural(ids.length, "ticket")} as ${id}.`, "", { label: `Open ${id}`, onClick: () => openBundleById(id) });
+  return id;
+}
+function openBundleById(id) {
+  withBundles(async () => {
+    if (ui.open && !(ui.mode === "bundle" && ui.open === id)) await closeRun();
+    if ($("#view-board").hidden) showView("board");
+    openBundle(id, cardEl(id));
+  });
+}
+// bundles.js (a deferred script after this one) defines the bundle view; run `f` once it has loaded.
+function withBundles(f) {
+  if (typeof openBundle === "function") return f();
+  addEventListener("DOMContentLoaded", () => { if (typeof openBundle === "function") f(); }, { once: true });
+}
 
 // ===================================================================== board
 function visibleRuns() {
@@ -195,10 +298,18 @@ function cardHtml(r) {
     <div class="card-title">${esc(r.request.title)}</div>
     <div class="card-row">${stateLabel(r)}${pa ? `<span class="turn-badge">${esc(turnText(pa.question))}</span>` : ""}${flag}</div>
     <div class="card-foot">
-      <div class="card-row"><span class="key">${esc(keyOf(r.id))}</span>${from ? `<span class="disc-mark" title="From discussion: ${esc(from.title)}" aria-label="From discussion: ${esc(from.title)}">${ICON.chat}</span>` : ""}${ui.filter.project ? "" : `<span class="pchip">${esc(r.project)}</span>`}<span class="rounds">${chips.join("")}</span></div>
+      <div class="card-row"><span class="key">${esc(keyOf(r.id))}</span>${from ? `<span class="disc-mark" title="From discussion: ${esc(from.title)}" aria-label="From discussion: ${esc(from.title)}">${ICON.chat}</span>` : ""}${ui.filter.project ? "" : `<span class="pchip">${esc(r.project)}</span>`}${r.bundle && r.state !== "READY" ? `<span class="bchip" title="${r.state === "DELIVERED" ? "Merged in" : "Shipped in"} ${esc(r.bundle)}">${esc(r.bundle)}</span>` : ""}<span class="rounds">${chips.join("")}</span></div>
       <div class="card-row"><span class="meta">${money(totalUsd(r))} · ${ago(r.createdAt)}</span>${role ? avatar(role, live) : ""}</div>
     </div>
   </button>`;
+}
+function colHead(c, n, byCol) {
+  let extra = "";
+  if (c.key === "ready" && ui.ship.length) extra = `<button type="button" class="btn primary small ship-go" data-ship-go>Ship ${plural(ui.ship.length, "ticket")}</button>`;
+  const head = `<div class="col-head"><span class="col-name">${c.name}</span><span class="col-count">${n}</span>${extra}</div>`;
+  if (c.key !== "ready" || !ui.ship.length) return head;
+  const proj = shipProject(), others = byCol.ready.some((r) => r.project !== proj);
+  return `${head}<div class="ship-note">${others ? `A bundle holds tickets of one project: only <b>${esc(proj)}</b> tickets can be added.` : `Tickets ship in the order you ticked them.`}</div>`;
 }
 function renderBoard() {
   computeKeys();
@@ -207,22 +318,28 @@ function renderBoard() {
   board.querySelectorAll(".card").forEach((el) => before.set(el.dataset.id, el.getBoundingClientRect()));
   board.querySelectorAll(".col").forEach((el) => (scrolls[el.dataset.col] = $(".col-body", el).scrollTop));
   const focused = document.activeElement?.closest?.(".card")?.dataset.id;
+  const focusedTick = document.activeElement?.matches?.("input[data-ship]") ? document.activeElement.dataset.ship : null;
 
   const runs = visibleRuns();
   const byCol = Object.fromEntries(COLUMNS.map((c) => [c.key, []]));
-  runs.forEach((r) => byCol[columnOf(r)].push(r));
+  runs.forEach((r) => { const col = boardColumn(r); if (col) byCol[col].push(r); });
   for (const k in byCol) byCol[k].sort((a, b) => (pending(b) ? 1 : 0) - (pending(a) ? 1 : 0) || (k === "done" ? b.updatedAt - a.updatedAt : a.createdAt - b.createdAt));
+  // Ticks survive renders while their runs stay in the Ready column.
+  ui.ship = ui.ship.filter((id) => byCol.ready.some((r) => r.id === id));
+  const bundles = visibleBundles().sort((a, b) => (pending(b) ? 1 : 0) - (pending(a) ? 1 : 0) || a.createdAt - b.createdAt);
   const first = ui.runs.size === 0;
   board.innerHTML = COLUMNS.map((c) => {
     const states = esc(c.key === "done" && ui.filter.closed ? "DELIVERED · FAILED · CANCELLED" : c.states);
+    const cards = c.key === "ready" ? byCol.ready.map(readyCardHtml) : c.key === "deliver" ? [...bundles.map(bundleCardHtml), ...byCol.deliver.map(cardHtml)] : byCol[c.key].map(cardHtml);
     return `<section class="col${c.key === "done" ? " done-col" : ""}" data-col="${c.key}" aria-label="${c.name}">
-      <div class="col-head"><span class="col-name">${c.name}</span><span class="col-count">${byCol[c.key].length}</span></div>
+      ${colHead(c, cards.length, byCol)}
       <div class="col-states" title="${states}">${states}</div>
-      <div class="col-body">${byCol[c.key].map(cardHtml).join("") || `<div class="col-empty">${first && c.key === "intake" ? "Press <b>Create</b> to submit your first ticket" : "No tickets"}</div>`}</div>
+      <div class="col-body">${cards.join("") || `<div class="col-empty">${first && c.key === "intake" ? "Press <b>Create</b> to submit your first ticket" : c.key === "ready" ? "Reviewed tickets wait here to ship" : "No tickets"}</div>`}</div>
     </section>`;
   }).join("");
   board.querySelectorAll(".col").forEach((el) => ($(".col-body", el).scrollTop = scrolls[el.dataset.col] ?? 0));
   if (focused) [...board.querySelectorAll(".card")].find((el) => el.dataset.id === focused)?.focus({ preventScroll: true });
+  if (focusedTick) [...board.querySelectorAll("input[data-ship]")].find((el) => el.dataset.ship === focusedTick)?.focus({ preventScroll: true });
 
   if (!reduceMotion()) board.querySelectorAll(".card").forEach((el) => {
     const b = before.get(el.dataset.id);
@@ -234,12 +351,13 @@ function renderBoard() {
   ui.liveSig = liveSignature();
 
   const all = [...ui.runs.values()].filter((r) => !ui.filter.project || r.project === ui.filter.project);
-  $("#n-turn").textContent = all.filter((r) => pending(r)).length;
+  const bTurns = [...ui.bundles.values()].filter((b) => (!ui.filter.project || b.project === ui.filter.project) && bundleOnBoard(b) && pending(b)).length;
+  $("#n-turn").textContent = all.filter((r) => pending(r)).length + bTurns;
   $("#n-active").textContent = all.filter((r) => !TERMINAL.includes(r.state)).length;
   $("#n-closed").textContent = all.filter((r) => r.state === "FAILED" || r.state === "CANCELLED").length;
   const p = ui.projects.find((x) => x.name === ui.filter.project);
   $("#board-title").textContent = p ? `${p.name} pipeline` : "Pipeline";
-  const turns = [...ui.runs.values()].filter((r) => pending(r)).length;
+  const turns = [...ui.runs.values()].filter((r) => pending(r)).length + [...ui.bundles.values()].filter((b) => bundleOnBoard(b) && pending(b)).length;
   document.title = turns ? `(${turns}) Factory Board` : "Factory Board";
 }
 const liveSignature = () => [...ui.runs.values()].filter(runLive).map((r) => r.id).join(",");
@@ -262,12 +380,40 @@ async function flush() {
       const r = await core.getRun(id);
       ui.runs.set(id, r);
       if (!ui.projects.some((p) => p.name === r.project)) newProject = true;
+      if (r.bundle && !ui.bundles.has(r.bundle)) refreshBundle(r.bundle);
     } catch (e) { if (e.code === "not_found") ui.runs.delete(id); }
   }));
   if (newProject) { ui.projects = await core.listProjects().catch(() => ui.projects); renderProjectFilter(); }
   renderBoard();
-  if (ui.open && ids.includes(ui.open)) renderRunView();
+  if (ui.open && !ui.mode && ids.includes(ui.open)) renderRunView();
+  if (ui.mode === "bundle" && openBundleData()?.members.some((m) => ids.includes(m.run))) renderBundleView();
   withDiscussions(() => discussionRunsChanged(ids));
+}
+// Bundles: refetched on their events (and when a run names one the cache lacks).
+const pendingBundles = new Set(); let bundleFlushTimer = 0;
+function refreshBundle(id) { if (!id) return; pendingBundles.add(id); if (!bundleFlushTimer) bundleFlushTimer = setTimeout(flushBundles, 60); }
+async function flushBundles() {
+  bundleFlushTimer = 0;
+  const ids = [...pendingBundles]; pendingBundles.clear();
+  await Promise.all(ids.map(async (id) => {
+    try { const b = await core.getBundle(id); if (b) ui.bundles.set(id, b); } catch (e) { if (e.code === "not_found") ui.bundles.delete(id); }
+  }));
+  if (!$("#view-board").hidden) renderBoard();
+  if (ui.mode === "bundle" && ids.includes(ui.open)) { if (openBundleData()) renderBundleView(); else closeRun(); }
+  else if (ui.open && !ui.mode && ids.includes(openRunData()?.bundle)) renderRunView();
+}
+function onBundleEvent(e) {
+  const open = ui.mode === "bundle" && ui.open === e.bundle;
+  if (e.type === "bundle.conversation.updated") {
+    ui.touched.set(String(e.conversationId), Date.now());
+    if (open) bundleConvUpdated(e);
+    else if (ui.bundles.has(e.bundle)) scheduleBoard();
+    return;
+  }
+  refreshBundle(e.bundle);
+  if (open) return;
+  if (e.type === "bundle.ask") toast(`${e.bundle}: ${e.question.kind === "merge" ? "ready to merge" : "escalated to you"}`, "", { label: "Open", onClick: () => openBundleById(e.bundle) });
+  if (e.type === "bundle.notice" && e.notice.final) toast(`${e.bundle}: ${e.notice.text}`, e.notice.level === "error" ? "error" : "");
 }
 // Transcripts of the open run: refetched (throttled) when the conversation changes.
 const convTimers = new Map();
@@ -287,6 +433,7 @@ function refreshConv(run, cid) {
 }
 function onEvent(e) {
   if (e.type.startsWith("discussion.")) return withDiscussions(() => onDiscussionEvent(e));
+  if (e.type.startsWith("bundle.")) return onBundleEvent(e);
   if (e.type === "conversation.updated") {
     ui.touched.set(String(e.conversationId), Date.now());
     const r = ui.runs.get(e.run);
@@ -309,10 +456,11 @@ let boardTimer = 0;
 function scheduleBoard() { if (!boardTimer) boardTimer = setTimeout(() => { boardTimer = 0; if (!$("#view-board").hidden) renderBoard(); }, 120); }
 async function resync() {
   try {
-    const [projects, runs, discs] = await Promise.all([core.listProjects(), core.listRuns(), core.listDiscussions()]);
-    ui.projects = projects; ui.runs = new Map(runs.map((r) => [r.id, r])); ui.discs = new Map(discs.map((d) => [d.id, d]));
+    const [projects, runs, discs, bundles] = await Promise.all([core.listProjects(), core.listRuns(), core.listDiscussions(), core.listBundles().catch(() => [...ui.bundles.values()])]);
+    ui.projects = projects; ui.runs = new Map(runs.map((r) => [r.id, r])); ui.discs = new Map(discs.map((d) => [d.id, d])); ui.bundles = new Map(bundles.map((b) => [b.id, b]));
     renderProjectFilter(); renderBoard();
     if (ui.mode === "discussion") withDiscussions(resyncDiscussion);
+    else if (ui.mode === "bundle") resyncBundle();
     else if (ui.open) { if (ui.runs.has(ui.open)) { renderRunView(); loadThread(false); } else closeRun(); }
     if (!$("#view-discussions").hidden) withDiscussions(renderDiscussions);
     if (!$("#view-settings").hidden) renderSettings();
@@ -459,6 +607,7 @@ async function closeRun() {
     await a.finished.catch(() => {});
   }
   ui.open = null; ui.mode = null; delete rv.dataset.mode; sheetLabels(false); ui.tx.clear(); rv.hidden = true; bd.hidden = true; closing = false;
+  $("#rv-links").innerHTML = ""; $("#rv-extra").innerHTML = ""; delete $("#rv-extra").dataset.key;
   renderBoard();
   if (wasDiscussion) withDiscussions(renderDiscussions);
   const c = home();
@@ -482,9 +631,26 @@ function renderRunView() {
   const act = r.conversations.active;
   if (act != null && !same(act, ui.lastActive) && (ui.lastActive == null || same(ui.thread, ui.lastActive))) { ui.thread = act; loadThread(true); }
   if (act != null) ui.lastActive = act;
-  renderThreads(r); renderComposer(r); renderDock(r); renderDetails(r);
+  renderRunLinks(r); renderThreads(r); renderComposer(r); renderDock(r); renderDetails(r);
   if (ui.thread === "timeline") renderTimeline(r, false);
   else { const t = ui.tx.get(String(ui.thread)); if (t) renderTranscript(r, t, false); }
+}
+// Header extras: the bundle the run is in (a link), its PR once merged, and Ship this ticket while it is Ready.
+function renderRunLinks(r) {
+  const d = r.artifacts.delivery, parts = [];
+  if (r.bundle) parts.push(`<button type="button" class="linkish" data-open-bundle="${esc(r.bundle)}" title="Open ${esc(r.bundle)}">In ${esc(r.bundle)}</button>`);
+  if (r.bundle && r.state === "DELIVERED" && d?.url) parts.push(`<a href="${esc(d.url)}" target="_blank" rel="noopener noreferrer">${d.kind === "pr" ? `PR #${esc(d.pr?.number ?? "")}` : "Repo"}</a>`);
+  $("#rv-links").innerHTML = parts.join("");
+  const canShip = r.state === "READY" && !inActiveBundle(r);
+  const extra = $("#rv-extra");
+  if (extra.dataset.key === `${r.id}:${canShip}` && (!canShip || $("#rv-ship"))) return;
+  extra.dataset.key = `${r.id}:${canShip}`;
+  extra.innerHTML = canShip ? `<button type="button" class="btn small primary" id="rv-ship" title="Make a bundle of this one ticket: one PR, as before bundles">Ship this ticket</button>` : "";
+  $("#rv-ship")?.addEventListener("click", async (e) => {
+    const b = e.currentTarget; b.disabled = true;
+    const id = await shipTickets([r.id]);
+    if (!id) b.disabled = false;
+  });
 }
 function modelOf(r, cid, role) {
   const c = r.cost.find((x) => same(x.conversationId, cid)) ?? [...r.cost].reverse().find((x) => x.role === role);
@@ -681,6 +847,7 @@ function copyFrom(btn, text, selectEl) {
 const LIVE_STAGE = { RECEIVED: "Queued", PREPARING: "Preparing the workspace", SPEC_READY: "Checking the spec gate", DELIVERING: "Delivering", AWAITING_CI: "Waiting for CI checks" };
 // Mirrors the routing rule of `message`: the agent the run is with. (The core decides; this only labels the chat box.)
 function chatTarget(r) {
+  if (r.chatTarget) return r.chatTarget; // a bundle shown through the run renderer carries its own
   const c = r.conversations;
   if (["RECEIVED", "PREPARING", "DISCUSSING", "SPEC_READY"].includes(r.state) || (r.state === "AWAITING_APPROVAL" && r.gate === "spec")) return { role: "architect", cid: c.architect ?? null };
   if (r.state === "REVIEWING") return { role: "reviewer", cid: c.reviewers.find((x) => same(x.id, c.active))?.id ?? null };
@@ -695,7 +862,8 @@ function updateComposerLive(r) {
   const pa = pending(r), gate = pa && pa.question.kind !== "discussion";
   line.innerHTML = busy ? `<span class="shimmer">${roleName(role)} is ${tool ? `running ${esc(tool)}` : "working"}</span>`
     : LIVE_STAGE[r.state] ? `<span class="shimmer">${LIVE_STAGE[r.state]}</span>`
-    : gate ? `<span style="color:var(--turn)">Waiting for your decision on the card above</span>` : `${cap1(role ?? "factory")} is between steps`;
+    : gate ? `<span style="color:var(--turn)">Waiting for your decision on the card above</span>`
+    : r.state === "READY" ? "Ready · tick it on the board, or Ship this ticket above" : `${cap1(role ?? "factory")} is between steps`;
   const tg = chatTarget(r), hint = $("#c-hint");
   if (hint) {
     const tBusy = tg.cid != null && convLive(tg.cid);
@@ -704,19 +872,25 @@ function updateComposerLive(r) {
 }
 function endComposer(r) {
   const d = r.artifacts.delivery;
-  if (r.state === "DELIVERED") return `<div class="cbox ok"><div class="c-status"><span class="c-ico ok">${ICON.check}</span><div class="c-main"><span class="c-line">Delivered</span><span class="c-sub">${d?.kind === "pr" ? `PR #${d.pr?.number ?? ""}` : "Pushed to main"} · ${plural(r.advisory.length, "advisory note")}${r.acceptedBlocking.length ? ` · ${plural(r.acceptedBlocking.length, "accepted finding")}` : ""} · start a new ticket for follow-up work</span></div>${d?.url ? `<a class="btn lg" href="${esc(d.url)}" target="_blank" rel="noopener noreferrer">${d.kind === "pr" ? "Open PR" : "Open repo"} ${ICON.ext}</a>` : ""}</div></div>`;
+  if (r.state === "DELIVERED") return `<div class="cbox ok"><div class="c-status"><span class="c-ico ok">${ICON.check}</span><div class="c-main"><span class="c-line">${r.bundle ? `Merged in ${esc(r.bundle)}` : "Delivered"}</span><span class="c-sub">${d?.kind === "pr" ? `PR #${d.pr?.number ?? ""}` : "Pushed to main"} · ${plural(r.advisory.length, "advisory note")}${r.acceptedBlocking.length ? ` · ${plural(r.acceptedBlocking.length, "accepted finding")}` : ""} · start a new ticket for follow-up work</span></div>${d?.url ? `<a class="btn lg" href="${esc(d.url)}" target="_blank" rel="noopener noreferrer">${d.kind === "pr" ? "Open PR" : "Open repo"} ${ICON.ext}</a>` : ""}</div></div>`;
   const failed = r.state === "FAILED";
   return `<div class="cbox${failed ? " bad" : ""}"><div class="c-status"><span class="c-ico ${failed ? "bad" : "muted"}">${failed ? ICON.warn : ICON.stop}</span><div class="c-main"><span class="c-line">${failed ? `Failed in ${esc(r.failure?.state ?? "a stage")}` : "Cancelled"}</span><span class="c-sub">${esc(r.failure?.reason ?? "")}</span></div><button type="button" class="btn primary lg" id="c-retry">${ICON.retry} Retry</button></div></div>`;
 }
 function autosize(ta, send) { ta.style.height = "auto"; ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`; if (send) send.disabled = !ta.value.trim(); }
 function renderComposer(r) {
   const pa = pending(r), disc = pa?.question.kind === "discussion", tg = chatTarget(r);
-  const key = TERMINAL.includes(r.state) ? `end:${r.state}` : disc ? `ask:${pa.id}` : `chat:${tg.role}`;
+  const bundled = r.state === "READY" && inActiveBundle(r);
+  const key = TERMINAL.includes(r.state) ? `end:${r.state}` : disc ? `ask:${pa.id}` : bundled ? `bundle:${r.bundle}` : `chat:${tg.role}`;
   if (key === ui.composerKey) return updateComposerLive(r);
   const draft = $("#cmp-chat")?.value ?? "";
   ui.composerKey = key;
   const el = $("#composer");
   if (TERMINAL.includes(r.state)) { el.innerHTML = endComposer(r); $("#c-retry")?.addEventListener("click", () => act(() => core.retryRun(r.id), "Retrying")); return; }
+  // A run inside an active bundle takes no messages: the bundle's integrator (or reviewer) does.
+  if (bundled) {
+    el.innerHTML = `<div class="cbox"><div class="c-status"><span class="c-ico muted">${ICON.wait}</span><div class="c-main"><span class="c-line">Shipping in ${esc(r.bundle)}</span><span class="c-sub">The ticket is part of a bundle now. Message the bundle to change anything.</span></div><button type="button" class="btn lg" data-open-bundle="${esc(r.bundle)}">Open ${esc(r.bundle)}</button></div></div>`;
+    return;
+  }
   if (disc) return discussionComposer(el, r, pa);
   el.innerHTML = `<div class="cbox">
     <div class="c-top"><span class="to-chip">To ${avatar(tg.role, false)}<b>${cap1(tg.role)}</b></span><span class="c-live-line" id="c-live"></span></div>
@@ -773,7 +947,7 @@ function dockInfo(r, pa) {
   const q = pa.question, d = r.artifacts.delivery, sp = r.artifacts.spec;
   if (q.kind === "escalation") return { cls: "bad", icon: ICON.warn, title: "Escalated to you", meta: r.escalation?.cap === "review" ? "review round cap reached" : r.escalation?.cap === "ciFix" ? "CI fix cap reached" : "needs a decision" };
   const adv = r.advisory.filter((x) => !x.blocking);
-  if (q.gate === "spec") return { cls: "turn", icon: ICON.doc, title: `Spec v${sp?.version ?? 1} needs your approval`, meta: `docs/spec.md · ${plural((sp?.text ?? "").split("\n").length, "line")}` };
+  if (q.gate === "spec") return { cls: "turn", icon: ICON.doc, title: `Spec v${sp?.version ?? 1} needs your approval`, meta: `${r.specPath || "docs/spec.md"} · ${plural((sp?.text ?? "").split("\n").length, "line")}` };
   if (q.gate === "delivery") return { cls: "turn", icon: ICON.doc, title: "Ready to deliver", meta: `review passed${adv.length ? ` with ${plural(adv.length, "advisory note")}` : ""}` };
   return { cls: "turn", icon: ICON.doc, title: "Ready to merge", meta: `${d?.pr ? `PR #${d.pr.number}` : "PR"}${r.noCi ? " · no CI" : " · CI green"}` };
 }
@@ -881,7 +1055,7 @@ function dockEscalation(dock, r, pa, info) {
 
 function openSpec(r) {
   const sp = r.artifacts.spec, pa = pending(r), gate = pa?.question.kind === "approval" && pa.question.gate === "spec";
-  const root = openModal(`<div class="modal"><div class="modal-head"><h2>docs/spec.md${sp ? ` · v${sp.version ?? 1}` : ""}</h2><button type="button" class="icon-btn" data-close aria-label="Close">${CLOSE_SVG}</button></div>
+  const root = openModal(`<div class="modal"><div class="modal-head"><h2>${esc(r.specPath || "docs/spec.md")}${sp ? ` · v${sp.version ?? 1}` : ""}</h2><button type="button" class="icon-btn" data-close aria-label="Close">${CLOSE_SVG}</button></div>
     <div class="modal-body"><div class="spec-doc">${sp ? md(sp.text) : "<p>No spec yet.</p>"}</div></div>
     <div class="modal-foot">${gate ? `<button type="button" class="btn lg" id="spec-changes">Request changes</button><button type="button" class="btn primary lg" id="spec-approve">${ICON.check} Approve and start building</button>` : `<button type="button" class="btn primary" data-close>Close</button>`}</div></div>`, true);
   root.querySelectorAll("[data-close]").forEach((b) => b.addEventListener("click", closeModal));
@@ -911,6 +1085,8 @@ function renderDetails(r) {
     ${r.request.body ? `<section class="d-sec"><h4>Request</h4><div class="f-body">${md(r.request.body)}</div></section>` : ""}
     <section class="d-sec"><h4>Artifacts</h4><div style="display:grid;gap:8px;font-size:13px">
       ${r.artifacts.spec ? `<button type="button" class="btn small" id="d-spec" style="justify-self:start">${ICON.doc} Spec v${r.artifacts.spec.version ?? 1}</button>` : `<span class="meta">The spec isn't written yet.</span>`}
+      ${r.specPath ? `<div class="meta">Spec in the repo: <span class="mono">${esc(r.specPath)}</span></div>` : ""}
+      ${r.bundle ? `<div>${r.state === "DELIVERED" ? "Merged in" : "Shipping in"} <button type="button" class="linkish" data-open-bundle="${esc(r.bundle)}">${esc(r.bundle)}</button></div>` : ""}
       ${d ? `<div>${d.kind === "pr" ? `PR #${d.pr?.number ?? ""}` : "Repo"} · <a href="${esc(d.url)}" target="_blank" rel="noopener noreferrer">${esc(String(d.url).replace(/^https?:\/\//, ""))}</a><div class="meta mono">${esc(String(d.sha ?? "").slice(0, 12))}</div></div>` : ""}
       ${ci ? `<div class="notice">${esc(ci.text)}</div>` : ""}</div></section>
     ${r.findingsLog.length ? `<section class="d-sec"><h4>Findings <span>${r.findingsLog.reduce((a, e) => a + e.findings.length, 0)}</span></h4>${findings}</section>` : ""}
@@ -924,7 +1100,7 @@ function renderDetails(r) {
       <dt>Created</dt><dd>${new Date(r.createdAt).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })}</dd>
       <dt>Pinned</dt><dd class="mono">${esc(r.configHash)} · ${esc(r.piVersion)}</dd></dl></section>
     <section class="d-sec"><h4>Actions</h4><div class="actions" style="display:flex;gap:8px;flex-wrap:wrap">
-      ${terminal ? (r.state !== "DELIVERED" ? `<button type="button" class="btn primary" id="d-retry">${ICON.retry} Retry run</button>` : `<span class="meta">Delivered runs are final.</span>`) : `<button type="button" class="btn danger" id="d-cancel">${ui.confirmCancel ? "Click again to cancel" : "Cancel run"}</button>`}
+      ${terminal ? (r.state !== "DELIVERED" ? `<button type="button" class="btn primary" id="d-retry">${ICON.retry} Retry run</button>` : `<span class="meta">Delivered runs are final.</span>`) : r.state === "READY" && inActiveBundle(r) ? `<span class="meta">In ${esc(r.bundle)}: drop it from the bundle, or cancel the bundle, to change it.</span>` : `<button type="button" class="btn danger" id="d-cancel">${ui.confirmCancel ? "Click again to cancel" : "Cancel run"}</button>`}
     </div></section>`;
   $("#d-spec")?.addEventListener("click", () => openSpec(r));
   $("#d-disc")?.addEventListener("click", () => withDiscussions(() => openDiscussion(from.id)));
@@ -1029,7 +1205,25 @@ function sheetLabels(discussion) {
 function wire() {
   document.querySelectorAll(".nav button").forEach((b) => b.addEventListener("click", () => showView(b.dataset.view)));
   $("#create-btn").addEventListener("click", openCreate);
-  $("#board").addEventListener("click", (e) => { const c = e.target.closest(".card"); if (c) openRun(c.dataset.id, c); });
+  $("#board").addEventListener("click", async (e) => {
+    const go = e.target.closest("[data-ship-go]");
+    if (go) { go.disabled = true; if (!(await shipTickets([...ui.ship]))) go.disabled = false; else renderBoard(); return; }
+    if (e.target.closest(".ship-tick")) return; // ticking a Ready card never opens it
+    const c = e.target.closest(".card"); if (!c) return;
+    if (c.dataset.bundle) openBundleById(c.dataset.bundle); else openRun(c.dataset.id, c);
+  });
+  $("#board").addEventListener("change", (e) => {
+    const cb = e.target.closest("input[data-ship]"); if (!cb) return;
+    const id = cb.dataset.ship, r = ui.runs.get(id), proj = shipProject();
+    if (cb.checked && proj != null && r && r.project !== proj) { cb.checked = false; toast("A bundle holds tickets of one project. Untick the other project's tickets first.", "error"); return; }
+    ui.ship = cb.checked ? [...ui.ship.filter((x) => x !== id), id] : ui.ship.filter((x) => x !== id);
+    renderBoard();
+  });
+  // "In bundle-N" links (run view, composer, details) open the bundle view.
+  document.addEventListener("click", (e) => {
+    const l = e.target.closest("[data-open-bundle]"); if (!l) return;
+    e.preventDefault(); openBundleById(l.dataset.openBundle);
+  });
   $("#proj-filter").addEventListener("change", (e) => { ui.filter.project = e.target.value; renderBoard(); });
   $("#q").addEventListener("input", (e) => { ui.filter.q = e.target.value; if ($("#view-board").hidden) showView("board"); else renderBoard(); });
   for (const [id, k] of [["#f-turn", "turn"], ["#f-active", "active"], ["#f-closed", "closed"]]) $(id).addEventListener("click", (e) => {
@@ -1041,6 +1235,7 @@ function wire() {
     ui.thread = t.dataset.thread;
     ui.stick = true; showJump(false);
     $("#rv-threads").classList.remove("open");
+    if (ui.mode === "bundle") { renderBundleThreads(openBundleData()); loadBundleThread(true); return; }
     renderThreads(openRunData()); loadThread(true);
   });
   $("#rv-threads-btn").addEventListener("click", () => $("#rv-threads").classList.toggle("open"));
@@ -1078,14 +1273,16 @@ function wire() {
     if (modalStack.length) return closeModal();
     if ($("#rv-threads").classList.contains("open")) return $("#rv-threads").classList.remove("open");
     if (ui.open && ui.details && innerWidth < 1180) return setDetails(false);
-    if (ui.open && ui.rejecting && document.activeElement?.closest("#dock")) { ui.rejecting = false; ui.structured = false; return renderDock(openRunData()); }
+    if (ui.open && ui.mode === "bundle" && ui.bdock?.mode && document.activeElement?.closest("#dock")) { ui.bdock.mode = null; return renderBundleDock(openBundleData()); }
+    if (ui.open && !ui.mode && ui.rejecting && document.activeElement?.closest("#dock")) { ui.rejecting = false; ui.structured = false; return renderDock(openRunData()); }
     if (ui.open) closeRun();
   });
   // Card ages tick every minute; live pulses fade a few seconds after a conversation goes quiet.
   setInterval(() => { if (!$("#view-board").hidden && !ui.open) renderBoard(); }, 60000);
   setInterval(() => {
     if (liveSignature() !== ui.liveSig && !$("#view-board").hidden) renderBoard();
-    if (ui.open) { const r = openRunData(); if (r) { renderThreads(r); updateComposerLive(r); } }
+    if (ui.open && ui.mode === "bundle") { const b = openBundleData(); if (b) { renderBundleThreads(b); updateBundleComposerLive(b); } }
+    else if (ui.open && !ui.mode) { const r = openRunData(); if (r) { renderThreads(r); updateComposerLive(r); } }
   }, 3000);
 }
 
@@ -1093,14 +1290,16 @@ async function boot() {
   wire();
   core.subscribe({}, onEvent); // empty filter: settings.changed only reaches unfiltered subscribers
   try {
-    const [projects, runs, discs] = await Promise.all([core.listProjects(), core.listRuns(), core.listDiscussions()]);
+    const [projects, runs, discs, bundles] = await Promise.all([core.listProjects(), core.listRuns(), core.listDiscussions(), core.listBundles().catch(() => [])]);
     ui.projects = projects;
     for (const r of runs) ui.runs.set(r.id, r);
     for (const d of discs) ui.discs.set(d.id, d);
+    for (const b of bundles) ui.bundles.set(b.id, b);
   } catch (e) { toast(String(e.message ?? e), "error"); }
   renderProjectFilter(); renderBoard();
-  const m = /^#run=(.+)$/.exec(location.hash), d = /^#disc=(.+)$/.exec(location.hash);
+  const m = /^#run=(.+)$/.exec(location.hash), d = /^#disc=(.+)$/.exec(location.hash), b = /^#bundle=(.+)$/.exec(location.hash);
   if (m && ui.runs.has(decodeURIComponent(m[1]))) openRun(decodeURIComponent(m[1]), null);
   else if (d) withDiscussions(() => { showView("discussions"); openDiscussion(decodeURIComponent(d[1])); });
+  else if (b) withBundles(() => openBundle(decodeURIComponent(b[1]), null));
 }
 boot();
