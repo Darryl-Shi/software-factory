@@ -13,6 +13,8 @@ import type { GitHubHost, Identity } from "./host.ts";
 const OK_CONCLUSIONS = ["success", "neutral", "skipped"];
 
 const identityOf = (rc: RunCtx): Identity => (rc.config.github?.identity ?? {}) as Identity;
+const workdirOf = (rc: RunCtx): string => expandHome(rc.config.workdir ?? "~/factory/work");
+const cloneOf = (workdir: string, ref: RepoRef): string => join(workdir, "repos", ref.replace("/", "__"));
 
 /** Rules on the `github` settings section; problems are relative to the section. */
 export function githubProblems(github: Obj): string[] {
@@ -60,17 +62,18 @@ export function report(ctx: Pick<DeliveryContext, "request" | "advisory" | "acce
 export class GitHub {
 	constructor(readonly host: GitHubHost) {}
 
-	async open(ref: RepoRef, rc: RunCtx): Promise<Workspace> {
+	/** A run's (or, with `area: "discussions"`, a discussion's) checkout under `<workdir>/<area>/<rc.runId>`. */
+	async open(ref: RepoRef, rc: RunCtx, area: "runs" | "discussions" = "runs"): Promise<Workspace> {
 		const host = this.host;
-		const workdir = expandHome(rc.config.workdir ?? "~/factory/work");
-		const m = join(workdir, "runs", `${rc.runId}.json`);
+		const workdir = workdirOf(rc);
+		const m = join(workdir, area, `${rc.runId}.json`);
 		if (existsSync(m)) {
 			const ws = JSON.parse(readFileSync(m, "utf8")) as Workspace;
 			if (existsSync(ws.path)) return ws;
 		}
 		const id = identityOf(rc);
-		const clone = join(workdir, "repos", ref.replace("/", "__"));
-		const worktree = join(workdir, "runs", rc.runId);
+		const clone = cloneOf(workdir, ref);
+		const worktree = join(workdir, area, rc.runId);
 		const branch = `factory/${rc.runId}`;
 		const exists = await host.repoExists(ref, id);
 		const auth = await host.gitAuth(id);
@@ -104,6 +107,35 @@ export class GitHub {
 		const ws: Workspace = { repo: ref, path: worktree, baseRef: base, branch, newRepo: !exists };
 		writeFileSync(m, JSON.stringify(ws, null, 2));
 		return ws;
+	}
+
+	/**
+	 * Bring a discussion's checkout up to date with the repo (spec discussion-flow §1.4): fast-forward an existing
+	 * repo's worktree to `origin/<default>`; for a new-repo workspace whose repo now exists, replace the local
+	 * workspace with a checkout of the repo.
+	 */
+	async refresh(ws: Workspace, rc: RunCtx): Promise<Workspace> {
+		const host = this.host;
+		const id = identityOf(rc);
+		const workdir = workdirOf(rc);
+		const clone = cloneOf(workdir, ws.repo);
+		const manifest = `${ws.path}.json`;
+		if (ws.newRepo) {
+			if (!(await host.repoExists(ws.repo, id))) return ws;
+			await git(clone, ["worktree", "remove", "--force", ws.path], { allowFail: true });
+			rmSync(ws.path, { recursive: true, force: true });
+			await git(clone, ["worktree", "prune"]);
+			await git(clone, ["branch", "-D", ws.branch], { allowFail: true });
+			rmSync(manifest, { force: true });
+			return this.open(ws.repo, rc, "discussions");
+		}
+		const def = await host.defaultBranch(ws.repo, id);
+		await git(clone, ["fetch", "-q", "origin", "--prune"], await host.gitAuth(id));
+		const ff = await git(ws.path, ["merge", "-q", "--ff-only", `origin/${def}`], { allowFail: true });
+		if (ff.code !== 0) throw new Error(`could not fast-forward the discussion's checkout to origin/${def}: ${ff.stderr.trim() || ff.stdout.trim()}`);
+		const next: Workspace = { ...ws, baseRef: await gitOut(ws.path, ["rev-parse", "HEAD"]) };
+		writeFileSync(manifest, JSON.stringify(next, null, 2));
+		return next;
 	}
 
 	async create(ref: RepoRef, rc: RunCtx): Promise<void> {
