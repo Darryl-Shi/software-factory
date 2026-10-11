@@ -126,14 +126,24 @@ PREPARING ──ok──► OPEN ──closeDiscussion──► CLOSED ──reo
    workspace if the repo doesn't exist yet), and `Sandbox.provision` gives the `discussant` role the architect's
    rules: the worktree is read-only, its scratch dir is writable, setup scripts don't run. The first time, the core
    creates the discussion's one Conversation with the pinned model and submits the project context followed by the
-   human's first message. A reopen fast-forwards the checkout (`GitHub.refresh`) and keeps the Conversation.
+   human's first message. A reopen or retry keeps the Conversation and resyncs the checkout (`GitHub.refresh`):
+   the checkout is read-only, so it is reset to `origin/<default>` and cleaned rather than merged, which survives a
+   force-pushed default branch or stray local changes. A missing checkout, manifest or clone is made again with
+   `GitHub.open`, as is a new-repo workspace whose repo now exists. Only a git failure (e.g. the remote is gone)
+   fails the discussion. When the checkout changed (another head, or the repo now exists), the next turn's input
+   carries a short factory note saying so. Leaving `OPEN` (close or failure) disposes the discussant's environment,
+   as a run's end does; a reopen or retry provisions it again.
 2. **Turns.** One at a time. `say` submits the human's text as a message; the turn ends when the model stops.
    `requestDrafts` submits drafting instructions; the turn ends when the model calls `submit_tickets`, after up to
-   2 reminders. `stopTurn` aborts the turn, which is not resumed. A provider error ends the turn with a notice and
-   leaves the discussion `OPEN`.
-3. **Drafts.** A valid `submit_tickets` sets the summary and replaces the drafts that haven't become runs. The human
-   edits or deletes drafts with `updateDraft` and `deleteDraft`.
-4. **Handoff.** `createTicket` creates the run and records the draft's `runId` in one commit, through the same helper
+   2 reminders. `stopTurn` asks for the turn to stop and aborts the Conversation's work; it returns at once, and the
+   discussion Task clears the turn and adds the `stopped` notice when that work has ended. A stopped turn is not
+   resumed. A provider error ends the turn with a notice and leaves the discussion `OPEN`.
+3. **Drafts.** A valid `submit_tickets` sets the summary and replaces the drafts that haven't become runs. A redraft's
+   input lists the drafts that already became tickets (title and run, not to be submitted again) and the current
+   drafts' texts, with the human's edits marked, so the model builds on them. The human edits or deletes drafts with
+   `updateDraft` and `deleteDraft`.
+4. **Handoff.** `createTicket` works in any discussion state, except while a `draft` turn runs; it creates the run and
+   records the draft's `runId` in one commit, through the same helper
    as `startRun`, so a crash can't leave one without the other. The run's request has `source: "discussion"` and a
    copy of the link in `meta.discussion` (discussion id and title, draft id, summary, the titles of the other drafts
    of the same submission). The run never reads the discussion again. Its architect gets a `# Prior discussion`
@@ -192,6 +202,8 @@ server is its transport.
 - **Discussions:** `startDiscussion`, `getDiscussion`, `listDiscussions`, `getDiscussionConversation`, `say`,
   `stopTurn`, `requestDrafts`, `updateDraft`, `deleteDraft`, `createTicket`, `closeDiscussion`, `reopenDiscussion`,
   `retryDiscussion`. An operation in the wrong state is refused with `conflict`, naming the state.
+- **Filters:** `listRuns` and `listDiscussions` take `{ project?, states? }`; `states` must be an array of known
+  states, else the call is refused with `invalid`.
 - **Settings:** `settingsSchema`, `getSettings`, `setSetting`, `unsetSetting`.
 - **Events:** `subscribe(filter, on)`. A filter can select a project, a run or a discussion; a project filter matches
   both run and discussion events. Event types:
@@ -202,7 +214,8 @@ server is its transport.
   - `conversation.updated`: a role transcript changed.
   - `run.message`: a message was sent, and again once it was handed to a Conversation.
   - `discussion.state`: a discussion's state transition.
-  - `discussion.updated`: a turn started or ended, drafts were submitted, a ticket was created, or a notice was added.
+  - `discussion.updated`: a turn started or ended, drafts were submitted (`submission: true`) or edited, a ticket was
+    created, or a notice was added.
   - `discussion.conversation.updated`: the discussion's transcript changed.
   - `settings.changed`
 

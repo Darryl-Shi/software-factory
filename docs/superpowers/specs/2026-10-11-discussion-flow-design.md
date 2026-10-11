@@ -2,6 +2,12 @@
 
 Date: 2026-10-11 · Status: approved design, awaiting spec review
 
+> **Amended after the final review** to match the code: reopen resyncs the read-only checkout instead of
+> fast-forwarding it, and falls back to a fresh checkout (§1.4, §4); `createTicket` works in any state except while
+> a `draft` turn runs (§2.1); a redraft is told about earlier drafts (§2.2); the next turn after a changed checkout
+> carries a factory note (§1.4); the discussant's environment is disposed when the discussion leaves `OPEN` (§1.4);
+> `drafts` events mark new submissions, and `states` filters are checked (§2.1). See DEVIATIONS.md 45–51.
+
 ## Intent
 
 Some problems are too unclear to write as a ticket. Today the only conversation the factory offers is the architect's
@@ -78,8 +84,8 @@ interface Draft {
 |---|---|---|
 | `PREPARING` | Open the workspace (§1.4), provision the `discussant` environment, and create and configure the Conversation if there is none yet (reopen and retry keep the existing one) | ok → `OPEN` · error → `FAILED` with the reason |
 | `OPEN` | Turns (§1.2) | `closeDiscussion` → `CLOSED` |
-| `CLOSED` | Read-only; drafts can still become runs | `reopenDiscussion` → `PREPARING` (pulls the default branch, keeps the Conversation) → `OPEN` |
-| `FAILED` | Nothing | `retryDiscussion` → `PREPARING` |
+| `CLOSED` | Read-only; drafts can still become runs | `reopenDiscussion` → `PREPARING` (resyncs the checkout to the default branch, keeps the Conversation) → `OPEN` |
+| `FAILED` | Nothing; drafts can still become runs | `retryDiscussion` → `PREPARING` |
 
 A discussion never appears on the run board, and runs never depend on it after they are created (§2.3).
 
@@ -132,8 +138,18 @@ discussion:
   `<workdir>/discussions/<id>/`.
   - **Existing repo:** a worktree of the default branch.
   - **No repo yet:** an empty local workspace, `newRepo: true`.
-- **Reopening:** `reopenDiscussion` fast-forwards the worktree to the latest default branch. If that fails because the
-  local branch diverged or the remote is gone, the discussion goes to `FAILED` with the reason; Retry tries again.
+- **Reopening:** `reopenDiscussion` (and `retryDiscussion`) resyncs the worktree to the latest default branch
+  (`GitHub.refresh`). The checkout is read-only, so it is reset to `origin/<default>` and cleaned rather than merged:
+  a force-pushed default branch or stray local changes don't matter. A missing checkout, manifest or clone (or a
+  worktree git can't reset) is made again with `GitHub.open`; so is a new-repo workspace whose repo now exists. Only
+  a git failure, such as a remote that is gone, sends the discussion to `FAILED` with git's message; Retry tries again.
+  `GitHub.open` ignores a manifest whose repo isn't the one asked for (a reused id) and makes the checkout again.
+- **Telling the model:** when a reopen or retry changed the checkout (another head, or the repo now exists), the next
+  turn's input carries a short factory note saying so ("The repo checkout was updated to <sha>…", "The repo <repo>
+  now exists…"): in a `say` turn in the message header after the sender, in a `draft` turn as a `# Factory note`
+  section at the end of the drafting input.
+- **Disposal:** when the discussion leaves `OPEN` (closed or failed), the discussant's environment is disposed, as a
+  run's are when it ends; a reopen or retry provisions it again.
 - **Sandbox:** `Sandbox.provision(ws, "discussant", rc)` gives the role the same environment as the architect:
   - the worktree is readable but not writable;
   - the scratch folder (`home`, `tmp`, caches) is writable;
@@ -209,22 +225,25 @@ retryDiscussion(id: DiscussionId): Promise<void>;
   | `say`, `requestDrafts` | `OPEN` and no turn running |
   | `stopTurn` | a turn running |
   | `updateDraft`, `deleteDraft` | the draft has no `runId` and no `draft` turn is running |
-  | `createTicket` | `OPEN` or `CLOSED`, the draft has no `runId`, no `draft` turn running |
+  | `createTicket` | any state; the draft has no `runId` and no `draft` turn is running |
   | `closeDiscussion` | `OPEN` with no turn running |
   | `reopenDiscussion` | `CLOSED` |
   | `retryDiscussion` | `FAILED` |
 
-- **Input checks:** empty text, title or body is refused with `invalid`, and an unknown id with `not_found`.
+- **Input checks:** empty text, title or body is refused with `invalid`, and an unknown id with `not_found`. A
+  `states` filter (`listDiscussions`, and `listRuns`) must be an array of known states, else `invalid`.
 
 **Events**, added to `FactoryEvent`:
 
 ```ts
 | { type: "discussion.state"; discussion: DiscussionId; project: string; from: DiscussionState | null; to: DiscussionState }
 | { type: "discussion.updated"; discussion: DiscussionId; project: string;
-    what: "turn.started" | "turn.ended" | "drafts" | "ticket" | "notice" }
+    what: "turn.started" | "turn.ended" | "drafts" | "ticket" | "notice"; submission?: true }
 | { type: "discussion.conversation.updated"; discussion: DiscussionId; conversationId: string }
 ```
 
+- `what: "drafts"` is emitted for a new submission (with `submission: true`) and for a human's edit or delete
+  (without it), so interfaces refresh on both but announce only new drafts.
 - `subscribe`'s filter gains `discussion?: DiscussionId`. A `project` filter matches both run and discussion events.
 - The web server's event stream needs no change.
 
@@ -252,6 +271,9 @@ retryDiscussion(id: DiscussionId): Promise<void>;
 - Each body is a self-contained request for the factory's architect: the goal, the constraints, what is in and out of
   scope, and acceptance criteria. Refer to other tickets by title where they depend on each other.
 - The summary separates what is settled from what is still open.
+- On a redraft, the drafts so far: those that already became tickets (title and run id, "do not re-submit these";
+  refer to them by title where a new ticket depends on them), then the current drafts' titles and bodies, marking
+  the ones the human edited, to build on (the submission replaces them).
 - Then come the human's instructions, if any.
 
 **What the core does with it**
@@ -369,7 +391,7 @@ The architect's discussion otherwise runs unchanged: it still asks with `ask_hum
 | Case | Result |
 |---|---|
 | Opening the repo or provisioning the sandbox fails | `FAILED` with the reason; Retry |
-| Fast-forward on reopen fails | `FAILED` with the reason; Retry |
+| Updating the checkout on reopen or retry fails (git fails, e.g. the remote is gone; a missing or diverged checkout is made again instead) | `FAILED` with git's message; Retry |
 | Provider error during a turn | `error` notice with the provider message; stays `OPEN` |
 | No `submit_tickets` after 2 reminders | notice; drafts and summary unchanged |
 | Invalid `submit_tickets` payload | problems returned to the model; the turn continues |
@@ -401,7 +423,8 @@ All tests use the scripted provider and need no credentials.
 **`test/discussion.test.ts` (new)**
 - **Life cycle:**
   - start → `OPEN`, with the first input containing the project context and the first message;
-  - close → reopen, where the worktree is fast-forwarded to a new commit on the fake remote;
+  - close → reopen, where the worktree is updated to a new commit on the fake remote, also after a force-push and
+    after the checkout was deleted;
   - a `FAILED` start, then retry.
 - **Turns:**
   - `say` gets a reply;
@@ -420,7 +443,7 @@ All tests use the scripted provider and need no credentials.
   - `createTicket` starts a run with the request meta;
   - the architect's first input contains `# Prior discussion`, the summary and the sibling titles;
   - a second `createTicket` on the draft is refused;
-  - `createTicket` on a `CLOSED` discussion works.
+  - `createTicket` on a `CLOSED` or `FAILED` discussion works.
 - **Settings:** `discussion.model` falls back to the architect's model, a project override is respected, and an
   unknown model is refused at start.
 
