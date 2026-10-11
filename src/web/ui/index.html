@@ -7,6 +7,7 @@
 <title>Factory Board</title>
 <link rel="stylesheet" href="/app.css">
 <script src="/app.js" defer></script>
+<script src="/discussions.js" defer></script>
 </head>
 <body>
 <div class="app" id="app">
@@ -14,6 +15,7 @@
     <div class="brand"><span class="brand-mark"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1 14V7l4 2.5V7l4 2.5V4l2-2h2l2 2v10z"/></svg></span>Factory</div>
     <nav class="nav" aria-label="Views">
       <button type="button" data-view="board" aria-current="page">Board</button>
+      <button type="button" data-view="discussions">Discussions</button>
       <button type="button" data-view="settings">Settings</button>
     </nav>
     <div class="top-spacer"></div>
@@ -36,6 +38,21 @@
     </div>
   </main>
 
+  <main class="view" id="view-discussions" hidden>
+    <div class="disc-wrap">
+      <div class="board-head">
+        <h1 class="board-title">Discussions</h1>
+        <select class="proj" id="disc-proj" aria-label="Project"></select>
+        <div class="chips" role="group" aria-label="Quick filters">
+          <button type="button" class="chip" id="disc-closed" aria-pressed="false">Show closed <span class="n" id="disc-n-closed">0</span></button>
+        </div>
+        <div class="top-spacer"></div>
+        <button type="button" class="btn" id="disc-new"><span aria-hidden="true">+</span> New discussion</button>
+      </div>
+      <div class="disc-list" id="disc-list" aria-label="Discussions"></div>
+    </div>
+  </main>
+
   <main class="view" id="view-settings" hidden>
     <div class="settings">
       <nav class="set-nav" id="set-nav" aria-label="Settings scope"></nav>
@@ -55,6 +72,7 @@
     </div>
     <div class="rv-progress" id="rv-progress" aria-label="Pipeline progress"></div>
     <div class="rv-actions">
+      <span class="rv-disc-actions" id="rv-disc-actions"></span>
       <span class="rv-cost" id="rv-cost" title="Cost so far"></span>
       <button type="button" class="icon-btn" id="rv-details-btn" aria-label="Ticket details" aria-pressed="false" title="Ticket details"><svg viewBox="0 0 16 16"><path d="M2 2.5h12a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1zm.5 1.5v8h7V4zm8.5 0v8h2.5V4z"/></svg></button>
       <button type="button" class="rv-close" id="rv-close" aria-label="Close ticket" title="Close (Esc)"><svg viewBox="0 0 16 16"><path d="M13.53 3.53 5.56 11.5H10V13H3V6h1.5v4.44l7.97-7.97z"/></svg></button>

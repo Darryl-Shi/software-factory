@@ -17,6 +17,7 @@ const UI_DIR = join(import.meta.dirname, "ui");
 const STATIC: Record<string, [string, string]> = {
 	"/": ["index.html", "text/html; charset=utf-8"],
 	"/app.js": ["app.js", "text/javascript; charset=utf-8"],
+	"/discussions.js": ["discussions.js", "text/javascript; charset=utf-8"],
 	"/app.css": ["app.css", "text/css; charset=utf-8"],
 };
 const CSP = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";

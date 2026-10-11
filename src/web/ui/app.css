@@ -505,3 +505,54 @@ table.cost tr.total td { font-weight: 600; border-bottom: 0; }
 .shots { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
 .shots a { display: grid; gap: 2px; text-decoration: none; }
 .shots img { width: 120px; max-height: 90px; object-fit: cover; border: 1px solid var(--line, #ccc); border-radius: 6px; background: var(--bg-2, #f4f4f4); }
+
+/* ---------- discussions: the list, the discussion view (the run view's sheet) and its drafts panel ---------- */
+.disc-wrap { height: 100%; display: grid; grid-template-rows: auto minmax(0, 1fr); min-height: 0; }
+.disc-list { overflow-y: auto; padding: 0 16px 16px; display: grid; gap: 8px; align-content: start; }
+.disc-list .col-empty { max-width: 560px; }
+.disc-row { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); padding: 10px 12px; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px 16px; align-items: center; text-align: left; width: 100%; max-width: 1100px; }
+.disc-row:hover { border-color: var(--line-strong); }
+.disc-row.closed { opacity: .78; }
+.dr-main { display: grid; gap: 7px; min-width: 0; }
+.dr-side { display: grid; gap: 6px; justify-items: end; }
+.disc-run { display: inline-flex; align-items: center; gap: 5px; }
+.disc-mark { display: inline-grid; place-items: center; color: var(--fg-3); }
+.disc-mark svg, .from-disc svg { width: 13px; height: 13px; fill: currentColor; flex: none; }
+.avatar.discussant { background: var(--r-arch); }
+.linkish { border: 0; background: none; padding: 0; color: var(--accent); text-decoration: underline; text-underline-offset: 2px; text-align: left; }
+.from-disc { display: flex; gap: 8px; align-items: center; font-size: 13px; color: var(--fg-2); }
+.nd-model { display: grid; grid-template-columns: minmax(0, 1fr) 140px; gap: 10px; }
+.nd-model .set-ctl input, .nd-model .set-ctl select { width: 100%; }
+.runview[data-mode="discussion"] .rv-progress, .runview[data-mode="discussion"] .rv-threads, .runview[data-mode="discussion"] .drawer-btn.threads { display: none; }
+.runview:not([data-mode="discussion"]) .rv-disc-actions { display: none; }
+.rv-disc-actions { display: inline-flex; gap: 6px; }
+.runview[data-mode="discussion"] .rv-body { grid-template-columns: minmax(0, 1fr) 0px; }
+.runview[data-mode="discussion"] .rv-body.with-details { grid-template-columns: minmax(0, 1fr) 348px; }
+.blk.turn-cost { text-align: right; font-size: 11.5px; color: var(--fg-3); font-variant-numeric: tabular-nums; margin: 6px 0 0; }
+.f-card.disc-notice.error { background: var(--bad-soft); border-color: var(--bad); }
+.f-card.disc-notice.stopped, .f-card.disc-notice.no_submission { background: var(--turn-soft); border-color: var(--turn-line); }
+.send.stop { background: var(--fg); color: var(--sheet); }
+.notice.drafting { display: flex; gap: 8px; align-items: center; }
+.dd-go { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
+.drafts { display: grid; gap: 10px; }
+.draft { border: 1px solid var(--hairline); border-radius: 12px; background: var(--sheet); padding: 10px 12px; display: grid; gap: 6px; min-width: 0; }
+.draft.done { background: var(--rail); }
+.draft.locked { opacity: .7; }
+.draft-top { display: flex; gap: 8px; align-items: center; min-width: 0; }
+.draft-title { font: 600 13.5px/1.35 var(--f-display); overflow-wrap: anywhere; }
+.draft-title-in { font: 600 13.5px/1.35 var(--f-display); border: 1px solid transparent; background: none; border-radius: var(--radius); padding: 4px 6px; margin: 0 -6px; width: calc(100% + 12px); min-width: 0; }
+.draft-title-in:hover:not(:disabled), .draft-body[tabindex]:hover { background: var(--rail); }
+.draft-title-in:focus { border-color: var(--accent); background: var(--raised); outline: none; }
+.draft-body { font-size: 13px; max-height: 16em; overflow: auto; border-radius: 8px; padding: 6px; margin: 0 -6px; }
+.draft-body[tabindex] { cursor: text; }
+.draft-body-in { width: 100%; min-height: 180px; resize: vertical; border: 1px solid var(--accent); border-radius: 8px; background: var(--raised); padding: 6px 8px; font: 12.5px/1.5 var(--f-mono); outline: none; }
+.draft-actions, .draft-run { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.draft details summary { cursor: pointer; }
+@media (max-width: 1180px) {
+  .runview[data-mode="discussion"] .rv-body, .runview[data-mode="discussion"] .rv-body.with-details { grid-template-columns: minmax(0, 1fr) 0px; }
+}
+@media (max-width: 760px) {
+  .disc-row { grid-template-columns: minmax(0, 1fr); }
+  .dr-side { justify-items: start; }
+  .rv-disc-actions .btn { padding: 3px 6px; }
+}
