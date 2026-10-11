@@ -36,6 +36,8 @@ export interface Draft {
 	title: string;
 	body: string;
 	edited: boolean;
+	/** Which submit_tickets submission it came from (1-based). */
+	batch: number;
 	runId?: RunId;
 }
 export interface DiscussionNotice {

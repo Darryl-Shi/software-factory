@@ -2,6 +2,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { afterEach, describe, expect, test } from "vitest";
 import { ROLE_TOOLS } from "../src/agents/tools.ts";
+import { bridgeToolsNotFor } from "../src/core/bridge.ts";
 import { makeFactory, type TestEnv } from "./helpers.ts";
 
 let t: TestEnv | undefined;
@@ -238,6 +239,9 @@ describe("settings layering", () => {
 		expect(ROLE_TOOLS.helper.map((e) => e.name)).toEqual(["role-helper", "coding", "test-runner", "web-search"]);
 		expect(ROLE_TOOLS.qa.map((e) => e.name)).toEqual(["role-qa", "coding-readonly", "computer", "web-search"]);
 		expect(ROLE_TOOLS.builder.map((e) => e.name)).toEqual(["role-builder", "coding", "subagent", "test-runner", "web-search"]);
+		expect(ROLE_TOOLS.discussant.map((e) => e.name)).toEqual(["role-discussant", "coding-readonly", "web-search"]);
+		expect(bridgeToolsNotFor("architect").map((t) => t.name)).toContain("submit_tickets");
+		expect(bridgeToolsNotFor("discussant").map((t) => t.name)).not.toContain("submit_tickets");
 	});
 
 	test("projects: createProject is idempotent, validates names and repo bindings, and rejects rebinding", async () => {
