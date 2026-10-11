@@ -323,7 +323,7 @@ function draftCard(d, x, locked) {
       <div class="draft-run"><button type="button" class="btn small" data-open-run="${esc(x.runId)}">Open ${esc(keyOf(x.runId))}</button>${stateLabel(draftRun(d, x.runId))}</div>
       <details><summary class="meta">Request</summary><div class="f-body">${md(x.body)}</div></details></div>`;
   }
-  const ticket = (d.state === "OPEN" || d.state === "CLOSED") && !locked;
+  const ticket = !locked; // any discussion state (a run never depends on it); only drafting locks the drafts
   return `<div class="draft${locked ? " locked" : ""}" data-draft="${esc(x.id)}" data-disc="${esc(d.id)}">
     <div class="draft-top"><span class="key">${esc(x.id)}</span>${x.edited ? `<span class="meta">edited</span>` : ""}</div>
     <input class="draft-title-in" data-keep data-field="title" value="${esc(x.title)}" aria-label="Title of draft ${esc(x.id)}" autocomplete="off"${locked ? " disabled" : ""}>
