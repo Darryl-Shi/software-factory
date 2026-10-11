@@ -21,7 +21,7 @@ tickets that you edit and turn into runs.
   backs every finding with a screenshot. QA is on by default (`qa.enabled`) and can be turned off per project.
 - **The web UI is the interface**, on `http://127.0.0.1:7317`: a ticket board where each run moves through the pipeline
   stages on its own, a full-screen run view with the agents' conversations, a chat box, and approvals in a floating
-  card, a Discussions tab, and a Settings view. The `factory` command only starts, stops and checks the process.
+  card, a **Chat** button for discussions, and a Settings view. The `factory` command only starts, stops and checks the process.
 - **Discussions come before a ticket, when you want one.** A discussion is a chat with one model (the `discussant`
   role) about one project. It can read the repo, run commands in a read-only sandbox and search the web, but can't
   change anything. Asked for drafts, it submits a summary and draft tickets (`submit_tickets`). Each draft you create
@@ -49,7 +49,8 @@ code differs from them is listed in [`DEVIATIONS.md`](DEVIATIONS.md).
   both need `bubblewrap` and `socat`.
 - **Discussions** were added on 11 October 2026. The test suite covers them, the dry run starts its first ticket
   from a discussion, and the Discussions tab was driven in a headless browser against the dry run's factory. The
-  discussant's prompt has not been tried with a real model.
+  discussant's prompt has not been tried with a real model. The Discussions tab was replaced by the **Chat** button and
+  a full-screen chat; that UI was driven with jsdom against a scripted factory (no real browser was available).
 - **AQ testing and writing helpers** (design spec §9, §9.1) were added on 10 October 2026. They are verified with a
   disk-based fake boat.dev (`--fake-boat`) and a stub Cua Driver; nothing has run against the live boat.dev API yet.
 - **Not yet done:** a live trial against github.com with real models. The real-GitHub client (`GhApiHost`) has only
@@ -179,14 +180,19 @@ The factory keeps its files next to the config file (`~/.factory/` by default):
   architect are answered there, and at other times your message is steered into the agent's work (a busy agent sees
   it after its current step; an idle one replies). Approvals and escalations float above the conversation, so you can
   ask before you decide. At the spec gate, asking the architect for a change makes it revise the spec.
-- **Discussions:** talk a problem through with one model before it becomes a ticket. **New discussion** asks for the
-  project, a title, the model (prefilled from `discussion.model`) and the first message. The discussion view reuses
-  the run view: the transcript and a chat box (**Stop** while the model is replying), and a drafts panel on the
-  right. **Draft tickets** asks the model for a summary and draft tickets; edit a draft's title and body in place,
-  then **Create ticket** turns it into a run on the board. That run's ticket details link back with "From
-  discussion", and its board card has a small discussion marker. **Close discussion** makes it read-only (drafts can
-  still become tickets, as they can in any state while the model isn't drafting); **Reopen** picks it up again with
-  the latest default branch, and **Retry** brings back a discussion that failed.
+- **Chat:** talk a problem through with one model before it becomes a ticket. The **Chat** button next to **Create**
+  opens a full-screen chat, on the discussion you had open last in this browser session or on a blank new chat
+  (`#chat`; a discussion is `#disc=<id>`). Pick the project (or **New project…**), the model (the models the factory
+  has credentials for, the project's `discussion.model` marked "(default)") and the thinking level in the dropdowns
+  at the top, then type: the first message starts the discussion, titled from its first line. After that the
+  dropdowns are locked to the discussion's pinned values; **New chat** starts another one. The left rail (it
+  collapses, and is a drawer on narrow screens) lists the selected project's discussions, newest first, with a live
+  dot while the model replies. The composer's button becomes **Stop** while a turn runs. **Draft tickets** opens the
+  drafts panel on the right: it asks the model for a summary and draft tickets; edit a draft's title and body in
+  place, then **Create ticket** turns it into a run on the board. That run's ticket details link back with "From
+  discussion", and its board card has a small discussion marker. The ⋯ menu holds **Close discussion**, which makes
+  it read-only (drafts can still become tickets, as they can in any state while the model isn't drafting);
+  **Reopen** picks it up again with the latest default branch, and **Retry** brings back a discussion that failed.
 - **Settings:** the layered settings as a form. Pick Global or a project; each field shows its source and a
   Reset/Inherit button.
 
@@ -215,13 +221,13 @@ npm run typecheck   # tsc (noEmit)
 | `test/settings.test.ts` | Layering and source attribution, unset, validate-on-save, the fixed schema and role tool sets, refusing a legacy `stages`/`workers` config or `roles.<role>.extensions` key, projects, `discussion.model` and its fallback to the architect |
 | `test/findings.test.ts` | Review and QA findings validation, builder responses, bridge enforcement, helpers that write |
 | `test/qa.test.ts` | AQ testing on the fake boat: QA pass/fail with screenshots, `submit_qa` rules, statuses ran/off/skipped/unavailable, missing key, cancel, ttl stop and resume, the startup sweep |
-| `test/discussion.test.ts` | Discussions: the checkout and its resync (diverged, force-pushed, deleted, remote gone, a reused id), start, close/reopen (the environment disposed and provisioned again, a factory note after the checkout changed), a failed start and retry, refusals and events; `say`, Stop (also a late one) and provider errors; no write tools; the pinned model; drafting with `submit_tickets` (invalid payloads, reminders, redrafts and what they are told about earlier drafts, Stop), draft edits and their refusals; `createTicket` (also on a `FAILED` discussion) and the architect's `# Prior discussion` |
+| `test/discussion.test.ts` | Discussions: the checkout and its resync (diverged, force-pushed, deleted, remote gone, a reused id), start, close/reopen (the environment disposed and provisioned again, a factory note after the checkout changed), a failed start and retry, refusals and events; `say`, Stop (also a late one) and provider errors; no write tools; the pinned model; drafting with `submit_tickets` (invalid payloads, reminders, redrafts and what they are told about earlier drafts, Stop), draft edits and their refusals; `createTicket` (also on a `FAILED` discussion) and the architect's `# Prior discussion`; the title derived from the first message |
 | `test/durability.test.ts` | `kill -9` mid-build, at a pending approval, mid-helper and mid-QA (and a VM deleted while down), then resume; a discussion killed mid-turn, mid-draft and right after `createTicket` |
 | `test/sandbox.test.ts` | The real bubblewrap sandbox: write rules (including the discussant's read-only worktree), denyRead, the factory home's secrets, no credential env vars, network allowlist |
 | `test/sandbox-write.test.ts` | A write root around the factory home: neither the home nor the storage is writable; the builder's worktree inside the home still is |
 | `test/github-api.test.ts` | `GhApiHost` request shapes, token handling, the GitHub App JWT exchange |
 | `test/messages.test.ts` | `message`: routing, refusals, side turns and their cost, spec revision at the gate, steering a busy builder, held messages, re-review of changes made at the delivery gate |
-| `test/web.test.ts` | The web server: token and cookie, Host/Origin/content-type checks, operations and error codes (discussion operations too), the event stream and its `discussion` filter, a busy port as an error, the static UI |
+| `test/web.test.ts` | The web server: token and cookie, Host/Origin/content-type checks, operations and error codes (discussion operations too, `listModels`, `startDiscussion` without a title), the event stream and its `discussion` filter, a busy port as an error, the static UI |
 | `test/web-search.test.ts` | `web_search` against a fake Parallel endpoint: request shape, result formatting, errors, a run using pinned `webSearch` settings |
 | `test/daemon.test.ts` | `serve`/`stop`/`status`/`web` as real processes: detaching, a second `serve`, a busy port, a bad or legacy config, unknown options, stale pid files, a fresh install |
 | `test/secrets.test.ts` | The secret store: file and directory modes, atomic writes, refusing a loose or unparseable file, `store:` refs |
@@ -245,7 +251,7 @@ src/github/        github.ts (GitHub: open, create, diff, writeArtifact, deliver
 src/boat/          boat.ts (Boat: QA VMs per review round, BoatEnv), backend.ts (BoatApiBackend on @boatdev/sdk, LocalBoatBackend fake)
 src/sandbox/       sandbox.ts (Sandbox: per-role environments in the run's worktree, inside sandbox-runtime)
 src/web/           server.ts (HTTP + server-sent events) and ui/ (the static web UI, no build step;
-                   discussions.js is the Discussions tab and discussion view)
+                   discussions.js is the full-screen chat behind the Chat button)
 src/agents/        tools.ts (coding, coding-readonly, subagent, test-runner, computer, browser; each role's fixed set),
                    web-search.ts, prompts.ts (role-* prompts)
 src/models/        host.ts (the model host: pi-coding-agent's ModelRuntime and package manager over <factoryHome>/pi)

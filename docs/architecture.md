@@ -261,6 +261,9 @@ only during a `draft` turn. It can't be messaged through `message`: the human ta
 server is its transport.
 
 - **Projects:** `createProject`, `getProject`, `listProjects`.
+- **Models:** `listModels()` returns `{ id: "provider/modelId", name?, provider }[]`, the models the model host
+  reports as available (with credentials; `models.getAvailable()`, as `factory setup roles` uses). It is read-only and
+  needs no project.
 - **Runs:** `startRun`, `getRun`, `listRuns`, `getConversation`, `cancelRun`, `retryRun`.
   - `getRun` returns a `RunView`.
   - `getConversation` returns a read-only transcript, including the builder's helpers.
@@ -276,6 +279,9 @@ server is its transport.
 - **Discussions:** `startDiscussion`, `getDiscussion`, `listDiscussions`, `getDiscussionConversation`, `say`,
   `stopTurn`, `requestDrafts`, `updateDraft`, `deleteDraft`, `createTicket`, `closeDiscussion`, `reopenDiscussion`,
   `retryDiscussion`. An operation in the wrong state is refused with `conflict`, naming the state.
+  `startDiscussion(project, { title?, message, model? })`: a missing or blank `title` is derived from the first
+  message (its first non-empty line, whitespace collapsed, markdown heading/bullet markers stripped, cut to 60
+  characters on a word boundary with `…`); an empty message is refused with `invalid`.
 - **Filters:** `listRuns` and `listDiscussions` take `{ project?, states? }`; `states` must be an array of known
   states, else the call is refused with `invalid`.
 - **Settings:** `settingsSchema`, `getSettings`, `setSetting`, `unsetSetting`.
@@ -299,7 +305,8 @@ server is its transport.
   `{ args }`, and `subscribe` as server-sent events at `/api/events` (`?run=`, `?project=`, `?discussion=`).
 - It also serves the UI: a board whose columns are pipeline stages, a full-screen run view with the run's
   conversations, a chat box addressed by `message`, and approvals in a card that floats over the transcript, a
-  Discussions tab whose discussion view reuses the run view's sheet with a drafts panel, and a Settings form
+  **Chat** button next to Create that opens discussions as a full-screen chat in the run view's sheet (a history
+  rail, project/model/thinking dropdowns locked after the first message, a drafts panel), and a Settings form
   generated from `settingsSchema()`. The UI only calls these operations; it has no state of its own
   beyond a cache.
 

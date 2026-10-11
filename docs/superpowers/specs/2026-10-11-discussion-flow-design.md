@@ -8,6 +8,15 @@ Date: 2026-10-11 · Status: approved design, awaiting spec review
 > carries a factory note (§1.4); the discussant's environment is disposed when the discussion leaves `OPEN` (§1.4);
 > `drafts` events mark new submissions, and `states` filters are checked (§2.1). See DEVIATIONS.md 45–51.
 
+> **Amended by the full-screen chat change** (`docs/spec.md`, run-mv46hn3a-f4fa): **§3 Web UI is superseded.** The
+> Discussions tab, its list and the New discussion modal are gone. A **Chat** button next to Create opens the run
+> view's sheet as a full-screen chat: project, model (from the new read-only `listModels` op) and thinking dropdowns
+> at the top, locked after the first message; a collapsible history rail of the selected project's discussions with
+> **New chat**; the transcript and composer in the centre; the drafts panel (unchanged) on the right, opened by
+> **Draft tickets**; Close/Reopen/Retry in a ⋯ menu. A blank new chat is `#chat`; a discussion keeps `#disc=<id>`.
+> In the core, `startDiscussion`'s `title` is optional: a missing or blank title is derived from the first line of
+> the message. Everything else in this design (states, turns, drafts, handoff, durability, pinning) is unchanged.
+
 ## Intent
 
 Some problems are too unclear to write as a ticket. Today the only conversation the factory offers is the architect's
@@ -320,6 +329,8 @@ The architect's discussion otherwise runs unchanged: it still asks with `ask_hum
 `RunView.request.meta` carries the link back to the discussion for the UI.
 
 ## 3. Web UI (`src/web/ui/`)
+
+> Superseded by the full-screen chat (see the amendment at the top and `docs/spec.md`).
 
 **Navigation**
 - The top bar gets a **Discussions** tab between Board and Settings (`data-view="discussions"`). The Board stays
