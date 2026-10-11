@@ -1,8 +1,10 @@
 // Layered settings (spec §5, §6): default → global → project, validate on save, file unchanged on rejection.
 import { readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import { ROLE_TOOLS } from "../src/agents/tools.ts";
 import { bridgeToolsNotFor } from "../src/core/bridge.ts";
+import { ConfigStore } from "../src/core/settings.ts";
 import { makeFactory, type TestEnv } from "./helpers.ts";
 
 let t: TestEnv | undefined;
@@ -98,12 +100,16 @@ describe("settings layering", () => {
 			[G, "ci.noChecksTimeout", "soon", /not a duration/],
 			[G, "policy.approvals", ["spec", "deploy"], /expected one of spec, delivery, merge/],
 			[G, "policy.approvals", ["spec", "spec"], /duplicate gate/],
-			[G, "roles.reviewer.model", "openai/no-such-model", /not a model createModels\(\) knows/],
+			[G, "roles.reviewer.model", "openai/no-such-model", /openai\/no-such-model is not a model the model host knows \(log in or add it with factory setup models\)/],
 			[G, "roles.reviewer.thinking", "extreme", /expected one of off, low, medium, high/],
 			[G, "roles.builder.extensions", ["coding"], /unknown setting/],
 			[G, "github.identity.tokenRef", "ghp_abc123", /secret reference/],
 			[G, "sandbox.extraWrite", ["~"], /home directory/],
 			[G, "sandbox.extraWrite", ["~/.ssh/keys"], /denied secret path/],
+			// the factory home is the config's directory: an extraWrite at, inside or around it is refused
+			[G, "sandbox.extraWrite", [dirname(t.configPath)], /factory home/],
+			[G, "sandbox.extraWrite", [join(dirname(t.configPath), "cache")], /factory home/],
+			[G, "sandbox.extraWrite", [dirname(dirname(t.configPath))], /factory home/],
 			[{ project: "p" }, "storage.path", "/tmp/x.sqlite", /global only/],
 			[{ project: "p" }, "web.port", 8000, /global only/],
 			[G, "web.port", 70000, /above the maximum 65535/],
@@ -265,5 +271,19 @@ describe("settings layering", () => {
 		const raw = readFileSync(t.configPath, "utf8");
 		expect(raw).toContain("# my factory");
 		expect(raw).toContain("reviewRoundCap: 4");
+	});
+
+	test("ConfigStore sees external writes and does not clobber them", async () => {
+		t = await makeFactory();
+		const schema = () => t!.factory.settingsSchema();
+		const a = new ConfigStore(t.configPath, schema);
+		const b = new ConfigStore(t.configPath, schema);
+		a.set(G, "ci.fixRounds", 1);
+		expect(b.effective(G).ci.fixRounds).toBe(1);
+		b.set(G, "ci.mode", "off");
+		const raw = readFileSync(t.configPath, "utf8");
+		expect(raw).toMatch(/fixRounds: 1/);
+		expect(raw).toMatch(/mode: off/);
+		expect(a.effective(G).ci).toMatchObject({ fixRounds: 1, mode: "off" });
 	});
 });

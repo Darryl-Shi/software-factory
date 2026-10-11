@@ -1,18 +1,20 @@
-// The factory process: the one process that owns the storage and the core. It creates the pi-ai models, a GitHub on
+// The factory process: the one process that owns the storage and the core. It points `store:` secret refs at
+// <factoryHome>/secrets.json, builds the model host (pi's ModelRuntime over <factoryHome>/pi), a GitHub on
 // a GhApiHost (or a LocalGitHubHost with --fake-github) and a Sandbox, hands them to the Factory, which opens the
 // storage, and then starts the web server, the factory's interface. A busy web port stops it before any run resumes.
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { dirname, join } from "node:path";
-import type { Models } from "@earendil-works/pi-ai";
-import { builtinModels } from "@earendil-works/pi-ai/providers/all";
+import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { Boat } from "./boat/boat.ts";
 import { BoatApiBackend, type BoatBackend, LocalBoatBackend } from "./boat/backend.ts";
 import { Factory } from "./core/core.ts";
-import { expandHome } from "./core/settings.ts";
+import { expandHome, setDefaultSecretStore } from "./core/settings.ts";
 import { GitHub } from "./github/github.ts";
 import { GhApiHost, type GitHubHost, LocalGitHubHost } from "./github/host.ts";
+import { createModelHost } from "./models/host.ts";
 import { Sandbox } from "./sandbox/sandbox.ts";
+import { SecretStore, secretsPath } from "./secrets/store.ts";
 import { startWebServer } from "./web/server.ts";
 
 export interface ProcessOptions {
@@ -33,17 +35,6 @@ export const DEFAULT_CONFIG = "~/.factory/config.yaml";
 
 export function factoryHome(configPath: string) {
 	return dirname(configPath);
-}
-
-export async function createModels(scripted: boolean): Promise<Models> {
-	// pi-ai providers read their credentials from the environment / secret store (platform service, §3.1).
-	const models = builtinModels();
-	if (scripted) {
-		const { scriptedProvider } = await import("./testing/scripted.ts");
-		const { DRY_RUN_SCRIPTS } = await import("./testing/dry-run-agents.ts");
-		models.setProvider(scriptedProvider(DRY_RUN_SCRIPTS).provider);
-	}
-	return models;
 }
 
 /** Boat on boat.dev's API, or on a LocalBoatBackend under `fake` (dry runs, tests). */
@@ -74,6 +65,18 @@ function probePort(host: string, port: number): Promise<void> {
 	});
 }
 
+/** Whether any role's model provider (global or any project) has credentials; serve still starts without. */
+async function anyRoleHasCredentials(factory: Factory, models: ModelRuntime): Promise<boolean> {
+	const scopes = [{ global: true } as const, ...factory.config.projects().map((p) => ({ project: p.name }))];
+	const providers = new Set<string>();
+	for (const s of scopes) {
+		const roles = factory.config.effective(s).roles ?? {};
+		for (const r of Object.values(roles) as { model?: unknown }[]) if (typeof r?.model === "string") providers.add(r.model.split("/")[0]!);
+	}
+	for (const p of providers) if (await models.checkAuth(p).catch(() => undefined)) return true;
+	return false;
+}
+
 export async function startFactoryProcess(opts: ProcessOptions = {}): Promise<FactoryProcess> {
 	const configPath = expandHome(opts.configPath ?? process.env.FACTORY_CONFIG ?? DEFAULT_CONFIG);
 	if (!existsSync(configPath)) {
@@ -81,16 +84,25 @@ export async function startFactoryProcess(opts: ProcessOptions = {}): Promise<Fa
 		writeFileSync(configPath, "version: 1\n");
 	}
 	const log = opts.log ?? ((m: string) => console.error(`[factory] ${m}`));
-	const host: GitHubHost = opts.fakeGithub ? new LocalGitHubHost(expandHome(opts.fakeGithub)) : new GhApiHost();
+	const home = factoryHome(configPath);
+	const secrets = new SecretStore(secretsPath(home));
+	// spec §5: refuse a loose or unparseable secrets.json before anything starts (a missing one is fine).
+	secrets.keys();
+	setDefaultSecretStore(secrets);
+	const modelHost = await createModelHost({ factoryHome: home, ...(opts.scripted ? { scripted: true } : {}) });
+	for (const d of modelHost.diagnostics) log(`extension: ${d.message}`);
+	const ghHost: GitHubHost = opts.fakeGithub ? new LocalGitHubHost(expandHome(opts.fakeGithub)) : new GhApiHost();
 	const factory = new Factory({
 		configPath,
-		models: await createModels(!!opts.scripted),
-		github: new GitHub(host),
+		models: modelHost.models,
+		github: new GitHub(ghHost),
 		sandbox: new Sandbox({ stateDir: join(factoryHome(configPath), "environments") }),
 		boat: createBoat(configPath, opts.fakeBoat),
 		...(opts.ciPollMs ? { ciPollMs: opts.ciPollMs } : {}),
 		log,
 	});
+	// A config problem here is reported by factory.start() below, not by this hint.
+	if (!(await anyRoleHasCredentials(factory, modelHost.models).catch(() => true))) log("no model credentials configured; run factory setup");
 	const cfg = factory.config.effective({ global: true }).web;
 	const webHost = String(cfg.host);
 	const webPort = opts.webPort ?? Number(cfg.port);

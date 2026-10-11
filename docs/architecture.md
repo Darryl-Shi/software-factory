@@ -62,10 +62,84 @@ not selectable: `ROLE_TOOLS` in `tools.ts` gives each role a fixed set, after it
 | `web-search` | `web_search`: Parallel's Search API in `fast` mode, run in the factory process | all |
 | `role-*` (`prompts.ts`) | each role's prompt sections | each its own |
 
-`src/main.ts` is the process wiring. It creates the pi-ai models, a `GitHub` on a `GhApiHost` (or a `LocalGitHubHost`
-with `--fake-github`), a `Sandbox` and the `Factory`, which opens the storage, then starts the web server.
+`src/main.ts` is the process wiring. It creates the secret store (refusing a `secrets.json` that is readable by group
+or others or doesn't parse) and the model host (below), a `GitHub` on a `GhApiHost` (or a `LocalGitHubHost` with
+`--fake-github`), a `Sandbox` and the `Factory`, which opens the storage, then starts the web server.
 `src/daemon.ts` runs `factory serve` in the background with `factory.pid` and `factory.log`; the web server writes
 `web-token` and `web-url`. All four live next to the config file.
+
+## Model host and secret store
+
+Both live in the factory home, the config file's directory (`~/.factory` by default).
+
+**The model host** (`src/models/host.ts`, `createModelHost`) is where models come from.
+- Role Conversations are pi-durable Conversations, and pi-durable takes a pi-ai `Models` object; it has no extension
+  or package loader. Packages and extensions belong to pi-coding-agent, so the factory uses pi-coding-agent as a
+  model host only (DEVIATIONS.md "pi-coding-agent as the model host").
+- `createAgentSessionServices({ cwd: agentDir, agentDir })` with `agentDir = <factory home>/pi` builds pi's
+  `ModelRuntime`: the built-in providers, `models.json`, the providers that installed packages' extensions register,
+  and the credentials in `auth.json` (with pi's locking and OAuth refresh). `cwd` is `agentDir` on purpose, so no
+  `.pi/` directory in the directory `serve` was started in is loaded. Nothing comes from `~/.pi/agent`.
+- `ModelHost` is `{ models, packages, agentDir, diagnostics }`. `models` is the `ModelRuntime`, which implements
+  pi-ai's `Models` and is what `Factory` receives; `packages` is pi's `DefaultPackageManager`.
+- Only the providers and virtual models that extensions register are used. Their tools, commands, flags and event
+  hooks attach to pi-coding-agent sessions, which the factory never creates.
+- Extension and `models.json` errors become `diagnostics`, never exceptions: `serve` logs them and `doctor` prints
+  them as `warn` lines.
+- `ModelRuntime` reads `auth.json` when it resolves auth, so a login applies to the running factory's next request.
+  Packages and `models.json` are loaded when the host is built, at startup.
+- `scripted: true` (the dry run, `--scripted`) registers the scripted provider as a native provider.
+
+**The secret store** (`src/secrets/store.ts`, `SecretStore`) backs `store:<key>` secret references.
+- It is `<factory home>/secrets.json`, `{ "version": 1, "secrets": { "<key>": "<value>" } }`: the file 0600, its
+  directory 0700, each write to a temp file then renamed. `get` re-reads the file, so the daemon sees new values
+  without a restart, and refuses a file readable by group or others.
+- `resolveSecret(ref, store?)` in `src/core/settings.ts` resolves `env:`, `file:` and `store:` refs, through the
+  store it is given or else the process default. `main.ts` (`serve`) and `createSetupContext` (`setup`) set the
+  default with `setDefaultSecretStore`, so `GhApiHost`, `Boat` and `web_search` resolve `store:` refs without being
+  handed a store. `doctor` (`src/doctor.ts`) sets no default: it builds its own `SecretStore` and passes it to
+  `resolveSecret` and `Boat.limits`.
+- The sandbox always denies the factory home, wherever `--config` points. Inside it, it re-exposes only the
+  environment's own worktree, git directory, scratch dir and `extraWrite` paths (a `workdir` placed in the home), and
+  denies the secret and state entries regardless: `secrets.json`, `pi/` (with `auth.json`), `web-token`, `web-url`,
+  `factory.log`, `factory.sqlite*`, `environments/` and `qa-vms/`, plus the `storage.path` database wherever it
+  lives. No write root may reach the home or the database from outside: such a root is dropped, so no agent can read
+  or rewrite a credential, the config or an environment record stored there.
+
+## The setup wizard
+
+`factory setup [section]` (`src/setup/`) sets up credentials, providers, role models and the service.
+
+```
+cli.ts setup ──► runSetup (wizard.ts) ──► steps/: prereqs · github · models · roles · qa · search · service
+                 │                        each a Step: status(ctx) → ok | warn | missing; run(ctx)
+                 ▼
+                 SetupContext (context.ts): config path, factory home, SetupUi, SecretStore, model host,
+                 validated settings, boat, fetch, command runner, platform, env, home dir, daemon, doctor
+```
+
+- **`cli.ts`** refuses unknown options, an unknown section and a missing TTY, then calls
+  `runSetup(createSetupContext({ configPath, ui: new ClackUi() }), section)` and exits with its code (0, 1 or 130).
+- **`wizard.ts`** (`runSetup`) refuses a legacy config or a bad `secrets.json` before any prompt. With no section it
+  shows the status summary, runs every step (asking `Reconfigure <title>?`, the step's title, for one that is `ok`),
+  offers a restart after a step that changed packages or `models.json` (`ctx.needsRestart`) while the factory runs,
+  runs the doctor checks and prints the outro. With a section it runs that step alone, then makes the same restart
+  offer. `SetupCancelled` from a prompt ends it with exit 130; Ctrl-C while a spinner runs is handled in `ClackUi`,
+  which prints the same message and exits 130 itself. What earlier steps saved stays saved.
+- **`steps/`** has one module per section, each exporting a `Step` (`name`, `title`, `status`, `run`); `index.ts`
+  lists them in order. Two helper modules export no step: `endpoints.ts` (the `models` section's compatible endpoints,
+  `models.json` I/O and the shared role-usage and credential helpers) and `candidate-store.ts` (a `SecretStore` that
+  answers one key from memory, so `qa` and `search` verify a pasted key before writing `secrets.json`). A step writes
+  settings through `ctx.settings()`, the factory's own `ConfigStore` over the current host's models, so the web UI's
+  validate-on-save applies. Secrets go through `ctx.secrets`, and model
+  credentials and packages through `ctx.host()` (`reloadHost()` after a change).
+- **`context.ts`** builds the context. `createSetupContext` is the CLI's (the real store, host, commands and daemon);
+  tests build one from stubs with `testContext` (`test/setup-context.ts`, over `buildSetupContext`), so no test
+  touches the real home, the network, `gh`, `systemctl` or `launchctl`.
+- **`ui.ts`:** steps depend only on the `SetupUi` interface. `ClackUi` implements it with `@clack/prompts` and turns a
+  cancel into `SetupCancelled`. `authInteraction(ui)` adapts it to pi-ai's login protocol (prompts, auth URLs, device
+  codes, progress); its `close()` stops the spinner a final `progress` event left running. Tests use `ScriptedUi`
+  (`test/setup-helpers.ts`), which pops queued answers and records what is shown.
 
 ## The flow
 
@@ -237,11 +311,15 @@ server is its transport.
 - `--foreground` runs in the current process, for systemd/launchd and development. It writes `factory.pid` once the
   web server listens and removes it on SIGINT or SIGTERM.
 - **The factory never runs without its web UI.** `serve` exits 1 with a one-line reason if the web port is taken, a
-  live pid file names a running factory, the config can't be loaded, or the config still has a `stages` or `workers`
-  section or a `roles.<role>.extensions` key (also under `projects.<name>`). The port is checked before any run resumes. Unknown options are refused.
+  live pid file names a running factory, `secrets.json` is readable by group or others or doesn't parse, the config
+  can't be loaded, or the config still has a `stages` or `workers` section or a `roles.<role>.extensions` key (also under `projects.<name>`). The port is checked before any run resumes. Unknown options are refused.
 - A pid file that names no running factory (a dead process, or a reused pid) is removed.
 - `stop` sends SIGTERM and waits for the process to exit; `status` prints the pid and the link; `web` prints the
-  link from `web-url`; `doctor` checks the config, models, sandbox, GitHub identity and `gh`.
+  link from `web-url`; `doctor` (`src/doctor.ts`) checks the config, extensions, models, sandbox, GitHub identity,
+  boat.dev and Parallel keys and `gh`; `setup` runs the wizard above.
+- `factory setup service` can install a systemd user unit or a launchd agent that runs `serve --foreground`. It
+  writes the same pid file, so `stop`, `status` and `web` work the same way; `stop` makes it exit 0, which the
+  service does not restart.
 
 ## Security boundaries
 
@@ -258,5 +336,10 @@ server is its transport.
   rebinding) and foreign `Origin`s, requires `application/json` on operations, and needs the access token from
   `web-token` next to the config file (mode 0600). The link's token becomes an HttpOnly, SameSite=Strict cookie.
   A strict CSP allows only same-origin scripts.
+- **Secrets stay in the factory home.** `secrets.json` and `pi/auth.json` are 0600, and the sandbox denies the
+  factory home except the environment's own paths inside it, and its secret and state entries always. The service
+  files hold no credentials.
+- **Provider packages are trusted code.** Their extensions run in the factory process, outside the sandbox, with
+  access to its credentials; setup says so and asks before installing one.
 - **`web_search` runs outside the sandbox, in the factory process.** Its API key stays there. Query text does
   leave the machine, so the tool's section tells agents not to put secrets or private code in queries.

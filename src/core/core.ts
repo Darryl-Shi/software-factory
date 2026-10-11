@@ -76,7 +76,7 @@ export const PI_DURABLE_VERSION: string = require("@earendil-works/pi-durable/pa
 export interface CoreOptions {
 	/** Path of the config file (§5). */
 	configPath: string;
-	/** pi-ai models (createModels() with providers) — injected platform service (§3.1). */
+	/** pi-ai models (the model host's ModelRuntime, src/models/host.ts) — injected platform service (§3.1). */
 	models: Models;
 	/** GitHub: workspaces, delivery, CI and merges. */
 	github: GitHub;
@@ -1009,7 +1009,7 @@ export class Factory implements FactoryCore {
 	private modelProblem(path: string, model: unknown): string | undefined {
 		const [provider, ...rest] = String(model ?? "").split("/");
 		if (!provider || rest.length === 0) return `${path}: expected provider/modelId`;
-		if (!this.opts.models.getModel(provider, rest.join("/"))) return `${path}: ${model} is not a model createModels() knows`;
+		if (!this.opts.models.getModel(provider, rest.join("/"))) return `${path}: ${model} is not a model the model host knows (log in or add it with factory setup models)`;
 		return undefined;
 	}
 
@@ -1029,7 +1029,7 @@ export class Factory implements FactoryCore {
 		}
 		if (isObj(eff.boat)) problems.push(...boatProblems(eff.boat).map((p) => `boat.${p}`));
 		if (isObj(eff.github)) problems.push(...githubProblems(eff.github).map((p) => `github.${p}`));
-		if (isObj(eff.sandbox)) problems.push(...sandboxProblems(eff.sandbox).map((p) => `sandbox.${p}`));
+		if (isObj(eff.sandbox)) problems.push(...sandboxProblems(eff.sandbox, dirname(this.opts.configPath)).map((p) => `sandbox.${p}`));
 		if (isObj(eff.ci)) {
 			const t = eff.ci.noChecksTimeout;
 			if (t !== undefined && !(parseDuration(t) >= 0)) problems.push(`ci.noChecksTimeout: "${t}" is not a duration (e.g. 2m, 90s, 500ms)`);

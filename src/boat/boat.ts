@@ -13,6 +13,7 @@ import { type ExecutionEnv, ExecutionError, FileError, type Result, type ShellEx
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { expandHome, parseDuration, resolveSecret } from "../core/settings.ts";
 import type { RunCtx, Workspace } from "../core/types.ts";
+import type { SecretStore } from "../secrets/store.ts";
 import { type BoatBackend, BoatNotFound, GONE_STATES, STOPPED_STATES } from "./backend.ts";
 
 export type QaVmRecord = {
@@ -98,8 +99,8 @@ export class Boat {
 		return !!resolveSecret(config.boat?.apiKey ?? "env:BOAT_API_KEY");
 	}
 
-	private backend(apiKeyRef: string): BoatBackend {
-		const key = resolveSecret(apiKeyRef);
+	private backend(apiKeyRef: string, store?: SecretStore): BoatBackend {
+		const key = resolveSecret(apiKeyRef, store);
 		if (!key) throw new Error(`boat.apiKey (${apiKeyRef}) does not resolve`);
 		return this.backendFor(key);
 	}
@@ -312,9 +313,9 @@ export class Boat {
 		return deleted;
 	}
 
-	/** doctor: boat's limits call with a key reference. */
-	limits(apiKeyRef: string): Promise<unknown> {
-		return this.backend(apiKeyRef).limits();
+	/** doctor: boat's limits call with a key reference (`store:` refs resolve through `store`, else the default). */
+	limits(apiKeyRef: string, store?: SecretStore): Promise<unknown> {
+		return this.backend(apiKeyRef, store).limits();
 	}
 }
 
