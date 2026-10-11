@@ -29,11 +29,13 @@ export interface ScriptContext {
 export type Script = ((ctx: ScriptContext) => AssistantMessage | Promise<AssistantMessage>) & {
 	onMessage?: (ctx: ScriptContext) => AssistantMessage | Promise<AssistantMessage> | undefined;
 };
-const BRIDGE_TOOLS = ["ask_human", "submit_spec", "report_done", "submit_review", "submit_qa"];
+const BRIDGE_TOOLS = ["ask_human", "submit_spec", "report_done", "submit_review", "submit_qa", "submit_tickets"];
 /** The human's own text of a message (without the factory's header and situation note). */
 export const humanText = (full: string) => parseMessage(full)?.text ?? full;
 
 export const say = (text: string) => fauxAssistantMessage([fauxText(text)]);
+/** A model call that fails (provider error), e.g. to exercise a turn that ends in error. */
+export const fail = (message: string) => fauxAssistantMessage([], { stopReason: "error", errorMessage: message });
 let callSeq = 0;
 export const call = (name: string, args: Record<string, unknown>) =>
 	fauxAssistantMessage([fauxToolCall(name, args as any, { id: `call_${Date.now().toString(36)}_${++callSeq}` })], { stopReason: "toolUse" });

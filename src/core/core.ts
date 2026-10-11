@@ -682,13 +682,23 @@ export class Factory implements FactoryCore {
 
 	private coreRules(eff: Obj, _scope: Scope): string[] {
 		const problems: string[] = [];
+		const modelProblem = (path: string, model: unknown): string | undefined => {
+			const [provider, ...rest] = String(model ?? "").split("/");
+			if (!provider || rest.length === 0) return `${path}: expected provider/modelId`;
+			if (!this.opts.models.getModel(provider, rest.join("/"))) return `${path}: ${model} is not a model createModels() knows`;
+			return undefined;
+		};
 		for (const role of ["architect", "builder", "helper", "reviewer", "qa"] as Role[]) {
 			const r = eff.roles?.[role];
 			if (!isObj(r) || r.model === undefined) continue;
-			const [provider, ...rest] = String(r.model ?? "").split("/");
-			if (!provider || rest.length === 0) problems.push(`roles.${role}.model: expected provider/modelId`);
-			else if (!this.opts.models.getModel(provider, rest.join("/"))) problems.push(`roles.${role}.model: ${r.model} is not a model createModels() knows`);
+			const p = modelProblem(`roles.${role}.model`, r.model);
+			if (p) problems.push(p);
 			else if (role === "qa" && !this.acceptsImages(String(r.model))) problems.push(`roles.qa.model: ${r.model} does not accept image input (the QA agent works from screenshots)`);
+		}
+		const dm = eff.discussion?.model?.model;
+		if (dm !== undefined) {
+			const p = modelProblem("discussion.model.model", dm);
+			if (p) problems.push(p);
 		}
 		if (isObj(eff.boat)) problems.push(...boatProblems(eff.boat).map((p) => `boat.${p}`));
 		if (isObj(eff.github)) problems.push(...githubProblems(eff.github).map((p) => `github.${p}`));

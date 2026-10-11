@@ -144,7 +144,7 @@ describe("settings layering", () => {
 	test("settingsSchema is the fixed core schema", async () => {
 		t = await makeFactory();
 		const schema = t.factory.settingsSchema();
-		expect(Object.keys(schema)).toEqual(["version", "workdir", "roles", "policy", "github", "ci", "sandbox", "qa", "boat", "web", "webSearch", "storage"]);
+		expect(Object.keys(schema)).toEqual(["version", "workdir", "roles", "discussion", "policy", "github", "ci", "sandbox", "qa", "boat", "web", "webSearch", "storage"]);
 		expect(Object.keys((schema.roles as any).fields)).toEqual(["architect", "builder", "helper", "reviewer", "qa"]);
 		expect(Object.keys((schema.boat as any).fields)).toEqual(["apiKey", "size", "ttl", "runScripts"]);
 		expect(Object.keys((schema.ci as any).fields)).toEqual(["mode", "fixRounds", "checks", "noChecksTimeout"]);
@@ -210,6 +210,25 @@ describe("settings layering", () => {
 		s = await f.getSettings({ project: "p" });
 		expect(s["roles.helper.model"]).toEqual({ value: "scripted/helper", source: "global" });
 		expect(s["roles.helper.thinking"]).toEqual({ value: "low", source: "default" });
+	});
+
+	test("discussion.model falls back to the architect's model and thinking; a project override wins", async () => {
+		t = await makeFactory();
+		const f = t.factory;
+		const eff = (s: { global: true } | { project: string }) => f.config.effective(s);
+		await f.createProject("p", "me/p");
+		// global: roles.architect = { model: scripted/architect, thinking: high }, no discussion section
+		expect(eff({ global: true }).discussion.model).toEqual({ model: "scripted/architect", thinking: "high" });
+		await f.setSetting({ project: "p" }, "discussion.model.model", "scripted/builder");
+		expect(eff({ project: "p" }).discussion.model).toEqual({ model: "scripted/builder", thinking: "high" });
+		expect((await f.getSettings({ project: "p" }))["discussion.model.model"]).toEqual({ value: "scripted/builder", source: "project" });
+	});
+
+	test("discussion.model.model must be a known model; policy.messages cannot list discussant", async () => {
+		t = await makeFactory();
+		const f = t.factory;
+		await expect(f.setSetting({ global: true }, "discussion.model.model", "scripted/nope")).rejects.toThrow(/discussion\.model\.model: .* is not a model/);
+		await expect(f.setSetting({ global: true }, "policy.messages", ["discussant"])).rejects.toThrow(/expected one of/);
 	});
 
 	test("roles have fixed tool sets", async () => {

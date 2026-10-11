@@ -16,6 +16,20 @@ export const RoleArchitect = defineExtension({
 	],
 });
 
+export const RoleDiscussant = defineExtension({
+	name: "role-discussant",
+	sections: [
+		section(
+			"role",
+			() => `You are helping a human think through a problem that is not yet well defined, before it becomes a ticket for the software factory. It may be a product question as well as a technical one.
+- Ground what you say in the repo: read the code and run commands to check claims. Search the web for outside facts. Say which claims you checked and which are guesses.
+- Ask questions when the problem is unclear. Push back on ideas that don't hold up.
+- You cannot change the repo. Don't write the solution, only what is needed to show an idea, in your scratch folder.
+- When asked for drafts, call submit_tickets.`,
+		),
+	],
+});
+
 export const RoleBuilder = defineExtension({
 	name: "role-builder",
 	sections: [
