@@ -256,7 +256,17 @@ describe("static UI", () => {
 		const disc = readFileSync(join(UI, "discussions.js"), "utf8");
 		// a classic script after app.js: it shares app.js's globals and parses in the same global scope
 		expect(() => new Script(`${js}\n;${disc}`, { filename: "app.js+discussions.js" })).not.toThrow();
-		expect([...html.matchAll(/<script\b[^>]*>/g)].map((m) => m[0])).toEqual(['<script src="/app.js" defer>', '<script src="/discussions.js" defer>']);
+		// md()/inline() come only from markdown.js, which shares the same global scope
+		const mdjs = readFileSync(join(UI, "markdown.js"), "utf8");
+		expect(() => new Script(`${mdjs}\n;${js}\n;${disc}`, { filename: "markdown.js+app.js+discussions.js" })).not.toThrow();
+		expect(`${js}\n${disc}`).not.toMatch(/(function|const|let|var)\s+(md|inline)\b/);
+		expect([...html.matchAll(/<script\b[^>]*>/g)].map((m) => m[0])).toEqual([
+			'<script src="/vendor/marked.js" defer>',
+			'<script src="/vendor/purify.js" defer>',
+			'<script src="/markdown.js" defer>',
+			'<script src="/app.js" defer>',
+			'<script src="/discussions.js" defer>',
+		]);
 		expect(html).toContain('data-view="discussions"');
 		expect(html).not.toMatch(/https?:\/\//);
 		expect(readFileSync(join(UI, "app.css"), "utf8")).not.toMatch(/@import|url\(https?:/);
@@ -265,6 +275,37 @@ describe("static UI", () => {
 		used.delete("subscribe");
 		const server = readFileSync(join(import.meta.dirname, "../src/core/types.ts"), "utf8");
 		for (const name of used) expect(server).toContain(`"${name}",`);
+	});
+
+	test("vendor markdown libraries and markdown.js: exact routes, JavaScript, same auth, no path traversal", async () => {
+		const { port, token } = await serve();
+		const get = (path: string, auth = true) => http(port, "GET", path, { headers: auth ? { authorization: `Bearer ${token}` } : {} });
+		for (const [path, marker] of [["/vendor/marked.js", "marked v18.1.0"], ["/vendor/purify.js", "DOMPurify"], ["/markdown.js", "DOMPurify"]] as const) {
+			const r = await get(path);
+			expect(r.status).toBe(200);
+			expect(r.headers["content-type"]).toBe("text/javascript; charset=utf-8");
+			expect(r.headers["x-content-type-options"]).toBe("nosniff");
+			expect(r.headers["content-security-policy"]).toBe((await get("/app.js")).headers["content-security-policy"]);
+			expect(r.body).toContain(marker);
+			expect(() => new Script(r.body, { filename: path })).not.toThrow();
+			// same rule as /app.js: refused without the token or cookie
+			const anon = await get(path, false);
+			expect(anon.status).toBe(401);
+			expect(anon.body).not.toContain(marker);
+		}
+		// only the exact entries: no directory listing, no other files, no traversal
+		for (const path of [
+			"/vendor/", "/vendor", "/vendor/marked.umd.js", "/vendor/purify.min.js", "/vendor/../package.json", "/vendor/%2e%2e/package.json",
+			"/vendor/..%2f..%2fpackage.json", "/vendor/marked.js/../../server.ts", "/node_modules/marked/package.json", "/../server.ts", "/%2e%2e/server.ts", "/constructor", "/__proto__", "/hasOwnProperty",
+		]) {
+			const r = await get(path);
+			expect(r.status, path).not.toBe(200);
+			expect(r.body, path).not.toMatch(/"name":|import \{/);
+		}
+		// the CSP gains no unsafe-eval and no foreign origin
+		const csp = String((await get("/")).headers["content-security-policy"]);
+		expect(csp).not.toMatch(/unsafe-eval|https?:/);
+		expect(csp).toContain("script-src 'self'");
 	});
 
 	test("discussions.js is served, parses, and is loaded by index.html", async () => {

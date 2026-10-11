@@ -190,6 +190,11 @@ The factory keeps its files next to the config file (`~/.factory/` by default):
 - **Settings:** the layered settings as a form. Pick Global or a project; each field shows its source and a
   Reset/Inherit button.
 
+Agent replies, chat bubbles, specs, requests, summaries and draft tickets render as GitHub-flavoured markdown
+(tables, nested and task lists, quotes, links, code blocks), sanitised so raw HTML in them never runs; links open in a
+new tab. The markdown libraries (`marked`, `DOMPurify`) are served by the factory itself from `/vendor/`, so the UI
+loads nothing from other origins.
+
 The UI listens on localhost only. To use it from another machine, forward the port over SSH
 (`ssh -L 7317:127.0.0.1:7317 host`). Change the port with `web.port` or `serve --port`.
 

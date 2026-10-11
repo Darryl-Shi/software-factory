@@ -558,3 +558,35 @@ table.cost tr.total td { font-weight: 600; border-bottom: 0; }
   .rv-disc-actions .btn { padding: 3px 6px; }
   .rv-model { display: none; }
 }
+
+/* ===================================================================== markdown (markdown.js: marked + DOMPurify)
+   Shared styles for rendered markdown in every prose container; container-specific sizes above still apply. */
+:is(.a-text, .f-body, .you-bubble, .spec-doc, .c-preview, .c-q, .draft-body) {
+  & :is(h4, h5, h6) { font: 600 1em/1.4 var(--f-display); margin: 12px 0 4px; }
+  & :is(h5, h6) { color: var(--fg-2); }
+  & h6 { font-size: .9em; }
+  & > :first-child { margin-top: 0; }
+  & :is(ul, ol) { padding-left: 1.4em; }
+  & li > :is(ul, ol) { margin: 2px 0 2px; padding-left: 1.3em; }
+  & li > p { margin: 0 0 4px; }
+  & li:has(> input[type="checkbox"]) { list-style: none; margin-left: -1.3em; }
+  & input[type="checkbox"] { margin: 0 .45em 0 0; vertical-align: -1px; accent-color: var(--accent); pointer-events: none; }
+  & blockquote { margin: 6px 0 10px; padding: 2px 0 2px 12px; border-left: 3px solid var(--line-strong); color: var(--fg-2); }
+  & blockquote > :last-child { margin-bottom: 0; }
+  & hr { border: 0; border-top: 1px solid var(--line); margin: 12px 0; }
+  & img { max-width: 100%; height: auto; border-radius: 6px; }
+  & del { color: var(--fg-3); }
+  & a { overflow-wrap: anywhere; }
+  & code { font-size: .88em; background: var(--code-bg); border: 1px solid var(--hairline); border-radius: 5px; padding: 1px 5px; }
+  & pre { margin: 6px 0 10px; }
+  & pre code { font: inherit; background: none; border: 0; padding: 0; border-radius: 0; }
+  /* tables: compact and bordered; a wide table scrolls inside its block instead of widening the layout */
+  & table { display: block; max-width: 100%; width: max-content; overflow-x: auto; border-collapse: collapse; margin: 6px 0 10px; font-size: .92em; line-height: 1.45; overflow-wrap: normal; }
+  & :is(th, td) { border: 1px solid var(--line); padding: 4px 9px; text-align: left; vertical-align: top; }
+  & th { background: var(--rail); font-weight: 600; }
+  & tr:nth-child(2n) td { background: color-mix(in srgb, var(--rail) 60%, transparent); }
+}
+.you-bubble th { background: var(--sheet); }
+.c-q p { margin: 0 0 6px; } .c-q p:last-child { margin-bottom: 0; } .c-q :is(ul, ol) { margin: 2px 0 6px; }
+.spec-doc h3 { font: 600 14.5px/1.3 var(--f-display); margin: 16px 0 6px; }
+.spec-doc :is(ul, ol) { margin: 4px 0 10px; }
