@@ -247,6 +247,30 @@ describe("discussions", () => {
 	});
 });
 
+describe("chat ops", () => {
+	test("listModels over HTTP returns the available models; startDiscussion without a title derives it", async () => {
+		const { port, token } = await serve();
+		const models = await op(port, token, "listModels");
+		expect(models.body).toContain("\"ok\":true");
+		expect(models.status).toBe(200);
+		const list = JSON.parse(models.body).result as { id: string; name?: string; provider: string }[];
+		expect(Array.isArray(list)).toBe(true);
+		expect(list.length).toBeGreaterThan(0);
+		for (const m of list) {
+			expect(m.id.startsWith(`${m.provider}/`)).toBe(true);
+		}
+		expect(list.map((m) => m.id)).toContain("scripted/discussant");
+		await t!.host.seedRepo("me/p", { "README.md": "# p\n" });
+		await op(port, token, "createProject", ["p", "me/p"]);
+		const res = await op(port, token, "startDiscussion", ["p", { message: "## Why is the build slow?\nIt takes ages." }]);
+		expect(res.status).toBe(200);
+		const id = JSON.parse(res.body).result;
+		const v = JSON.parse((await op(port, token, "getDiscussion", [id])).body).result;
+		expect(v.title).toBe("Why is the build slow?");
+		await t!.factory.waitForDiscussion(id, (d) => d.state !== "PREPARING");
+	});
+});
+
 describe("static UI", () => {
 	test("app.js parses; index.html loads only same-origin files and has no inline script (CSP)", () => {
 		const js = readFileSync(join(UI, "app.js"), "utf8");

@@ -360,10 +360,19 @@ export type FactoryEvent =
 	| { type: "discussion.updated"; discussion: DiscussionId; project: string; what: "turn.started" | "turn.ended" | "drafts" | "ticket" | "notice"; submission?: true }
 	| { type: "discussion.conversation.updated"; discussion: DiscussionId; conversationId: string };
 
+/** A model `listModels` reports: `id` is `provider/modelId`. */
+export interface ModelInfo {
+	id: string;
+	name?: string;
+	provider: string;
+}
+
 export interface FactoryCore {
 	createProject(name: string, repo: RepoRef): Promise<Project>;
 	getProject(name: string): Promise<Project>;
 	listProjects(): Promise<Project[]>;
+	/** The models the model host reports as available (with credentials). Read-only; needs no project. */
+	listModels(): Promise<ModelInfo[]>;
 	startRun(project: string, request: Omit<Request, "id" | "project">): Promise<RunId>;
 	getRun(run: RunId): Promise<RunView>;
 	listRuns(filter?: { project?: string; states?: RunState[] }): Promise<RunView[]>;
@@ -383,8 +392,9 @@ export interface FactoryCore {
 	getSettings(scope: Scope): Promise<EffectiveSettings>;
 	setSetting(scope: Scope, path: string, value: unknown): Promise<void>;
 	unsetSetting(scope: Scope, path: string): Promise<void>;
-	/** Start a discussion on a project with a first message; `model` defaults to the project's `discussion.model`. */
-	startDiscussion(project: string, d: { title: string; message: string; model?: { model: string; thinking: string } }): Promise<DiscussionId>;
+	/** Start a discussion on a project with a first message; `model` defaults to the project's `discussion.model`.
+	 * A missing or blank `title` is derived from the first line of the message (see `deriveTitle`). */
+	startDiscussion(project: string, d: { title?: string; message: string; model?: { model: string; thinking: string } }): Promise<DiscussionId>;
 	getDiscussion(id: DiscussionId): Promise<DiscussionView>;
 	listDiscussions(filter?: { project?: string; states?: DiscussionState[] }): Promise<DiscussionView[]>;
 	/** The discussion's transcript (its one Conversation, role `discussant`). */
@@ -412,6 +422,7 @@ export const CORE_OPS = [
 	"createProject",
 	"getProject",
 	"listProjects",
+	"listModels",
 	"startRun",
 	"getRun",
 	"listRuns",
