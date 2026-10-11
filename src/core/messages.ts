@@ -33,12 +33,18 @@ export function holdMessage(d: Pick<RunDocState, "state" | "driving">, target: {
 
 const HEADER = /^\[Message from the human via (\S+) · ([A-Za-z0-9._:-]+)\]\n/;
 
+/** A human message with no situation note (a discussion's `say`): the header `parseMessage` reads, then the text. */
+export function humanContent(by: string, msgId: string, text: string): { type: "text"; text: string }[] {
+	return [
+		{ type: "text", text: `[Message from the human via ${by} · ${msgId}]\n\n` },
+		{ type: "text", text },
+	];
+}
+
 /** What the agent receives: a header naming the sender, a note on where the run is, then the human's text. */
 export function messageContent(d: RunDocState, msg: HumanMessage): { type: "text"; text: string }[] {
-	return [
-		{ type: "text", text: `[Message from the human via ${msg.by} · ${msg.id}]\n${situation(d, msg.to)}\n\n` },
-		{ type: "text", text: msg.text },
-	];
+	const [head, body] = humanContent(msg.by, msg.id, msg.text) as [{ type: "text"; text: string }, { type: "text"; text: string }];
+	return [{ type: "text", text: `${head.text.slice(0, -1)}${situation(d, msg.to)}\n\n` }, body];
 }
 
 /** Recognise a human message in a user entry's content (see `messageContent`). */

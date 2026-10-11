@@ -118,6 +118,31 @@ export function validateResponses(
 	return { ok: true, responses: [...byId.values()] };
 }
 
+/**
+ * A discussant's `submit_tickets` (discussions spec §2.2) is valid iff the summary is not empty and there are 1 to 20
+ * tickets, each with a title of at most 200 characters and a non-empty body. Titles are trimmed.
+ */
+export function validateTickets(
+	input: unknown,
+): { ok: true; payload: { summary: string; tickets: { title: string; body: string }[] } } | { ok: false; problems: string[] } {
+	if (typeof input !== "object" || input === null) return { ok: false, problems: ["submission must be an object"] };
+	const { summary, tickets } = input as { summary?: unknown; tickets?: unknown };
+	const problems: string[] = [];
+	if (!nonEmpty(summary)) problems.push("summary is required");
+	if (!Array.isArray(tickets)) return { ok: false, problems: [...problems, "tickets must be a list"] };
+	if (tickets.length < 1 || tickets.length > 20) problems.push("give 1 to 20 tickets");
+	const out = tickets.map((raw, i) => {
+		const t = (typeof raw === "object" && raw !== null ? raw : {}) as { title?: unknown; body?: unknown };
+		const title = typeof t.title === "string" ? t.title.trim() : "";
+		if (!title) problems.push(`tickets[${i}]: title is required`);
+		else if (title.length > 200) problems.push(`tickets[${i}]: title is longer than 200 characters`);
+		if (!nonEmpty(t.body)) problems.push(`tickets[${i}]: body is required`);
+		return { title, body: typeof t.body === "string" ? t.body : "" };
+	});
+	if (problems.length) return { ok: false, problems };
+	return { ok: true, payload: { summary: summary as string, tickets: out } };
+}
+
 export function formatFinding(f: Finding): string {
 	const lines = [
 		`- [${f.id ?? "?"}] (${f.source ?? "reviewer"}, ${f.blocking ? "BLOCKING" : "advisory"}, ${f.severity})${f.specRef ? ` spec: ${f.specRef}` : ""}`,

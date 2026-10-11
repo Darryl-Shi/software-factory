@@ -42,14 +42,15 @@ const identity: SettingField = {
 	},
 };
 
-const thinking: SettingField = { type: "enum", values: ["off", "low", "medium", "high"], description: "Thinking level" };
-function roleField(model: string | undefined, level: string | undefined, description: string): SettingField {
+export const THINKING_LEVELS = ["off", "low", "medium", "high"];
+const thinking: SettingField = { type: "enum", values: THINKING_LEVELS, description: "Thinking level" };
+function roleField(model: string | undefined, level: string | undefined, description: string, inheritsFrom: "builder" | "architect" = "builder"): SettingField {
 	return {
 		type: "object",
 		description,
 		fields: {
-			model: { type: "string", ...(model ? { default: model } : {}), description: model ? "provider/modelId known to createModels()" : "provider/modelId known to createModels() (unset = the builder's)" },
-			thinking: { ...thinking, ...(level ? { default: level } : {}), ...(level ? {} : { description: "Thinking level (unset = the builder's)" }) } as SettingField,
+			model: { type: "string", ...(model ? { default: model } : {}), description: model ? "provider/modelId known to createModels()" : `provider/modelId known to createModels() (unset = the ${inheritsFrom}'s)` },
+			thinking: { ...thinking, ...(level ? { default: level } : {}), ...(level ? {} : { description: `Thinking level (unset = the ${inheritsFrom}'s)` }) } as SettingField,
 		},
 	};
 }
@@ -69,6 +70,13 @@ export function coreSchema(): Record<string, SettingField> {
 				helper: roleField(undefined, undefined, "Helpers the builder spawns; they write code (unset = the builder's)"),
 				reviewer: roleField("openai/gpt-6-sol", "high", "Reviewer: whole product vs spec, tests, code quality and security"),
 				qa: roleField("anthropic/claude-sonnet-5-5", "medium", "QA agent: uses the product in a boat.dev VM (AQ testing); the model must accept images"),
+			},
+		},
+		discussion: {
+			type: "object",
+			description: "Discussions: talk a problem through with the discussant before it becomes a ticket",
+			fields: {
+				model: roleField(undefined, undefined, "Default model and thinking of a new discussion (unset = the architect's)", "architect"),
 			},
 		},
 		policy: {
@@ -343,6 +351,18 @@ function inheritHelper(eff: Obj): Obj {
 	return eff;
 }
 
+/** `discussion.model.{model, thinking}` unset (at every layer) = the architect's effective value. */
+function inheritDiscussion(eff: Obj): Obj {
+	const architect = isObj(eff.roles) && isObj(eff.roles.architect) ? eff.roles.architect : {};
+	const discussion = isObj(eff.discussion) ? eff.discussion : {};
+	const model = isObj(discussion.model) ? discussion.model : {};
+	eff.discussion = {
+		...discussion,
+		model: { ...model, ...(model.model === undefined && architect.model !== undefined ? { model: architect.model } : {}), ...(model.thinking === undefined && architect.thinking !== undefined ? { thinking: architect.thinking } : {}) },
+	};
+	return eff;
+}
+
 // ---------------------------------------------------------------- the config store
 export type RuleCheck = (effective: Obj, scope: Scope) => string[];
 
@@ -382,11 +402,11 @@ export class ConfigStore {
 		const defaults = defaultsOf(this.schema());
 		const { projects: _p, ...top } = raw;
 		const global = deepMerge(defaults, top) as Obj;
-		if ("global" in scope) return inheritHelper(global);
+		if ("global" in scope) return inheritDiscussion(inheritHelper(global));
 		const proj = raw.projects?.[scope.project];
 		if (!isObj(proj)) throw new FactoryError("not_found", `project ${scope.project} does not exist`);
 		const { repo: _r, ...over } = proj;
-		return inheritHelper(deepMerge(global, over) as Obj);
+		return inheritDiscussion(inheritHelper(deepMerge(global, over) as Obj));
 	}
 
 	getSettings(scope: Scope): EffectiveSettings {

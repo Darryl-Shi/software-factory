@@ -1,9 +1,20 @@
 // Findings/evidence enforcement (spec §2 "Findings", §3.4).
 import { afterEach, describe, expect, test } from "vitest";
-import { formatFinding, humanFindings, validateQa, validateResponses, validateReview } from "../src/core/findings.ts";
+import { formatFinding, humanFindings, validateQa, validateResponses, validateReview, validateTickets } from "../src/core/findings.ts";
 import { makeFactory, type TestEnv } from "./helpers.ts";
 
 const ok = { severity: "major", blocking: true, specRef: "AB1", description: "broken", evidence: "$ npm test\n1 failing" };
+
+test("validateTickets", () => {
+	expect(validateTickets({ summary: "s", tickets: [{ title: " A ", body: "b" }] })).toEqual({ ok: true, payload: { summary: "s", tickets: [{ title: "A", body: "b" }] } });
+	const bad = validateTickets({ summary: " ", tickets: [{ title: "x".repeat(201), body: "" }] });
+	expect(bad.ok).toBe(false);
+	expect((bad as any).problems).toEqual(
+		expect.arrayContaining(["summary is required", "tickets[0]: title is longer than 200 characters", "tickets[0]: body is required"]),
+	);
+	expect((validateTickets({ summary: "s", tickets: [] }) as any).problems).toContain("give 1 to 20 tickets");
+	expect((validateTickets({ summary: "s", tickets: Array(21).fill({ title: "t", body: "b" }) }) as any).problems).toContain("give 1 to 20 tickets");
+});
 
 describe("validateReview", () => {
 	test("a valid fail and a valid pass", () => {

@@ -143,6 +143,14 @@ describe("operations and events", () => {
 		const invalid = await op(port, token, "message", ["nope", "   "]);
 		expect(invalid.status).toBe(400);
 		expect(JSON.parse(invalid.body).code).toBe("invalid");
+		// a `states` filter must be an array of known states (a string used to substring-match, a number threw a 500)
+		for (const name of ["listRuns", "listDiscussions"])
+			for (const states of ["OPEN", 5, ["NOPE"]]) {
+				const r = await op(port, token, name, [{ states }]);
+				expect(r.status).toBe(400);
+				expect(JSON.parse(r.body).code).toBe("invalid");
+			}
+		expect(JSON.parse((await op(port, token, "listRuns", [{ states: ["DELIVERED"] }])).body).result).toEqual([]);
 		expect((await op(port, token, "createProject", ["p", "other/p"])).status).toBe(409);
 		expect((await op(port, token, "subscribe")).status).toBe(404);
 		expect((await op(port, token, "harnessForTests")).status).toBe(404);
@@ -186,19 +194,86 @@ describe("operations and events", () => {
 	});
 });
 
+/** Opens `/api/events?<query>` and collects its frames into `got`. */
+async function sse(port: number, token: string, query: string) {
+	const got: any[] = [];
+	const stream = await new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
+		const req = request({ host: "127.0.0.1", port, path: `/api/events?${query}`, headers: { host: `127.0.0.1:${port}`, authorization: `Bearer ${token}` } }, resolve);
+		req.on("error", reject);
+		req.end();
+	});
+	stops.push(async () => void stream.destroy());
+	let buf = "";
+	stream.on("data", (c) => {
+		buf += c;
+		for (let i = buf.indexOf("\n\n"); i >= 0; i = buf.indexOf("\n\n")) {
+			const data = /^data: (.*)$/m.exec(buf.slice(0, i))?.[1];
+			buf = buf.slice(i + 2);
+			if (data) got.push(JSON.parse(data));
+		}
+	});
+	return { got, stream };
+}
+async function waitFor(cond: () => boolean | Promise<boolean>, ms = 10_000) {
+	for (const end = Date.now() + ms; !(await cond()); ) {
+		if (Date.now() > end) throw new Error("waitFor timed out");
+		await new Promise((r) => setTimeout(r, 20));
+	}
+}
+
+describe("discussions", () => {
+	test("discussion operations over HTTP, their error codes, and the discussion event filter", async () => {
+		const { port, token } = await serve();
+		await t!.host.seedRepo("me/p", { "README.md": "# p\n" });
+		await op(port, token, "createProject", ["p", "me/p"]);
+		const es = await sse(port, token, "discussion=disc-1");
+		const id = JSON.parse((await op(port, token, "startDiscussion", ["p", { title: "t", message: "m" }])).body).result;
+		expect(id).toBe("disc-1");
+		// a second discussion's events must not reach disc-1's stream
+		const other = JSON.parse((await op(port, token, "startDiscussion", ["p", { title: "u", message: "n" }])).body).result;
+		expect(other).toBe("disc-2");
+		await waitFor(() => es.got.some((e) => e.type === "discussion.state" && e.to === "OPEN"));
+		const v2 = await t!.factory.waitForDiscussion(other, (v) => v.state !== "PREPARING");
+		expect(v2.state).toBe("OPEN");
+		await new Promise((r) => setTimeout(r, 100));
+		expect(es.got.length).toBeGreaterThan(0);
+		expect(es.got.every((e) => e.discussion === id)).toBe(true);
+		const missing = await op(port, token, "say", ["disc-9", "x"]);
+		expect(missing.status).toBe(404);
+		expect(JSON.parse(missing.body).code).toBe("not_found");
+		const empty = await op(port, token, "say", [id, ""]);
+		expect(empty.status).toBe(400);
+		expect(JSON.parse(empty.body).code).toBe("invalid");
+	});
+});
+
 describe("static UI", () => {
 	test("app.js parses; index.html loads only same-origin files and has no inline script (CSP)", () => {
 		const js = readFileSync(join(UI, "app.js"), "utf8");
 		expect(() => new Script(js, { filename: "app.js" })).not.toThrow();
 		const html = readFileSync(join(UI, "index.html"), "utf8");
 		expect(html).toContain('href="/app.css"');
-		expect([...html.matchAll(/<script\b[^>]*>/g)].map((m) => m[0])).toEqual(['<script src="/app.js" defer>']);
+		const disc = readFileSync(join(UI, "discussions.js"), "utf8");
+		// a classic script after app.js: it shares app.js's globals and parses in the same global scope
+		expect(() => new Script(`${js}\n;${disc}`, { filename: "app.js+discussions.js" })).not.toThrow();
+		expect([...html.matchAll(/<script\b[^>]*>/g)].map((m) => m[0])).toEqual(['<script src="/app.js" defer>', '<script src="/discussions.js" defer>']);
+		expect(html).toContain('data-view="discussions"');
 		expect(html).not.toMatch(/https?:\/\//);
 		expect(readFileSync(join(UI, "app.css"), "utf8")).not.toMatch(/@import|url\(https?:/);
 		// every operation the UI calls is one the server allows
-		const used = new Set([...js.matchAll(/core\.([a-zA-Z]+)\(/g)].map((m) => m[1]!));
+		const used = new Set([...`${js}\n${disc}`.matchAll(/core\.([a-zA-Z]+)\(/g)].map((m) => m[1]!));
 		used.delete("subscribe");
 		const server = readFileSync(join(import.meta.dirname, "../src/core/types.ts"), "utf8");
 		for (const name of used) expect(server).toContain(`"${name}",`);
+	});
+
+	test("discussions.js is served, parses, and is loaded by index.html", async () => {
+		const { port, token } = await serve();
+		const get = (path: string) => http(port, "GET", path, { headers: { authorization: `Bearer ${token}` } });
+		const js = await get("/discussions.js");
+		expect(js.status).toBe(200);
+		expect(js.headers["content-type"]).toMatch(/^text\/javascript/);
+		expect(() => new Function(js.body)).not.toThrow();
+		expect((await get("/")).body).toMatch(/<script src="\/discussions\.js" defer><\/script>/);
 	});
 });

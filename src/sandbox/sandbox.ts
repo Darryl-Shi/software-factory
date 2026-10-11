@@ -37,6 +37,8 @@ type EnvRecord = {
 	setup?: { script: string; exitCode: number };
 	/** Credential env vars and key files named by the run's config (missing on records written before). */
 	credentials?: { envVars: string[]; files: string[] };
+	/** Set by `dispose`; a later `provision` of the same environment (a reopened discussion) clears it. */
+	disposed?: boolean;
 };
 
 const shellQuote = (argv: readonly string[]) => argv.map((a) => `'${a.replace(/'/g, `'\\''`)}'`).join(" ");
@@ -277,7 +279,13 @@ export class Sandbox {
 		const root = expandHome(rc.config.workdir ?? "~/factory/work");
 		const envId = `${rc.runId}-${role}`;
 		const existing = existsSync(this.recordPath(envId)) ? this.load(envId) : undefined;
-		if (existing) return { envId, cwd: existing.cwd };
+		if (existing) {
+			if (existing.disposed) {
+				delete existing.disposed;
+				writeFileSync(this.recordPath(envId), JSON.stringify(existing, null, 2));
+			}
+			return { envId, cwd: existing.cwd };
+		}
 		const sb = rc.config.sandbox ?? {};
 		const rec: EnvRecord = {
 			envId,

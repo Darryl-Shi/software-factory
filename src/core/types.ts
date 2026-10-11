@@ -3,7 +3,7 @@
 export type RunId = string;
 export type AskId = string;
 export type RepoRef = string; // "owner/name"
-export type Role = "architect" | "builder" | "helper" | "reviewer" | "qa";
+export type Role = "architect" | "builder" | "helper" | "reviewer" | "qa" | "discussant";
 /** Whether AQ testing ran in a review round (§2 "QA status"). */
 export type QaStatus = "ran" | "off" | "skipped" | "unavailable";
 export type Gate = "spec" | "delivery" | "merge";
@@ -27,6 +27,54 @@ export const RUN_STATES = [
 export type RunState = (typeof RUN_STATES)[number];
 export const TERMINAL_STATES: readonly RunState[] = ["DELIVERED", "FAILED", "CANCELLED"];
 
+// ---------------------------------------------------------------- discussions (a pre-ticket chat with the discussant)
+export type DiscussionId = string;
+export const DISCUSSION_STATES = ["PREPARING", "OPEN", "CLOSED", "FAILED"] as const;
+export type DiscussionState = (typeof DISCUSSION_STATES)[number];
+export interface Draft {
+	id: string;
+	title: string;
+	body: string;
+	edited: boolean;
+	/** Which submit_tickets submission it came from (1-based). */
+	batch: number;
+	runId?: RunId;
+}
+export interface DiscussionNotice {
+	at: number;
+	kind: "error" | "stopped" | "no_submission";
+	text: string;
+	/** The turn (its seq, as in `turnCosts`) that ended with this notice. */
+	turn?: number;
+}
+export interface TurnCost {
+	turn: number;
+	kind: "say" | "draft";
+	usd: number;
+	totalTokens: number;
+	durationMs: number;
+}
+export interface DiscussionView {
+	id: DiscussionId;
+	project: string;
+	repo: RepoRef;
+	title: string;
+	state: DiscussionState;
+	error?: string;
+	model: { model: string; thinking: string };
+	conversationId?: string;
+	turn: { kind: "say" | "draft"; startedAt: number } | null;
+	summary?: string;
+	drafts: Draft[];
+	notices: DiscussionNotice[];
+	cost: { usd: number; totalTokens: number };
+	turnCosts: TurnCost[];
+	runs: { id: RunId; state: RunState }[];
+	workspace?: Workspace;
+	createdAt: number;
+	updatedAt: number;
+}
+
 export interface Request {
 	id: string;
 	source: string;
@@ -34,6 +82,16 @@ export interface Request {
 	body: string;
 	project: string;
 	meta?: Record<string, unknown>;
+}
+
+/** `Request.meta.discussion` of a run created from a discussion draft (`createTicket`): copied, never read back. */
+export interface DiscussionLink {
+	id: DiscussionId;
+	title: string;
+	draftId: string;
+	summary: string;
+	/** The titles of the other drafts from the same submit_tickets submission. */
+	siblings: string[];
 }
 
 export interface ArtifactRef {
@@ -296,7 +354,11 @@ export type FactoryEvent =
 	| { type: "run.notice"; run: RunId; notice: Notice }
 	| { type: "conversation.updated"; run: RunId; conversationId: string; role: Role }
 	| { type: "run.message"; run: RunId; message: { id: string; to: Role; conversationId?: string } }
-	| { type: "settings.changed"; scope: Scope; path: string };
+	| { type: "settings.changed"; scope: Scope; path: string }
+	| { type: "discussion.state"; discussion: DiscussionId; project: string; from: DiscussionState | null; to: DiscussionState }
+	/** `submission`: with `what: "drafts"`, a new submit_tickets was applied (absent for a human's edit or delete). */
+	| { type: "discussion.updated"; discussion: DiscussionId; project: string; what: "turn.started" | "turn.ended" | "drafts" | "ticket" | "notice"; submission?: true }
+	| { type: "discussion.conversation.updated"; discussion: DiscussionId; conversationId: string };
 
 export interface FactoryCore {
 	createProject(name: string, repo: RepoRef): Promise<Project>;
@@ -321,7 +383,28 @@ export interface FactoryCore {
 	getSettings(scope: Scope): Promise<EffectiveSettings>;
 	setSetting(scope: Scope, path: string, value: unknown): Promise<void>;
 	unsetSetting(scope: Scope, path: string): Promise<void>;
-	subscribe(filter: { project?: string; run?: RunId }, on: (e: FactoryEvent) => void): Unsubscribe;
+	/** Start a discussion on a project with a first message; `model` defaults to the project's `discussion.model`. */
+	startDiscussion(project: string, d: { title: string; message: string; model?: { model: string; thinking: string } }): Promise<DiscussionId>;
+	getDiscussion(id: DiscussionId): Promise<DiscussionView>;
+	listDiscussions(filter?: { project?: string; states?: DiscussionState[] }): Promise<DiscussionView[]>;
+	/** The discussion's transcript (its one Conversation, role `discussant`). */
+	getDiscussionConversation(id: DiscussionId): Promise<TranscriptView>;
+	/** Send the human's text to the discussant: starts a turn. Refused while a turn runs or when not OPEN. */
+	say(id: DiscussionId, text: string): Promise<void>;
+	/** Abort the turn that is running. */
+	stopTurn(id: DiscussionId): Promise<void>;
+	/** Ask the discussant for draft tickets and a summary (a `draft` turn), with the human's optional instructions. */
+	requestDrafts(id: DiscussionId, instructions?: string): Promise<void>;
+	/** Edit a draft that has not become a run; marks it `edited`. */
+	updateDraft(id: DiscussionId, draft: string, change: { title?: string; body?: string }): Promise<void>;
+	deleteDraft(id: DiscussionId, draft: string): Promise<void>;
+	/** Turn a draft into a run (OPEN or CLOSED; not while a `draft` turn runs); the draft then records the run and is read-only. */
+	createTicket(id: DiscussionId, draft: string): Promise<RunId>;
+	closeDiscussion(id: DiscussionId): Promise<void>;
+	reopenDiscussion(id: DiscussionId): Promise<void>;
+	retryDiscussion(id: DiscussionId): Promise<void>;
+	/** A `project` filter matches run and discussion events; `run` and `discussion` match only that run's or discussion's. */
+	subscribe(filter: { project?: string; run?: RunId; discussion?: DiscussionId }, on: (e: FactoryEvent) => void): Unsubscribe;
 }
 
 /** The operations an interface may call over its transport (everything but `subscribe`). */
@@ -346,6 +429,19 @@ export const CORE_OPS = [
 	"getSettings",
 	"setSetting",
 	"unsetSetting",
+	"startDiscussion",
+	"getDiscussion",
+	"listDiscussions",
+	"getDiscussionConversation",
+	"say",
+	"stopTurn",
+	"requestDrafts",
+	"updateDraft",
+	"deleteDraft",
+	"createTicket",
+	"closeDiscussion",
+	"reopenDiscussion",
+	"retryDiscussion",
 ] as const satisfies readonly (keyof FactoryCore)[];
 
 export class FactoryError extends Error {
