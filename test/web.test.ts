@@ -245,13 +245,27 @@ describe("static UI", () => {
 		expect(() => new Script(js, { filename: "app.js" })).not.toThrow();
 		const html = readFileSync(join(UI, "index.html"), "utf8");
 		expect(html).toContain('href="/app.css"');
-		expect([...html.matchAll(/<script\b[^>]*>/g)].map((m) => m[0])).toEqual(['<script src="/app.js" defer>']);
+		const disc = readFileSync(join(UI, "discussions.js"), "utf8");
+		// a classic script after app.js: it shares app.js's globals and parses in the same global scope
+		expect(() => new Script(`${js}\n;${disc}`, { filename: "app.js+discussions.js" })).not.toThrow();
+		expect([...html.matchAll(/<script\b[^>]*>/g)].map((m) => m[0])).toEqual(['<script src="/app.js" defer>', '<script src="/discussions.js" defer>']);
+		expect(html).toContain('data-view="discussions"');
 		expect(html).not.toMatch(/https?:\/\//);
 		expect(readFileSync(join(UI, "app.css"), "utf8")).not.toMatch(/@import|url\(https?:/);
 		// every operation the UI calls is one the server allows
-		const used = new Set([...js.matchAll(/core\.([a-zA-Z]+)\(/g)].map((m) => m[1]!));
+		const used = new Set([...`${js}\n${disc}`.matchAll(/core\.([a-zA-Z]+)\(/g)].map((m) => m[1]!));
 		used.delete("subscribe");
 		const server = readFileSync(join(import.meta.dirname, "../src/core/types.ts"), "utf8");
 		for (const name of used) expect(server).toContain(`"${name}",`);
+	});
+
+	test("discussions.js is served, parses, and is loaded by index.html", async () => {
+		const { port, token } = await serve();
+		const get = (path: string) => http(port, "GET", path, { headers: { authorization: `Bearer ${token}` } });
+		const js = await get("/discussions.js");
+		expect(js.status).toBe(200);
+		expect(js.headers["content-type"]).toMatch(/^text\/javascript/);
+		expect(() => new Function(js.body)).not.toThrow();
+		expect((await get("/")).body).toMatch(/<script src="\/discussions\.js" defer><\/script>/);
 	});
 });

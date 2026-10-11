@@ -246,7 +246,7 @@ describe("turns", () => {
 		await stopping;
 		const v = await t!.factory.waitForDiscussion(id, open);
 		expect(v.state).toBe("OPEN");
-		expect(v.notices.at(-1)).toMatchObject({ kind: "stopped", text: "Stopped by web" });
+		expect(v.notices.at(-1)).toMatchObject({ kind: "stopped", text: "Stopped by web", turn: 2 });
 		expect(v.turnCosts).toHaveLength(2);
 		const items = (await t!.factory.getDiscussionConversation(id)).items;
 		expect(items.some((i) => i.role === "assistant" && i.text === "re: slow")).toBe(false);
@@ -260,7 +260,9 @@ describe("turns", () => {
 		t!.control.discussantFail = "invalid api key";
 		await t!.factory.say(id, "hi");
 		const v = await t!.factory.waitForDiscussion(id, open);
-		expect(v.notices.at(-1)).toMatchObject({ kind: "error", text: expect.stringContaining("invalid api key") });
+		// the notice names its turn (the UI places it after that turn): the second, after the first input
+		expect(v.notices.at(-1)).toMatchObject({ kind: "error", text: expect.stringContaining("invalid api key"), turn: v.turnCosts.at(-1)!.turn });
+		expect(v.turnCosts.at(-1)!.turn).toBe(2);
 		expect(v.state).toBe("OPEN");
 	});
 

@@ -69,7 +69,7 @@ export function createDiscussionTask(svc: DiscussionServices) {
 	}
 
 	function notice(d: DiscussionDocState, n: Omit<DiscussionNotice, "at">) {
-		d.notices.push({ at: svc.now(), kind: n.kind, text: n.text });
+		d.notices.push({ at: svc.now(), kind: n.kind, text: n.text, ...(n.turn !== undefined ? { turn: n.turn } : {}) });
 	}
 
 	/** Clear the turn and, for a `draft` turn, what the bridge expects for it (a late submit_tickets is refused). */
@@ -216,10 +216,10 @@ export function createDiscussionTask(svc: DiscussionServices) {
 		await rt.commit(async (tx) => {
 			const doc = (await tx.doc(DiscussionDoc, d.id, null as never)) as unknown as DiscussionDocState;
 			if (doc.turn?.key !== turn.key) return undefined;
-			if (doc.turn.stopRequested) notice(doc, { kind: "stopped", text: `Stopped by ${doc.turn.stoppedBy ?? doc.turn.by}` });
+			if (doc.turn.stopRequested) notice(doc, { kind: "stopped", text: `Stopped by ${doc.turn.stoppedBy ?? doc.turn.by}`, turn: turn.seq });
 			else {
 				outcome.apply?.(doc);
-				if (outcome.notice) notice(doc, outcome.notice);
+				if (outcome.notice) notice(doc, { ...outcome.notice, turn: turn.seq });
 			}
 			doc.turnCosts.push({
 				turn: turn.seq,
