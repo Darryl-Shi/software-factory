@@ -22,3 +22,6 @@
 - The chat view closes into the Chat button (the run view's shrink animation).
 - Old test assertion `data-view="discussions"` replaced by the spec's opposite (nav is Board, Settings; Chat next to
   Create); the refusal of a blank title replaced by "blank title is derived" + "blank message refused".
+- CI round 1 (F7): no logs reachable (gh unauthenticated). Most likely cause is the one seen locally: bwrap present
+  but Ubuntu 24.04 AppArmor blocks unprivileged user namespaces. CI now installs bubblewrap/socat/ripgrep and sets
+  kernel.apparmor_restrict_unprivileged_userns=0, with a bwrap probe step that fails early and clearly.
