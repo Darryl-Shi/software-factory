@@ -5,11 +5,11 @@ import { createModels } from "@earendil-works/pi-ai/models";
 import { Boat } from "../src/boat/boat.ts";
 import { LocalBoatBackend } from "../src/boat/backend.ts";
 import { Factory } from "../src/core/core.ts";
-import type { RunView } from "../src/core/types.ts";
+import type { DiscussionView, RunView } from "../src/core/types.ts";
 import { GitHub } from "../src/github/github.ts";
 import { LocalGitHubHost } from "../src/github/host.ts";
 import { Sandbox } from "../src/sandbox/sandbox.ts";
-import { call, calls, humanText, type Script, say, scriptedProvider } from "../src/testing/scripted.ts";
+import { call, calls, fail, humanText, type Script, say, scriptedProvider } from "../src/testing/scripted.ts";
 
 export type ReviewPlan = "pass" | "fail" | "invalid-then-pass" | "pass-advisory";
 
@@ -48,10 +48,43 @@ export interface Control {
 	/** Hang the helper after its first write (crash tests). */
 	helperHang?: boolean;
 	helperRuns: number;
+	/** The discussant's factory inputs (the first input, drafting instructions). */
+	discussantInputs: string[];
+	/** The human texts the discussant heard (`say`). */
+	discussantHeard: string[];
+	/** The model id of each discussant turn. */
+	discussantModels: string[];
+	/** Hang the discussant's reply to a human message (Stop, refusals during a turn). */
+	discussantHang?: boolean;
+	/** The discussant's replies to human messages fail with this provider error. */
+	discussantFail?: string;
+	/** Per draft turn, what the discussant does (drafting). */
+	draftPlan: string[];
 }
 
 export function newControl(): Control {
-	return { reviews: [], builderNoProgress: false, builderHang: false, askFirst: false, responsePlan: [], architectDouble: false, architectNoAB: false, reviewerInputs: [], builderInputs: [], architectInputs: [], reviewerModels: [], messagesSeen: [], searchResults: [], qa: [], qaInputs: [], helperRuns: 0 };
+	return {
+		reviews: [],
+		builderNoProgress: false,
+		builderHang: false,
+		askFirst: false,
+		responsePlan: [],
+		architectDouble: false,
+		architectNoAB: false,
+		reviewerInputs: [],
+		builderInputs: [],
+		architectInputs: [],
+		reviewerModels: [],
+		messagesSeen: [],
+		searchResults: [],
+		qa: [],
+		qaInputs: [],
+		helperRuns: 0,
+		discussantInputs: [],
+		discussantHeard: [],
+		discussantModels: [],
+		draftPlan: [],
+	};
 }
 
 const SPEC = (v: number) => `# Spec v${v}\n\nA tiny product.\n\n## Acceptance behaviours\n\n- running it prints hello\n`;
@@ -138,6 +171,27 @@ export function scripts(control: Control): Record<string, Script> {
 		if (ctx.side!.turn === 0 && text.startsWith("EDIT:")) return call("write", { path: "CHANGELOG.md", content: `${text.slice(5).trim()}\n` });
 		return say(ctx.side!.turn === 0 ? `re: ${text}` : "changed CHANGELOG.md");
 	};
+	// Factory inputs: the first input ("# Discussion") makes it look at the repo, then reply.
+	const discussant: Script = (ctx) => {
+		if (ctx.turn === 0) {
+			control.discussantInputs.push(ctx.input);
+			control.discussantModels.push(ctx.model);
+		}
+		if (ctx.input.startsWith("# Discussion")) return ctx.turn === 0 ? call("bash", { command: "ls -1a" }) : say("first reply");
+		return say("ok");
+	};
+	// Human turns (say): "WRITE: x" makes it try to write a file; anything else gets "re: <text>".
+	discussant.onMessage = async (ctx) => {
+		const text = humanText(ctx.side!.message);
+		if (ctx.side!.turn === 0) {
+			control.discussantHeard.push(text);
+			control.discussantModels.push(ctx.model);
+		}
+		while (control.discussantHang) await new Promise((r) => setTimeout(r, 50));
+		if (control.discussantFail) return fail(control.discussantFail);
+		if (ctx.side!.turn === 0 && text.startsWith("WRITE:")) return call("write", { path: "x.txt", content: "x" });
+		return say(`re: ${text}`);
+	};
 	return {
 		architect,
 		builder,
@@ -175,6 +229,8 @@ export function scripts(control: Control): Record<string, Script> {
 		},
 		reviewer: reviewer("reviewer"),
 		"reviewer-strict": reviewer("reviewer-strict"),
+		discussant,
+		"discussant-b": discussant,
 	};
 }
 
@@ -205,6 +261,7 @@ roles:
   helper: { model: scripted/helper }
   reviewer: { model: scripted/reviewer }
   qa: { model: scripted/qa }
+discussion: { model: { model: scripted/discussant } }
 qa: { enabled: false }
 boat: { apiKey: env:SF_TEST_BOAT_KEY }
 sandbox: { enabled: false }
@@ -250,3 +307,4 @@ policy:
 
 export const until = (f: Factory, run: string, pred: (v: RunView) => boolean, ms = 30_000) => f.waitForState(run, pred, ms);
 export const inState = (...s: string[]) => (v: RunView) => s.includes(v.state);
+export const untilDiscussion = (f: Factory, id: string, pred: (v: DiscussionView) => boolean, ms = 30_000) => f.waitForDiscussion(id, pred, ms);

@@ -4,7 +4,7 @@ import { createRequire } from "node:module";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Context } from "@earendil-works/chord";
-import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
 import type { Models } from "@earendil-works/pi-ai";
 import {
 	AssistantEntry,
@@ -16,6 +16,7 @@ import {
 	MemoryStorage,
 	type Registry,
 	type Submission,
+	type Tx,
 	UsageDoc,
 } from "@earendil-works/pi-durable";
 import { AGENT_EXTENSIONS, ROLE_TOOLS } from "../agents/tools.ts";
@@ -23,16 +24,21 @@ import { type Boat, boatProblems } from "../boat/boat.ts";
 import { type GitHub, githubProblems } from "../github/github.ts";
 import { type Sandbox, sandboxProblems } from "../sandbox/sandbox.ts";
 import { Bridge, BridgeDoc, bridgeToolsNotFor, EnvDoc } from "./bridge.ts";
+import { DiscussionDoc, type DiscussionDocState, DiscussionIndex, toDiscussionView } from "./discussion-doc.ts";
+import { createDiscussionTask } from "./discussion-task.ts";
 import { humanFindings } from "./findings.ts";
 import { DEFAULT_MESSAGE_ROLES, holdMessage, messageContent, messageTarget, parseMessage } from "./messages.ts";
 import { RunDoc, type RunDocState, RunIndex, toView } from "./run-doc.ts";
 import { RunConfigDoc } from "./run-config.ts";
 import { createRunTask } from "./run-task.ts";
-import { assertNoLegacySections, ConfigStore, coreSchema, expandHome, hashConfig, isObj, type Obj, parseDuration } from "./settings.ts";
+import { assertNoLegacySections, ConfigStore, coreSchema, expandHome, hashConfig, isObj, type Obj, parseDuration, THINKING_LEVELS } from "./settings.ts";
 import { addCost, sumUsage, type UsageSum } from "./usage.ts";
 import {
 	type AskId,
 	type AskResponse,
+	type DiscussionId,
+	type DiscussionState,
+	type DiscussionView,
 	type EffectiveSettings,
 	type FactoryCore,
 	FactoryError,
@@ -85,10 +91,15 @@ export class Factory implements FactoryCore {
 	private root!: Conversation;
 	private registry: Registry;
 	private runTask!: ReturnType<typeof createRunTask>;
-	private listeners = new Set<{ filter: { project?: string; run?: RunId }; on: (e: FactoryEvent) => void }>();
+	private discussionTask!: ReturnType<typeof createDiscussionTask>;
+	private listeners = new Set<{ filter: { project?: string; run?: RunId; discussion?: DiscussionId }; on: (e: FactoryEvent) => void }>();
+	/** Keyed by document id: run ids and discussion ids never collide. */
 	private waiters = new Map<string, Set<Waiter>>();
 	private cache = new Map<string, RunDocState>();
 	private convIndex = new Map<string, { run: string; role: Role }>();
+	private discussions = new Map<string, DiscussionDocState>();
+	/** The discussant Conversation of each discussion (keys are String(conversationId)). */
+	private discussionConvs = new Map<string, DiscussionId>();
 	private convThrottle = new Map<string, NodeJS.Timeout>();
 	private ctx: Context = BACKGROUND_CONTEXT;
 	private now: () => number;
@@ -119,7 +130,15 @@ export class Factory implements FactoryCore {
 			ciPollMs: this.opts.ciPollMs ?? 15_000,
 			log: this.log,
 		});
-		this.registry.install(defineExtension({ name: "factory.core", tasks: [this.runTask] }));
+		this.discussionTask = createDiscussionTask({
+			github: this.opts.github,
+			sandbox: this.opts.sandbox,
+			bridge: Bridge,
+			changed: (id, ms) => this.changed(id, ms),
+			now: this.now,
+			log: this.log,
+		});
+		this.registry.install(defineExtension({ name: "factory.core", tasks: [this.runTask, this.discussionTask] }));
 
 		const storage = await this.openStorage();
 		this.harness = await Harness.open(
@@ -173,9 +192,14 @@ export class Factory implements FactoryCore {
 				if (ch.type === "document" && ch.record.kind === "factory.run" && ch.record.key && ch.value) {
 					const v = ch.value as unknown as RunDocState;
 					setImmediate(() => this.onRunChange(v));
+				} else if (ch.type === "document" && ch.record.kind === "factory.discussion" && ch.record.key && ch.value) {
+					const v = ch.value as unknown as DiscussionDocState;
+					setImmediate(() => this.onDiscussionChange(v));
 				} else if (ch.type === "document" && ch.record.kind === "factory.env" && ch.conversationId && ch.value) {
 					const v = ch.value as { runId?: string; role?: Role };
-					if (v.runId && v.role) this.convIndex.set(ch.conversationId as unknown as string, { run: v.runId, role: v.role });
+					// a discussant's runId is its discussion's id
+					if (v.runId && v.role === "discussant") this.discussionConvs.set(String(ch.conversationId), v.runId);
+					else if (v.runId && v.role) this.convIndex.set(ch.conversationId as unknown as string, { run: v.runId, role: v.role });
 				} else if (ch.type === "entry") {
 					this.touchConversation(ch.value.conversationId as unknown as string);
 				} else if (ch.type === "document" && ch.record.kind === "pi.live" && ch.conversationId) {
@@ -281,6 +305,33 @@ export class Factory implements FactoryCore {
 			const d = (await this.harness.snapshot(RunDoc, id, this.ctx)) as RunDocState | undefined;
 			if (d) this.indexRun(d);
 		}
+		const didx = await this.harness.snapshot(DiscussionIndex, this.ctx);
+		for (const id of didx?.ids ?? []) {
+			const d = (await this.harness.snapshot(DiscussionDoc, id, this.ctx)) as DiscussionDocState | undefined;
+			if (d) this.indexDiscussion(d);
+		}
+	}
+
+	private indexDiscussion(d: DiscussionDocState) {
+		this.discussions.set(d.id, structuredClone(d));
+		if (d.conversationId !== undefined) this.discussionConvs.set(String(d.conversationId), d.id);
+	}
+
+	private onDiscussionChange(v: DiscussionDocState) {
+		const prev = this.discussions.get(v.id);
+		this.indexDiscussion(v);
+		const ws = this.waiters.get(v.id);
+		if (ws) for (const w of [...ws]) w();
+		const scope = { project: v.project, discussion: v.id };
+		if (prev?.state !== v.state) this.emit({ type: "discussion.state", discussion: v.id, project: v.project, from: prev?.state ?? null, to: v.state }, scope);
+		const updated = (what: "turn.started" | "turn.ended" | "drafts" | "ticket" | "notice") =>
+			this.emit({ type: "discussion.updated", discussion: v.id, project: v.project, what }, scope);
+		if (prev?.turn && prev.turn.key !== v.turn?.key) updated("turn.ended");
+		if (v.turn && v.turn.key !== prev?.turn?.key) updated("turn.started");
+		const drafts = (d?: DiscussionDocState) => JSON.stringify([d?.summary ?? null, (d?.drafts ?? []).map((x) => [x.id, x.title, x.body])]);
+		if (drafts(prev) !== drafts(v)) updated("drafts");
+		if (v.drafts.some((x) => x.runId !== undefined && prev?.drafts.find((p) => p.id === x.id)?.runId === undefined)) updated("ticket");
+		if (v.notices.length > (prev?.notices.length ?? 0)) updated("notice");
 	}
 
 	private indexRun(d: RunDocState) {
@@ -296,21 +347,22 @@ export class Factory implements FactoryCore {
 		this.indexRun(v);
 		const ws = this.waiters.get(v.id);
 		if (ws) for (const w of [...ws]) w();
+		const scope = { project: v.project, run: v.id };
 		const hist = v.history.slice(prev?.history.length ?? 0);
-		for (const h of hist) this.emit({ type: "run.state", run: v.id, project: v.project, from: h.from, to: h.to, round: h.round }, v);
+		for (const h of hist) this.emit({ type: "run.state", run: v.id, project: v.project, from: h.from, to: h.to, round: h.round }, scope);
 		const prevAsk = prev?.pendingAsk;
 		if (prevAsk && !prevAsk.response && (v.pendingAsk?.id !== prevAsk.id || v.pendingAsk.response)) {
 			const by = v.pendingAsk?.id === prevAsk.id ? v.pendingAsk.response!.by : v.closedAsk?.id === prevAsk.id ? v.closedAsk.by : "core";
-			this.emit({ type: "run.askResolved", run: v.id, ask: prevAsk.id, by }, v);
+			this.emit({ type: "run.askResolved", run: v.id, ask: prevAsk.id, by }, scope);
 		}
 		if (v.pendingAsk && !v.pendingAsk.response && v.pendingAsk.id !== prevAsk?.id)
-			this.emit({ type: "run.ask", run: v.id, ask: v.pendingAsk.id, question: v.pendingAsk.question }, v);
-		for (const n of v.notices.slice(prev?.notices.length ?? 0)) this.emit({ type: "run.notice", run: v.id, notice: n }, v);
+			this.emit({ type: "run.ask", run: v.id, ask: v.pendingAsk.id, question: v.pendingAsk.question }, scope);
+		for (const n of v.notices.slice(prev?.notices.length ?? 0)) this.emit({ type: "run.notice", run: v.id, notice: n }, scope);
 		const before = new Map((prev?.messages ?? []).map((m) => [m.id, m]));
 		for (const m of v.messages ?? []) {
 			const was = before.get(m.id);
 			if (!was || (was.conversationId === undefined && m.conversationId !== undefined))
-				this.emit({ type: "run.message", run: v.id, message: { id: m.id, to: m.to, ...(m.conversationId !== undefined ? { conversationId: m.conversationId } : {}) } }, v);
+				this.emit({ type: "run.message", run: v.id, message: { id: m.id, to: m.to, ...(m.conversationId !== undefined ? { conversationId: m.conversationId } : {}) } }, scope);
 		}
 	}
 
@@ -320,18 +372,25 @@ export class Factory implements FactoryCore {
 			id,
 			setTimeout(() => {
 				this.convThrottle.delete(id);
+				const disc = this.discussions.get(this.discussionConvs.get(String(id)) ?? "");
+				if (disc) {
+					this.emit({ type: "discussion.conversation.updated", discussion: disc.id, conversationId: id }, { project: disc.project, discussion: disc.id });
+					return;
+				}
 				const m = this.convIndex.get(id);
 				if (!m) return;
 				const run = this.cache.get(m.run);
-				if (run) this.emit({ type: "conversation.updated", run: m.run, conversationId: id, role: m.role }, run);
+				if (run) this.emit({ type: "conversation.updated", run: m.run, conversationId: id, role: m.role }, { project: run.project, run: run.id });
 			}, 150),
 		);
 	}
 
-	private emit(e: FactoryEvent, run?: { id: string; project: string }) {
+	/** `scope`: whose event it is. A `run` or `discussion` filter only matches events of that run or discussion. */
+	private emit(e: FactoryEvent, scope?: { project: string; run?: string; discussion?: string }) {
 		for (const l of [...this.listeners]) {
-			if (l.filter.run && (!run || l.filter.run !== run.id)) continue;
-			if (l.filter.project && (!run || l.filter.project !== run.project)) continue;
+			if (l.filter.run && l.filter.run !== scope?.run) continue;
+			if (l.filter.discussion && l.filter.discussion !== scope?.discussion) continue;
+			if (l.filter.project && l.filter.project !== scope?.project) continue;
 			try {
 				l.on(e);
 			} catch (err) {
@@ -354,7 +413,7 @@ export class Factory implements FactoryCore {
 		});
 	}
 
-	subscribe(filter: { project?: string; run?: RunId }, on: (e: FactoryEvent) => void): Unsubscribe {
+	subscribe(filter: { project?: string; run?: RunId; discussion?: DiscussionId }, on: (e: FactoryEvent) => void): Unsubscribe {
 		const l = { filter, on };
 		this.listeners.add(l);
 		return () => this.listeners.delete(l);
@@ -450,6 +509,11 @@ export class Factory implements FactoryCore {
 			const env = await this.harness.snapshot(EnvDoc, conversationId as never, this.ctx);
 			if (env?.runId !== run) throw new FactoryError("not_found", `conversation ${conversationId} does not belong to run ${run}`);
 		}
+		return this.transcript(conversationId, this.convIndex.get(conversationId)?.role);
+	}
+
+	/** A Conversation's transcript as interfaces show it: factory input, human messages, replies, tool calls and results. */
+	private async transcript(conversationId: string, role?: Role): Promise<TranscriptView> {
 		const conv = await this.harness.conversation(conversationId as never, this.ctx);
 		if (!conv) throw new FactoryError("not_found", `conversation ${conversationId} does not exist`);
 		const items: TranscriptItem[] = [];
@@ -506,7 +570,6 @@ export class Factory implements FactoryCore {
 			if (typeof child === "string" || typeof child === "number") helpers.add(child as unknown as string);
 		}
 		const busy = !!live && (live.generation !== undefined || Object.keys(live.tools ?? {}).length > 0);
-		const role = this.convIndex.get(conversationId)?.role;
 		return { conversationId, ...(role ? { role } : {}), items, helpers: [...helpers], busy, queued };
 	}
 
@@ -675,29 +738,192 @@ export class Factory implements FactoryCore {
 		return { mime: "image/png", bytes: readFileSync(file) };
 	}
 
+	// ------------------------------------------------------------------ discussions (a pre-ticket chat per project)
+	async startDiscussion(project: string, d: { title: string; message: string; model?: { model: string; thinking: string } }): Promise<DiscussionId> {
+		const by = this.by;
+		const p = this.config.project(project);
+		const title = typeof d?.title === "string" ? d.title.trim() : "";
+		const message = typeof d?.message === "string" ? d.message.trim() : "";
+		if (!title) throw new FactoryError("invalid", "a discussion needs a title");
+		if (!message) throw new FactoryError("invalid", "a discussion needs a first message");
+		const eff = this.config.effective({ project });
+		const def = eff.discussion?.model ?? {};
+		const model = d.model ? { model: String(d.model.model ?? ""), thinking: String(d.model.thinking ?? "") } : { model: String(def.model ?? ""), thinking: String(def.thinking ?? "medium") };
+		const problem = this.modelProblem("model", model.model) ?? (THINKING_LEVELS.includes(model.thinking) ? undefined : `thinking: expected one of ${THINKING_LEVELS.join(", ")}`);
+		if (problem) throw new FactoryError("invalid", problem);
+		const now = this.now();
+		let id!: DiscussionId;
+		await this.root.commit(async (tx) => {
+			const idx = await tx.doc(DiscussionIndex);
+			id = `disc-${idx.ids.length + 1}`;
+			idx.ids.push(id);
+			const seed: DiscussionDocState = {
+				id,
+				project,
+				repo: p.repo,
+				title,
+				state: "PREPARING",
+				model,
+				pinned: { config: eff },
+				turn: null,
+				firstMessage: { text: message, by },
+				counters: { turnSeq: 0, draftSeq: 0, batch: 0 },
+				drafts: [],
+				notices: [],
+				turnCosts: [],
+				createdAt: now,
+				updatedAt: now,
+			};
+			const doc = (await tx.doc(DiscussionDoc, id, seed as never)) as unknown as DiscussionDocState;
+			doc.taskId = await this.newDiscussionTask(tx, id);
+		}, this.ctx);
+		this.harness.resume();
+		return id;
+	}
+
+	/** A discussion Task that starts at PREPARING, created in `tx` (start, reopen, retry). */
+	private async newDiscussionTask(tx: Tx, id: DiscussionId): Promise<string> {
+		const taskId = await tx.createTask(this.discussionTask, { discussionId: id, start: "PREPARING" as const }, { ownership: { kind: "conversation" }, background: true });
+		return taskId as unknown as string;
+	}
+
+	private async discussionDoc(id: DiscussionId): Promise<DiscussionDocState> {
+		const d = typeof id === "string" ? ((await this.harness.snapshot(DiscussionDoc, id, this.ctx)) as DiscussionDocState | undefined) : undefined;
+		if (!d) throw new FactoryError("not_found", `discussion ${id} does not exist`);
+		return d;
+	}
+
+	private async discussionView(d: DiscussionDocState): Promise<DiscussionView> {
+		const usage = d.conversationId !== undefined ? sumUsage((await this.harness.snapshot(UsageDoc, d.conversationId as never, this.ctx)) as any) : undefined;
+		const runs: DiscussionView["runs"] = [];
+		for (const x of d.drafts) {
+			if (x.runId === undefined) continue;
+			const state = this.cache.get(x.runId)?.state ?? ((await this.harness.snapshot(RunDoc, x.runId, this.ctx)) as RunDocState | undefined)?.state;
+			if (state) runs.push({ id: x.runId, state });
+		}
+		return toDiscussionView(d, { usd: usage?.usd ?? 0, totalTokens: usage?.totalTokens ?? 0 }, runs);
+	}
+
+	async getDiscussion(id: DiscussionId): Promise<DiscussionView> {
+		return this.discussionView(await this.discussionDoc(id));
+	}
+
+	async listDiscussions(filter?: { project?: string; states?: DiscussionState[] }): Promise<DiscussionView[]> {
+		const idx = await this.harness.snapshot(DiscussionIndex, this.ctx);
+		const out: DiscussionView[] = [];
+		for (const id of idx?.ids ?? []) {
+			const d = await this.discussionDoc(id);
+			if (filter?.project && d.project !== filter.project) continue;
+			if (filter?.states && !filter.states.includes(d.state)) continue;
+			out.push(await this.discussionView(d));
+		}
+		return out;
+	}
+
+	async getDiscussionConversation(id: DiscussionId): Promise<TranscriptView> {
+		const d = await this.discussionDoc(id);
+		if (d.conversationId === undefined) throw new FactoryError("not_found", `discussion ${id} has no conversation yet (${d.state})`);
+		return this.transcript(d.conversationId, "discussant");
+	}
+
+	/** Change a discussion in one commit; `change` checks the state and throws a FactoryError to refuse. */
+	private async changeDiscussion<T>(id: DiscussionId, change: (d: DiscussionDocState) => T): Promise<T> {
+		await this.discussionDoc(id); // not_found
+		let out!: T;
+		await this.root.commit(async (tx) => {
+			const d = (await tx.doc(DiscussionDoc, id, null as never)) as unknown as DiscussionDocState;
+			out = change(d);
+			d.updatedAt = this.now();
+		}, this.ctx);
+		return out;
+	}
+
+	async say(id: DiscussionId, text: string): Promise<void> {
+		const by = this.by;
+		if (typeof text !== "string" || !text.trim()) throw new FactoryError("invalid", "say needs text");
+		await this.changeDiscussion(id, (d) => {
+			if (d.state !== "OPEN") throw new FactoryError("conflict", `discussion ${id} is ${d.state}; only an OPEN discussion takes messages`);
+			if (d.turn) throw new FactoryError("conflict", `discussion ${id} has a turn running; wait for the reply or stop it`);
+			d.counters.turnSeq += 1;
+			const seq = d.counters.turnSeq;
+			d.turn = { kind: "say", key: `${id}:turn${seq}`, seq, text: text.trim(), by, msgId: `${id}-msg${seq}`, startedAt: this.now() };
+		});
+	}
+
+	async stopTurn(id: DiscussionId): Promise<void> {
+		const by = this.by;
+		const conversationId = await this.changeDiscussion(id, (d) => {
+			if (!d.turn) throw new FactoryError("conflict", `discussion ${id} has no turn running`);
+			d.turn.stopRequested = true;
+			d.turn.stoppedBy = by;
+			return d.conversationId;
+		});
+		// The Task clears the turn and adds the notice once the Conversation's work has stopped.
+		if (conversationId === undefined) return;
+		const conv = await this.harness.conversation(conversationId as never, this.ctx);
+		await conv?.abort(this.ctx);
+	}
+
+	async closeDiscussion(id: DiscussionId): Promise<void> {
+		const taskId = await this.changeDiscussion(id, (d) => {
+			if (d.state !== "OPEN") throw new FactoryError("conflict", `discussion ${id} is ${d.state}; only an OPEN discussion can be closed`);
+			if (d.turn) throw new FactoryError("conflict", `discussion ${id} has a turn running; stop it before closing`);
+			d.state = "CLOSED";
+			return d.taskId;
+		});
+		// The Task ends as soon as it sees the state; wait for that (briefly) so that a reopen can follow at once.
+		if (taskId !== undefined) await this.harness.waitForTask(taskId as never, withAbortSignal(AbortSignal.timeout(10_000), this.ctx)).catch(() => undefined);
+	}
+
+	async reopenDiscussion(id: DiscussionId): Promise<void> {
+		await this.restartDiscussion(id, "CLOSED", "reopened");
+	}
+
+	async retryDiscussion(id: DiscussionId): Promise<void> {
+		await this.restartDiscussion(id, "FAILED", "retried");
+	}
+
+	/** Reopen or retry: back to PREPARING with a new Task (the Conversation is kept), like `retryRun`. */
+	private async restartDiscussion(id: DiscussionId, from: "CLOSED" | "FAILED", verb: string): Promise<void> {
+		const d = await this.discussionDoc(id);
+		if (d.state !== from) throw new FactoryError("conflict", `discussion ${id} is ${d.state}; only a ${from} discussion can be ${verb}`);
+		const old = d.taskId !== undefined ? await this.harness.getTask(d.taskId as never, this.ctx) : undefined;
+		if (old && old.state.status !== "terminal") throw new FactoryError("conflict", `discussion ${id} is still finishing; try again in a moment`);
+		await this.root.commit(async (tx) => {
+			const doc = (await tx.doc(DiscussionDoc, id, null as never)) as unknown as DiscussionDocState;
+			if (doc.state !== from) throw new FactoryError("conflict", `discussion ${id} is ${doc.state}; only a ${from} discussion can be ${verb}`);
+			doc.state = "PREPARING";
+			delete doc.error;
+			doc.updatedAt = this.now();
+			doc.taskId = await this.newDiscussionTask(tx, id);
+		}, this.ctx);
+		this.harness.resume();
+	}
+
 	// ------------------------------------------------------------------ settings
 	settingsSchema(): Record<string, SettingField> {
 		return coreSchema();
 	}
 
+	private modelProblem(path: string, model: unknown): string | undefined {
+		const [provider, ...rest] = String(model ?? "").split("/");
+		if (!provider || rest.length === 0) return `${path}: expected provider/modelId`;
+		if (!this.opts.models.getModel(provider, rest.join("/"))) return `${path}: ${model} is not a model createModels() knows`;
+		return undefined;
+	}
+
 	private coreRules(eff: Obj, _scope: Scope): string[] {
 		const problems: string[] = [];
-		const modelProblem = (path: string, model: unknown): string | undefined => {
-			const [provider, ...rest] = String(model ?? "").split("/");
-			if (!provider || rest.length === 0) return `${path}: expected provider/modelId`;
-			if (!this.opts.models.getModel(provider, rest.join("/"))) return `${path}: ${model} is not a model createModels() knows`;
-			return undefined;
-		};
 		for (const role of ["architect", "builder", "helper", "reviewer", "qa"] as Role[]) {
 			const r = eff.roles?.[role];
 			if (!isObj(r) || r.model === undefined) continue;
-			const p = modelProblem(`roles.${role}.model`, r.model);
+			const p = this.modelProblem(`roles.${role}.model`, r.model);
 			if (p) problems.push(p);
 			else if (role === "qa" && !this.acceptsImages(String(r.model))) problems.push(`roles.qa.model: ${r.model} does not accept image input (the QA agent works from screenshots)`);
 		}
 		const dm = eff.discussion?.model?.model;
 		if (dm !== undefined) {
-			const p = modelProblem("discussion.model.model", dm);
+			const p = this.modelProblem("discussion.model.model", dm);
 			if (p) problems.push(p);
 		}
 		if (isObj(eff.boat)) problems.push(...boatProblems(eff.boat).map((p) => `boat.${p}`));
@@ -740,6 +966,16 @@ export class Factory implements FactoryCore {
 			if (pred(v)) return v;
 			if (Date.now() > deadline) throw new Error(`timeout waiting on run ${run}; state ${v.state}${v.failure ? ` (${v.failure.reason})` : ""}`);
 			await this.changed(run, 200);
+		}
+	}
+
+	async waitForDiscussion(id: DiscussionId, pred: (v: DiscussionView) => boolean, timeoutMs = 30_000): Promise<DiscussionView> {
+		const deadline = Date.now() + timeoutMs;
+		for (;;) {
+			const v = await this.getDiscussion(id);
+			if (pred(v)) return v;
+			if (Date.now() > deadline) throw new Error(`timeout waiting on discussion ${id}; state ${v.state}${v.error ? ` (${v.error})` : ""}${v.turn ? `; a ${v.turn.kind} turn is running` : ""}`);
+			await this.changed(id, 200);
 		}
 	}
 }

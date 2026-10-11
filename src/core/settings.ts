@@ -42,7 +42,8 @@ const identity: SettingField = {
 	},
 };
 
-const thinking: SettingField = { type: "enum", values: ["off", "low", "medium", "high"], description: "Thinking level" };
+export const THINKING_LEVELS = ["off", "low", "medium", "high"];
+const thinking: SettingField = { type: "enum", values: THINKING_LEVELS, description: "Thinking level" };
 function roleField(model: string | undefined, level: string | undefined, description: string, inheritsFrom: "builder" | "architect" = "builder"): SettingField {
 	return {
 		type: "object",

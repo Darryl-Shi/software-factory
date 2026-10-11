@@ -218,7 +218,8 @@ describe("settings layering", () => {
 		const f = t.factory;
 		const eff = (s: { global: true } | { project: string }) => f.config.effective(s);
 		await f.createProject("p", "me/p");
-		// global: roles.architect = { model: scripted/architect, thinking: high }, no discussion section
+		// global: roles.architect = { model: scripted/architect, thinking: high }; the test config's discussion model removed
+		await f.unsetSetting({ global: true }, "discussion.model.model");
 		expect(eff({ global: true }).discussion.model).toEqual({ model: "scripted/architect", thinking: "high" });
 		await f.setSetting({ project: "p" }, "discussion.model.model", "scripted/builder");
 		expect(eff({ project: "p" }).discussion.model).toEqual({ model: "scripted/builder", thinking: "high" });

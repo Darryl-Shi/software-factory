@@ -64,7 +64,8 @@ export interface CoreServices {
 }
 
 const MAX_NUDGES = 2;
-const WRITE_TOOLS: ToolRegistration[] = [createWriteTool() as ToolRegistration, createEditTool() as ToolRegistration];
+/** Removed from every role but the builder (and its helpers). */
+export const WRITE_TOOLS: ToolRegistration[] = [createWriteTool() as ToolRegistration, createEditTool() as ToolRegistration];
 
 class Cancelled extends Error {}
 

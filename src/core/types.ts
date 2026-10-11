@@ -342,7 +342,10 @@ export type FactoryEvent =
 	| { type: "run.notice"; run: RunId; notice: Notice }
 	| { type: "conversation.updated"; run: RunId; conversationId: string; role: Role }
 	| { type: "run.message"; run: RunId; message: { id: string; to: Role; conversationId?: string } }
-	| { type: "settings.changed"; scope: Scope; path: string };
+	| { type: "settings.changed"; scope: Scope; path: string }
+	| { type: "discussion.state"; discussion: DiscussionId; project: string; from: DiscussionState | null; to: DiscussionState }
+	| { type: "discussion.updated"; discussion: DiscussionId; project: string; what: "turn.started" | "turn.ended" | "drafts" | "ticket" | "notice" }
+	| { type: "discussion.conversation.updated"; discussion: DiscussionId; conversationId: string };
 
 export interface FactoryCore {
 	createProject(name: string, repo: RepoRef): Promise<Project>;
@@ -367,7 +370,21 @@ export interface FactoryCore {
 	getSettings(scope: Scope): Promise<EffectiveSettings>;
 	setSetting(scope: Scope, path: string, value: unknown): Promise<void>;
 	unsetSetting(scope: Scope, path: string): Promise<void>;
-	subscribe(filter: { project?: string; run?: RunId }, on: (e: FactoryEvent) => void): Unsubscribe;
+	/** Start a discussion on a project with a first message; `model` defaults to the project's `discussion.model`. */
+	startDiscussion(project: string, d: { title: string; message: string; model?: { model: string; thinking: string } }): Promise<DiscussionId>;
+	getDiscussion(id: DiscussionId): Promise<DiscussionView>;
+	listDiscussions(filter?: { project?: string; states?: DiscussionState[] }): Promise<DiscussionView[]>;
+	/** The discussion's transcript (its one Conversation, role `discussant`). */
+	getDiscussionConversation(id: DiscussionId): Promise<TranscriptView>;
+	/** Send the human's text to the discussant: starts a turn. Refused while a turn runs or when not OPEN. */
+	say(id: DiscussionId, text: string): Promise<void>;
+	/** Abort the turn that is running. */
+	stopTurn(id: DiscussionId): Promise<void>;
+	closeDiscussion(id: DiscussionId): Promise<void>;
+	reopenDiscussion(id: DiscussionId): Promise<void>;
+	retryDiscussion(id: DiscussionId): Promise<void>;
+	/** A `project` filter matches run and discussion events; `run` and `discussion` match only that run's or discussion's. */
+	subscribe(filter: { project?: string; run?: RunId; discussion?: DiscussionId }, on: (e: FactoryEvent) => void): Unsubscribe;
 }
 
 /** The operations an interface may call over its transport (everything but `subscribe`). */
@@ -392,6 +409,15 @@ export const CORE_OPS = [
 	"getSettings",
 	"setSetting",
 	"unsetSetting",
+	"startDiscussion",
+	"getDiscussion",
+	"listDiscussions",
+	"getDiscussionConversation",
+	"say",
+	"stopTurn",
+	"closeDiscussion",
+	"reopenDiscussion",
+	"retryDiscussion",
 ] as const satisfies readonly (keyof FactoryCore)[];
 
 export class FactoryError extends Error {
