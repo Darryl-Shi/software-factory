@@ -25,7 +25,7 @@ import { type GitHub, githubProblems } from "../github/github.ts";
 import { type Sandbox, sandboxProblems } from "../sandbox/sandbox.ts";
 import { Bridge, BridgeDoc, bridgeToolsNotFor, EnvDoc } from "./bridge.ts";
 import { DiscussionDoc, type DiscussionDocState, DiscussionIndex, toDiscussionView } from "./discussion-doc.ts";
-import { createDiscussionTask, draftInstructions } from "./discussion-task.ts";
+import { createDiscussionTask, draftInstructions, takeCheckoutNote } from "./discussion-task.ts";
 import { humanFindings } from "./findings.ts";
 import { DEFAULT_MESSAGE_ROLES, holdMessage, messageContent, messageTarget, parseMessage } from "./messages.ts";
 import { RunDoc, type RunDocState, RunIndex, toView } from "./run-doc.ts";
@@ -40,6 +40,7 @@ import {
 	type DiscussionLink,
 	type DiscussionState,
 	type DiscussionView,
+	DISCUSSION_STATES,
 	type EffectiveSettings,
 	type FactoryCore,
 	FactoryError,
@@ -51,6 +52,7 @@ import {
 	type Request,
 	type Role,
 	type RunId,
+	RUN_STATES,
 	type RunState,
 	type RunView,
 	type Scope,
@@ -60,6 +62,13 @@ import {
 	type TranscriptView,
 	type Unsubscribe,
 } from "./types.ts";
+
+/** A `states` filter from an interface: an array of known states (else `invalid`). */
+function checkStates(states: unknown, known: readonly string[]): void {
+	if (states === undefined) return;
+	if (!Array.isArray(states) || !states.every((s) => typeof s === "string" && known.includes(s)))
+		throw new FactoryError("invalid", `states must be an array of: ${known.join(", ")}`);
+}
 
 const require = createRequire(import.meta.url);
 export const PI_DURABLE_VERSION: string = require("@earendil-works/pi-durable/package.json").version;
@@ -325,12 +334,13 @@ export class Factory implements FactoryCore {
 		if (ws) for (const w of [...ws]) w();
 		const scope = { project: v.project, discussion: v.id };
 		if (prev?.state !== v.state) this.emit({ type: "discussion.state", discussion: v.id, project: v.project, from: prev?.state ?? null, to: v.state }, scope);
-		const updated = (what: "turn.started" | "turn.ended" | "drafts" | "ticket" | "notice") =>
-			this.emit({ type: "discussion.updated", discussion: v.id, project: v.project, what }, scope);
+		const updated = (what: "turn.started" | "turn.ended" | "drafts" | "ticket" | "notice", submission?: boolean) =>
+			this.emit({ type: "discussion.updated", discussion: v.id, project: v.project, what, ...(submission ? { submission: true as const } : {}) }, scope);
 		if (prev?.turn && prev.turn.key !== v.turn?.key) updated("turn.ended");
 		if (v.turn && v.turn.key !== prev?.turn?.key) updated("turn.started");
 		const drafts = (d?: DiscussionDocState) => JSON.stringify([d?.summary ?? null, (d?.drafts ?? []).map((x) => [x.id, x.title, x.body])]);
-		if (drafts(prev) !== drafts(v)) updated("drafts");
+		// `submission`: a new submit_tickets was applied (not a human's edit or delete).
+		if (drafts(prev) !== drafts(v)) updated("drafts", v.counters.batch > (prev?.counters.batch ?? 0));
 		if (v.drafts.some((x) => x.runId !== undefined && prev?.drafts.find((p) => p.id === x.id)?.runId === undefined)) updated("ticket");
 		if (v.notices.length > (prev?.notices.length ?? 0)) updated("notice");
 	}
@@ -498,6 +508,7 @@ export class Factory implements FactoryCore {
 	}
 
 	async listRuns(filter?: { project?: string; states?: RunState[] }): Promise<RunView[]> {
+		checkStates(filter?.states, RUN_STATES);
 		const idx = await this.harness.snapshot(RunIndex, this.ctx);
 		const out: RunView[] = [];
 		for (const id of idx?.runs ?? []) {
@@ -820,6 +831,7 @@ export class Factory implements FactoryCore {
 	}
 
 	async listDiscussions(filter?: { project?: string; states?: DiscussionState[] }): Promise<DiscussionView[]> {
+		checkStates(filter?.states, DISCUSSION_STATES);
 		const idx = await this.harness.snapshot(DiscussionIndex, this.ctx);
 		const out: DiscussionView[] = [];
 		for (const id of idx?.ids ?? []) {
@@ -857,7 +869,8 @@ export class Factory implements FactoryCore {
 			if (d.turn) throw new FactoryError("conflict", `discussion ${id} has a turn running; wait for the reply or stop it`);
 			d.counters.turnSeq += 1;
 			const seq = d.counters.turnSeq;
-			d.turn = { kind: "say", key: `${id}:turn${seq}`, seq, text: text.trim(), by, msgId: `${id}-msg${seq}`, startedAt: this.now() };
+			const note = takeCheckoutNote(d);
+			d.turn = { kind: "say", key: `${id}:turn${seq}`, seq, text: text.trim(), by, msgId: `${id}-msg${seq}`, startedAt: this.now(), ...(note ? { note } : {}) };
 		});
 	}
 
@@ -887,7 +900,14 @@ export class Factory implements FactoryCore {
 			d.counters.turnSeq += 1;
 			const seq = d.counters.turnSeq;
 			const key = `${id}:turn${seq}`;
-			d.turn = { kind: "draft", key, seq, text: draftInstructions(instructions), by, startedAt: this.now() };
+			// The drafts so far (spec §2.2): converted ones must not come back, the others are built on.
+			const context = {
+				tickets: d.drafts.filter((x) => x.runId !== undefined).map((x) => ({ title: x.title, runId: x.runId! })),
+				drafts: d.drafts.filter((x) => x.runId === undefined).map((x) => ({ title: x.title, body: x.body, edited: x.edited })),
+			};
+			const note = takeCheckoutNote(d);
+			const text = draftInstructions(instructions, context);
+			d.turn = { kind: "draft", key, seq, text: note ? `${text}\n\n# Factory note\n${note}` : text, by, startedAt: this.now() };
 			// The bridge takes submit_tickets for this turn only; the Task clears `expect` when the turn ends.
 			const b = await tx.doc(BridgeDoc, d.conversationId as never);
 			b.expect = { key, tools: ["submit_tickets"] };
@@ -918,9 +938,8 @@ export class Factory implements FactoryCore {
 	async createTicket(id: DiscussionId, draft: string): Promise<RunId> {
 		const by = this.by; // before any await (see startRun)
 		// One commit: the run (index entry, seed, Task) and the draft's runId, checked inside it, so a second call is refused.
+		// Any state: a run never depends on the discussion (only a running `draft` turn locks the drafts).
 		const runId = await this.changeDiscussion(id, async (d, tx) => {
-			if (d.state !== "OPEN" && d.state !== "CLOSED")
-				throw new FactoryError("conflict", `discussion ${id} is ${d.state}; only an OPEN or CLOSED discussion's drafts can become tickets`);
 			const x = this.editableDraft(d, draft);
 			const discussion: DiscussionLink = {
 				id,

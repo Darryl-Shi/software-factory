@@ -143,6 +143,14 @@ describe("operations and events", () => {
 		const invalid = await op(port, token, "message", ["nope", "   "]);
 		expect(invalid.status).toBe(400);
 		expect(JSON.parse(invalid.body).code).toBe("invalid");
+		// a `states` filter must be an array of known states (a string used to substring-match, a number threw a 500)
+		for (const name of ["listRuns", "listDiscussions"])
+			for (const states of ["OPEN", 5, ["NOPE"]]) {
+				const r = await op(port, token, name, [{ states }]);
+				expect(r.status).toBe(400);
+				expect(JSON.parse(r.body).code).toBe("invalid");
+			}
+		expect(JSON.parse((await op(port, token, "listRuns", [{ states: ["DELIVERED"] }])).body).result).toEqual([]);
 		expect((await op(port, token, "createProject", ["p", "other/p"])).status).toBe(409);
 		expect((await op(port, token, "subscribe")).status).toBe(404);
 		expect((await op(port, token, "harnessForTests")).status).toBe(404);

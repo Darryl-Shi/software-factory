@@ -15,6 +15,24 @@ const OK_CONCLUSIONS = ["success", "neutral", "skipped"];
 const identityOf = (rc: RunCtx): Identity => (rc.config.github?.identity ?? {}) as Identity;
 const workdirOf = (rc: RunCtx): string => expandHome(rc.config.workdir ?? "~/factory/work");
 const cloneOf = (workdir: string, ref: RepoRef): string => join(workdir, "repos", ref.replace("/", "__"));
+const gitReason = (r: { stderr: string; stdout: string }) => r.stderr.trim() || r.stdout.trim() || "no output from git";
+
+/**
+ * Remove a checkout and its manifest: the git worktree (from `ws.repo`'s clone, if that clone exists), the directory
+ * and the local branch. Every step is best effort; a branch that can't be deleted is reset by the next `open` of a
+ * discussion (`worktree add -B`), so it is never reattached as it was.
+ */
+async function discard(ws: Workspace, workdir: string, manifest: string): Promise<void> {
+	const clone = cloneOf(workdir, ws.repo);
+	const hasClone = existsSync(join(clone, ".git"));
+	if (hasClone) await git(clone, ["worktree", "remove", "--force", ws.path], { allowFail: true });
+	rmSync(ws.path, { recursive: true, force: true });
+	if (hasClone) {
+		await git(clone, ["worktree", "prune"], { allowFail: true });
+		await git(clone, ["branch", "-D", ws.branch], { allowFail: true });
+	}
+	rmSync(manifest, { force: true });
+}
 
 /** Rules on the `github` settings section; problems are relative to the section. */
 export function githubProblems(github: Obj): string[] {
@@ -69,7 +87,9 @@ export class GitHub {
 		const m = join(workdir, area, `${rc.runId}.json`);
 		if (existsSync(m)) {
 			const ws = JSON.parse(readFileSync(m, "utf8")) as Workspace;
-			if (existsSync(ws.path)) return ws;
+			if (ws.repo === ref && existsSync(ws.path)) return ws;
+			// A manifest for another repo is stale (the id was reused, e.g. after the factory's storage was reset): start over.
+			if (ws.repo !== ref) await discard(ws, workdir, m);
 		}
 		const id = identityOf(rc);
 		const clone = cloneOf(workdir, ref);
@@ -101,8 +121,10 @@ export class GitHub {
 		if (!existsSync(worktree)) {
 			mkdirSync(dirname(worktree), { recursive: true });
 			await git(clone, ["worktree", "prune"]);
-			const has = await git(clone, ["rev-parse", "--verify", "-q", `refs/heads/${branch}`], { allowFail: true });
-			await git(clone, has.code === 0 ? ["worktree", "add", "-q", worktree, branch] : ["worktree", "add", "-q", "-b", branch, worktree, base]);
+			// A run's branch holds its work and is reattached; a discussion's checkout is read-only, so its branch is
+			// (re)started at the base.
+			const has = area === "runs" && (await git(clone, ["rev-parse", "--verify", "-q", `refs/heads/${branch}`], { allowFail: true })).code === 0;
+			await git(clone, has ? ["worktree", "add", "-q", worktree, branch] : ["worktree", "add", "-q", area === "runs" ? "-b" : "-B", branch, worktree, base]);
 		}
 		const ws: Workspace = { repo: ref, path: worktree, baseRef: base, branch, newRepo: !exists };
 		writeFileSync(m, JSON.stringify(ws, null, 2));
@@ -110,29 +132,33 @@ export class GitHub {
 	}
 
 	/**
-	 * Bring a discussion's checkout up to date with the repo (spec discussion-flow §1.4): fast-forward an existing
-	 * repo's worktree to `origin/<default>`; for a new-repo workspace whose repo now exists, replace the local
-	 * workspace with a checkout of the repo.
+	 * Bring a discussion's checkout up to date with the repo (spec discussion-flow §1.4). The checkout is read-only, so
+	 * it is resynced, not merged: an existing repo's worktree is reset to `origin/<default>` (a force-pushed default
+	 * branch or stray local changes don't matter) and cleaned. A missing checkout or manifest, a missing clone, or a
+	 * worktree git can't reset is made again with `open`; so is a new-repo workspace whose repo now exists (the empty
+	 * local workspace becomes a checkout of the repo). Fails only when git does (e.g. the remote is gone).
 	 */
 	async refresh(ws: Workspace, rc: RunCtx): Promise<Workspace> {
 		const host = this.host;
 		const id = identityOf(rc);
 		const workdir = workdirOf(rc);
 		const clone = cloneOf(workdir, ws.repo);
-		const manifest = `${ws.path}.json`;
-		if (ws.newRepo) {
-			if (!(await host.repoExists(ws.repo, id))) return ws;
-			await git(clone, ["worktree", "remove", "--force", ws.path], { allowFail: true });
-			rmSync(ws.path, { recursive: true, force: true });
-			await git(clone, ["worktree", "prune"]);
-			await git(clone, ["branch", "-D", ws.branch], { allowFail: true });
-			rmSync(manifest, { force: true });
+		const manifest = join(workdir, "discussions", `${rc.runId}.json`);
+		const again = async () => {
+			await discard(ws, workdir, manifest);
 			return this.open(ws.repo, rc, "discussions");
+		};
+		if (ws.newRepo) {
+			if (await host.repoExists(ws.repo, id)) return again();
+			return existsSync(join(ws.path, ".git")) && existsSync(manifest) ? ws : again();
 		}
+		if (![join(ws.path, ".git"), manifest, join(clone, ".git")].every((p) => existsSync(p))) return again();
 		const def = await host.defaultBranch(ws.repo, id);
-		await git(clone, ["fetch", "-q", "origin", "--prune"], await host.gitAuth(id));
-		const ff = await git(ws.path, ["merge", "-q", "--ff-only", `origin/${def}`], { allowFail: true });
-		if (ff.code !== 0) throw new Error(`could not fast-forward the discussion's checkout to origin/${def}: ${ff.stderr.trim() || ff.stdout.trim()}`);
+		const fetched = await git(clone, ["fetch", "-q", "origin", "--prune"], { ...(await host.gitAuth(id)), allowFail: true });
+		if (fetched.code !== 0) throw new Error(`could not fetch ${ws.repo} to update the discussion's checkout: ${gitReason(fetched)}`);
+		const reset = await git(ws.path, ["checkout", "-q", "-f", "-B", ws.branch, `origin/${def}`], { allowFail: true });
+		if (reset.code !== 0) return again();
+		await git(ws.path, ["clean", "-q", "-f", "-d"]);
 		const next: Workspace = { ...ws, baseRef: await gitOut(ws.path, ["rev-parse", "HEAD"]) };
 		writeFileSync(manifest, JSON.stringify(next, null, 2));
 		return next;

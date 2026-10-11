@@ -438,7 +438,7 @@ function onDiscussionEvent(e) {
   refreshDisc(e.discussion);
   if (mine) { refreshDiscConv(e.discussion); return; }
   const title = ui.discs.get(e.discussion)?.title ?? e.discussion;
-  if (e.type === "discussion.updated" && e.what === "drafts") toast(`Draft tickets are ready in "${title}"`);
+  if (e.type === "discussion.updated" && e.what === "drafts" && e.submission) toast(`Draft tickets are ready in "${title}"`);
   if (e.type === "discussion.state" && e.to === "FAILED") toast(`The discussion "${title}" failed`, "error");
 }
 // Runs changed (app.js's flush): their state chips in the list and in the open discussion's drafts.

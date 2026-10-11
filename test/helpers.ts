@@ -52,6 +52,8 @@ export interface Control {
 	discussantInputs: string[];
 	/** The human texts the discussant heard (`say`). */
 	discussantHeard: string[];
+	/** The human messages the discussant got, as sent (header and any factory note included). */
+	discussantMessages: string[];
 	/** The model id of each discussant turn. */
 	discussantModels: string[];
 	/** Hang the discussant's reply to a human message, and its first step on drafting instructions (Stop, refusals during a turn). */
@@ -86,6 +88,7 @@ export function newControl(): Control {
 		helperRuns: 0,
 		discussantInputs: [],
 		discussantHeard: [],
+		discussantMessages: [],
 		discussantModels: [],
 		draftPlan: [],
 	};
@@ -213,6 +216,7 @@ export function scripts(control: Control): Record<string, Script> {
 		const text = humanText(ctx.side!.message);
 		if (ctx.side!.turn === 0) {
 			control.discussantHeard.push(text);
+			control.discussantMessages.push(ctx.side!.message);
 			control.discussantModels.push(ctx.model);
 		}
 		while (control.discussantHang) await new Promise((r) => setTimeout(r, 50));

@@ -15,6 +15,8 @@ export type DiscussionTurn = {
 	/** Set on a human's `say`: the input goes in as a human message (`humanContent`); unset on the core's first input. */
 	msgId?: string;
 	startedAt: number;
+	/** A `say` turn's factory note (the checkout changed since the last turn), sent in the message's header. */
+	note?: string;
 	stopRequested?: boolean;
 	/** The interface that asked to stop the turn. */
 	stoppedBy?: string;
@@ -36,6 +38,11 @@ export type DiscussionDocState = {
 	taskId?: string;
 	/** The read-only checkout (spec §1.4). */
 	workspace?: Workspace;
+	/**
+	 * Set when a reopen or retry changed the checkout (another head, or the repo now exists) and no turn has told the
+	 * model yet; the next `say` or `draft` turn takes it as a factory note (`takeCheckoutNote`).
+	 */
+	checkoutChanged?: { from: string; to: string; repoCreated: boolean };
 	conversationId?: string;
 	turn: DiscussionTurn | null;
 	/** The human's first message (with `startDiscussion`); the first turn submits it with the project context. */

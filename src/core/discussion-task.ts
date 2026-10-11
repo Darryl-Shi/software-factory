@@ -32,8 +32,15 @@ class Cancelled extends Error {}
 /** Reminders after the model stops without calling submit_tickets (as `runAgent`'s). */
 const MAX_NUDGES = 2;
 
-/** What a `draft` turn submits (spec §2.2): the drafting instructions, then the human's, if any. */
-export function draftInstructions(instructions?: string): string {
+/** The drafts a redraft builds on: those that already became runs, and the others (which the submission replaces). */
+export type DraftContext = { tickets: { title: string; runId: string }[]; drafts: { title: string; body: string; edited: boolean }[] };
+
+/**
+ * What a `draft` turn submits (spec §2.2): the drafting instructions; on a redraft, the drafts that already became
+ * tickets (not to be submitted again) and the current drafts with the human's edits marked; then the human's
+ * instructions, if any.
+ */
+export function draftInstructions(instructions?: string, context?: DraftContext): string {
 	const lines = [
 		"# Draft tickets",
 		"Draft tickets from this discussion and submit them, with a summary, by calling submit_tickets.",
@@ -41,9 +48,36 @@ export function draftInstructions(instructions?: string): string {
 		"- Each body is a self-contained request for the factory's architect: the goal, the constraints, what is in and out of scope, and acceptance criteria. Refer to other tickets by title where they depend on each other.",
 		"- The summary separates what is settled from what is still open.",
 	];
+	if (context?.tickets.length)
+		lines.push(
+			"",
+			"# Drafts that already became tickets",
+			"These are runs now. Do not re-submit these; refer to them by title where a new ticket depends on them.",
+			...context.tickets.map((x) => `- ${x.title} (run ${x.runId})`),
+		);
+	if (context?.drafts.length)
+		lines.push(
+			"",
+			"# The current drafts",
+			"Your submission replaces these. Build on them: keep what still holds, and keep the human's edits unless the discussion has moved past them.",
+			...context.drafts.flatMap((x) => ["", `## ${x.title}${x.edited ? " (edited by the human)" : ""}`, x.body]),
+		);
 	const extra = instructions?.trim();
 	if (extra) lines.push("", "# The human's instructions", extra);
 	return lines.join("\n");
+}
+
+/**
+ * The factory note for the next turn when a reopen or retry changed the checkout, or undefined; clears it (call
+ * inside the commit that sets the turn).
+ */
+export function takeCheckoutNote(d: DiscussionDocState): string | undefined {
+	const ch = d.checkoutChanged;
+	if (!ch) return undefined;
+	delete d.checkoutChanged;
+	if (ch.repoCreated)
+		return `The repo ${d.repo} now exists: your workspace (${d.workspace?.path}) is now a checkout of it at ${ch.to}. Read AGENTS.md and docs/spec.md first if present.`;
+	return `The repo checkout was updated to ${ch.to}, the latest commit of the default branch (it was ${ch.from}). Files may have changed since you last read them.`;
 }
 
 export function createDiscussionTask(svc: DiscussionServices) {
@@ -70,6 +104,20 @@ export function createDiscussionTask(svc: DiscussionServices) {
 
 	function notice(d: DiscussionDocState, n: Omit<DiscussionNotice, "at">) {
 		d.notices.push({ at: svc.now(), kind: n.kind, text: n.text, ...(n.turn !== undefined ? { turn: n.turn } : {}) });
+	}
+
+	/**
+	 * Retire the discussant's environment (its network allowlist entries) when the discussion leaves OPEN, as a run does
+	 * when it ends. Best effort and idempotent; a reopen or retry provisions it again (`Sandbox.provision`).
+	 */
+	async function disposeEnv(rt: RT, c: Context, d: DiscussionDocState) {
+		try {
+			if (d.conversationId === undefined) return;
+			const env = await rt.snapshot(EnvDoc, d.conversationId as never, c);
+			if (env?.envId) await svc.sandbox.dispose(env.envId);
+		} catch (e) {
+			svc.log(`discussion ${d.id}: could not dispose its environment: ${e instanceof Error ? e.message : String(e)}`);
+		}
 	}
 
 	/** Clear the turn and, for a `draft` turn, what the bridge expects for it (a late submit_tickets is refused). */
@@ -161,7 +209,12 @@ export function createDiscussionTask(svc: DiscussionServices) {
 	/** A `say` turn: the first turn submits the project context and the first message, later ones the human's text. */
 	async function sayTurn(rt: RT, c: Context, d: DiscussionDocState, handle: ConversationHandle): Promise<TurnOutcome> {
 		const turn = d.turn!;
-		const content = turn.msgId === undefined ? turn.text : humanContent(turn.by, turn.msgId, turn.text);
+		let content: UserMessage["content"] = turn.text;
+		if (turn.msgId !== undefined) {
+			const [head, body] = humanContent(turn.by, turn.msgId, turn.text) as [{ type: "text"; text: string }, { type: "text"; text: string }];
+			// A factory note goes in the header, after the sender (as a run message's situation note).
+			content = turn.note ? [{ type: "text", text: `${head.text.slice(0, -1)}[factory] ${turn.note}\n\n` }, body] : [head, body];
+		}
 		const r = await submitAndWait(rt, c, d, handle, turn.key, content);
 		return r.error !== undefined ? { notice: { kind: "error", text: r.error } } : {};
 	}
@@ -240,7 +293,13 @@ export function createDiscussionTask(svc: DiscussionServices) {
 			const ws = d.workspace ? await svc.github.refresh(d.workspace, rc(d)) : await svc.github.open(d.repo, rc(d), "discussions");
 			const env = await svc.sandbox.provision(ws, "discussant", rc(d));
 			await transition(rt, c, d.id, async (doc, tx): Promise<Phase> => {
+				const prev = doc.workspace;
 				doc.workspace = ws;
+				// The model read the old checkout: the next turn tells it what changed (an untold earlier change is merged in).
+				if (prev && (prev.baseRef !== ws.baseRef || prev.newRepo !== ws.newRepo)) {
+					const pending = doc.checkoutChanged;
+					doc.checkoutChanged = { from: pending?.from ?? prev.baseRef, to: ws.baseRef, repoCreated: !!pending?.repoCreated || (prev.newRepo && !ws.newRepo) };
+				}
 				// Reopen and retry keep the Conversation; only the first prepare creates it and sets the first turn.
 				if (doc.conversationId === undefined) {
 					doc.conversationId = await createConversation(rt, tx, doc, env);
@@ -257,7 +316,10 @@ export function createDiscussionTask(svc: DiscussionServices) {
 			for (;;) {
 				if (rt.signal.aborted) throw new Cancelled();
 				const doc = await read(rt, d.id, c);
-				if (doc.state !== "OPEN") return transition(rt, c, d.id, () => "FINAL");
+				if (doc.state !== "OPEN") {
+					await disposeEnv(rt, c, doc);
+					return transition(rt, c, d.id, () => "FINAL");
+				}
 				if (doc.turn) {
 					await runTurn(rt, c, doc);
 					continue;
@@ -293,6 +355,7 @@ export function createDiscussionTask(svc: DiscussionServices) {
 						} catch (abortError) {
 							svc.log(`discussion ${d.id}: could not abort the conversation: ${abortError instanceof Error ? abortError.message : String(abortError)}`);
 						}
+						await disposeEnv(rt, c, d);
 						// FAILED and the end of the Task in one commit, so that Retry can follow at once.
 						await transition(rt, c, d.id, async (doc, tx): Promise<Phase> => {
 							doc.state = "FAILED";

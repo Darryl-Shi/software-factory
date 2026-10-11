@@ -9,6 +9,7 @@ import { draftInstructions } from "../src/core/discussion-task.ts";
 import type { DiscussionView, FactoryEvent, RunCtx } from "../src/core/types.ts";
 import { git, gitOut } from "../src/github/git.ts";
 import { GitHub } from "../src/github/github.ts";
+import { Sandbox } from "../src/sandbox/sandbox.ts";
 import { makeFactory, type TestEnv, until, untilDiscussion } from "./helpers.ts";
 
 let t: TestEnv | undefined;
@@ -38,6 +39,21 @@ async function pushCommit(repo: string, path: string, content: string): Promise<
 /** Create the remote repo with a first commit holding `path` on main. */
 const createRemoteWith = (repo: string, path: string, content: string) => pushCommit(repo, path, content);
 
+/** Replace the remote's main with an unrelated history holding only `path` (a force-push); returns the new head. */
+async function forcePush(repo: string, path: string, content: string): Promise<string> {
+	const work = mkdtempSync(join(tmpdir(), "force-"));
+	try {
+		await git(work, ["init", "-q", "-b", "main"]);
+		writeFileSync(join(work, path), content);
+		await git(work, ["add", "-A"]);
+		await git(work, ["commit", "-q", "-m", "rewrite"]);
+		await git(work, ["push", "-q", "--force", t!.host.bare(repo), "HEAD:refs/heads/main"]);
+		return await gitOut(work, ["rev-parse", "HEAD"]);
+	} finally {
+		rmSync(work, { recursive: true, force: true });
+	}
+}
+
 describe("workspace", () => {
 	let gh: GitHub;
 	let rc: RunCtx;
@@ -56,7 +72,7 @@ describe("workspace", () => {
 		expect(readFileSync(join(ws.path, "README.md"), "utf8")).toBe("# p\n");
 	});
 
-	test("refresh fast-forwards to the default branch", async () => {
+	test("refresh brings the checkout to the default branch", async () => {
 		const ws = await gh.open("me/p", rc, "discussions");
 		const head = await pushCommit("me/p", "NEW.md", "new\n");
 		const ws2 = await gh.refresh(ws, rc);
@@ -81,13 +97,59 @@ describe("workspace", () => {
 		expect(readFileSync(join(ws2.path, "README.md"), "utf8")).toBe("delivered\n");
 	});
 
-	test("a failed fast-forward throws with git's output", async () => {
+	test("refresh resyncs a diverged checkout (a local commit, local changes, stray files) to origin/main", async () => {
 		const ws = await gh.open("me/p", rc, "discussions");
 		writeFileSync(join(ws.path, "LOCAL.md"), "local\n");
 		await git(ws.path, ["add", "-A"]);
 		await git(ws.path, ["commit", "-q", "-m", "diverge"]);
-		await pushCommit("me/p", "NEW.md", "new\n");
-		await expect(gh.refresh(ws, rc)).rejects.toThrow(/^could not fast-forward the discussion's checkout to origin\/main: /);
+		writeFileSync(join(ws.path, "README.md"), "changed\n");
+		writeFileSync(join(ws.path, "STRAY.md"), "stray\n");
+		const head = await pushCommit("me/p", "NEW.md", "new\n");
+		const ws2 = await gh.refresh(ws, rc);
+		expect(ws2.baseRef).toBe(head);
+		expect(await gitOut(ws2.path, ["rev-parse", "HEAD"])).toBe(head);
+		expect(readFileSync(join(ws2.path, "README.md"), "utf8")).toBe("# p\n");
+		expect(existsSync(join(ws2.path, "LOCAL.md"))).toBe(false);
+		expect(existsSync(join(ws2.path, "STRAY.md"))).toBe(false);
+		expect(await gitOut(ws2.path, ["status", "--porcelain"])).toBe("");
+	});
+
+	test("refresh after a force-push of the default branch gives the new head", async () => {
+		const ws = await gh.open("me/p", rc, "discussions");
+		const head = await forcePush("me/p", "REWRITTEN.md", "r\n");
+		const ws2 = await gh.refresh(ws, rc);
+		expect(ws2.baseRef).toBe(head);
+		expect(existsSync(join(ws2.path, "README.md"))).toBe(false);
+		expect(readFileSync(join(ws2.path, "REWRITTEN.md"), "utf8")).toBe("r\n");
+	});
+
+	test("refresh makes the checkout again when its directory or its manifest is gone", async () => {
+		const ws = await gh.open("me/p", rc, "discussions");
+		rmSync(ws.path, { recursive: true, force: true });
+		const head = await pushCommit("me/p", "NEW.md", "new\n");
+		const ws2 = await gh.refresh(ws, rc);
+		expect(ws2).toMatchObject({ path: ws.path, baseRef: head, newRepo: false });
+		expect(readFileSync(join(ws2.path, "NEW.md"), "utf8")).toBe("new\n");
+		rmSync(`${ws.path}.json`);
+		const ws3 = await gh.refresh(ws2, rc);
+		expect(ws3.baseRef).toBe(head);
+		expect(JSON.parse(readFileSync(`${ws.path}.json`, "utf8")).baseRef).toBe(head);
+	});
+
+	test("refresh with the remote gone fails with git's output", async () => {
+		const ws = await gh.open("me/p", rc, "discussions");
+		rmSync(t!.host.bare("me/p"), { recursive: true, force: true });
+		await expect(gh.refresh(ws, rc)).rejects.toThrow(/^could not fetch me\/p to update the discussion's checkout: \S/);
+	});
+
+	test("open ignores a manifest for another repo (a reused id)", async () => {
+		await t!.host.seedRepo("me/q", { "README.md": "# q\n" });
+		const ws = await gh.open("me/p", rc, "discussions");
+		const ws2 = await gh.open("me/q", rc, "discussions");
+		expect(ws2).toMatchObject({ repo: "me/q", path: ws.path, newRepo: false });
+		expect(readFileSync(join(ws2.path, "README.md"), "utf8")).toBe("# q\n");
+		expect(JSON.parse(readFileSync(`${ws.path}.json`, "utf8")).repo).toBe("me/q");
+		expect(await gh.open("me/q", rc, "discussions")).toEqual(ws2);
 	});
 
 	test("the run area is unchanged by default", async () => {
@@ -127,9 +189,86 @@ describe("life cycle", () => {
 		expect(v.workspace!.path).toBe(join(t!.dir, "work", "discussions", id));
 		expect((await t!.factory.listDiscussions({ project: "p" })).map((x) => x.id)).toEqual([id]);
 		expect(await t!.factory.listDiscussions({ states: ["CLOSED"] })).toEqual([]);
+		for (const states of ["OPEN", 5, ["NOPE"], [null]]) {
+			await expect(t!.factory.listDiscussions({ states } as any)).rejects.toMatchObject({ code: "invalid" });
+			await expect(t!.factory.listRuns({ states } as any)).rejects.toMatchObject({ code: "invalid" });
+		}
+		expect(await t!.factory.listRuns({ states: ["DELIVERED"] })).toEqual([]);
 	});
 
-	test("reopen fast-forwards the checkout and keeps the Conversation", async () => {
+	test("reopen after the checkout was deleted makes it again", async () => {
+		const id = await t!.factory.startDiscussion("p", { title: "t", message: "m" });
+		const v1 = await t!.factory.waitForDiscussion(id, open);
+		await t!.factory.closeDiscussion(id);
+		await t!.factory.waitForDiscussion(id, (v) => v.state === "CLOSED");
+		rmSync(v1.workspace!.path, { recursive: true, force: true });
+		await t!.factory.reopenDiscussion(id);
+		const v2 = await t!.factory.waitForDiscussion(id, (v) => v.state !== "PREPARING");
+		expect(v2.state).toBe("OPEN");
+		expect(readFileSync(join(v2.workspace!.path, "README.md"), "utf8")).toBe("# p\n");
+		await t!.factory.say(id, "still there?");
+		await t!.factory.waitForDiscussion(id, open);
+		expect((await t!.factory.getDiscussionConversation(id)).items.at(-1)).toMatchObject({ role: "assistant", text: "re: still there?" });
+	});
+
+	test("reopen after a force-push gives the new head; the next turn carries a factory note, once", async () => {
+		const id = await t!.factory.startDiscussion("p", { title: "t", message: "m" });
+		const v1 = await t!.factory.waitForDiscussion(id, open);
+		await t!.factory.closeDiscussion(id);
+		await t!.factory.waitForDiscussion(id, (v) => v.state === "CLOSED");
+		const head = await forcePush("me/p", "REWRITTEN.md", "r\n");
+		await t!.factory.reopenDiscussion(id);
+		const v2 = await t!.factory.waitForDiscussion(id, (v) => v.state !== "PREPARING");
+		expect(v2.state).toBe("OPEN");
+		expect(v2.workspace!.baseRef).toBe(head);
+		await t!.factory.say(id, "what changed?");
+		await t!.factory.waitForDiscussion(id, open);
+		const msg = t!.control.discussantMessages.at(-1)!;
+		expect(msg).toContain(`[factory] The repo checkout was updated to ${head}, the latest commit of the default branch (it was ${v1.workspace!.baseRef}).`);
+		expect(t!.control.discussantHeard.at(-1)).toBe("what changed?");
+		// the UI still shows a plain human message
+		const items = (await t!.factory.getDiscussionConversation(id)).items;
+		expect(items.filter((i) => i.author === "human").at(-1)).toMatchObject({ text: "what changed?" });
+		await t!.factory.say(id, "and now?");
+		await t!.factory.waitForDiscussion(id, open);
+		expect(t!.control.discussantMessages.at(-1)).not.toContain("[factory]");
+	});
+
+	test("a draft turn after a reopen that created the repo says the repo now exists", async () => {
+		await t!.factory.createProject("n", "me/new");
+		const id = await t!.factory.startDiscussion("n", { title: "t", message: "m" });
+		const v1 = await t!.factory.waitForDiscussion(id, open);
+		expect(v1.workspace!.newRepo).toBe(true);
+		await t!.factory.closeDiscussion(id);
+		await t!.factory.waitForDiscussion(id, (v) => v.state === "CLOSED");
+		const head = await createRemoteWith("me/new", "README.md", "delivered\n");
+		await t!.factory.reopenDiscussion(id);
+		const v2 = await t!.factory.waitForDiscussion(id, open);
+		expect(v2.workspace).toMatchObject({ newRepo: false, baseRef: head });
+		await t!.factory.requestDrafts(id);
+		await t!.factory.waitForDiscussion(id, (v) => open(v) && v.drafts.length > 0);
+		expect(t!.control.discussantInputs.at(-1)).toMatch(/^# Draft tickets[\s\S]*\n# Factory note\nThe repo me\/new now exists: your workspace \(.*\) is now a checkout of it at [0-9a-f]{40}\./);
+		expect(t!.control.discussantInputs.at(-1)).toContain(head);
+	});
+
+	test("close disposes the discussant's environment; reopen provisions it again", async () => {
+		const dispose = vi.spyOn(Sandbox.prototype, "dispose");
+		const id = await t!.factory.startDiscussion("p", { title: "t", message: "m" });
+		await t!.factory.waitForDiscussion(id, open);
+		await t!.factory.closeDiscussion(id);
+		await t!.factory.waitForDiscussion(id, (v) => v.state === "CLOSED");
+		expect(dispose).toHaveBeenCalledWith(`${id}-discussant`);
+		const record = join(t!.dir, "state", "environments", `${id}-discussant.json`);
+		expect(JSON.parse(readFileSync(record, "utf8")).disposed).toBe(true);
+		await t!.factory.reopenDiscussion(id);
+		await t!.factory.waitForDiscussion(id, open);
+		expect(JSON.parse(readFileSync(record, "utf8")).disposed).toBeUndefined();
+		await t!.factory.say(id, "LS");
+		await t!.factory.waitForDiscussion(id, open);
+		expect((await t!.factory.getDiscussionConversation(id)).items.at(-1)).toMatchObject({ role: "assistant", text: "re: LS" });
+	});
+
+	test("reopen updates the checkout and keeps the Conversation", async () => {
 		const id = await t!.factory.startDiscussion("p", { title: "t", message: "m" });
 		const v1 = await t!.factory.waitForDiscussion(id, open);
 		await expect(t!.factory.reopenDiscussion(id)).rejects.toMatchObject({ code: "conflict" });
@@ -456,6 +595,32 @@ describe("drafting", () => {
 		expect(b.expect ?? null).toBeNull();
 	});
 
+	test("a redraft's input lists the drafts that became tickets and the current drafts with the human's edits", async () => {
+		await draft();
+		const run = await t!.factory.createTicket(id, "D1");
+		await t!.factory.updateDraft(id, "D2", { body: "B2, edited" });
+		await draft("only the rest");
+		const input = t!.control.discussantInputs.at(-1)!;
+		expect(input).toMatch(/^# Draft tickets\n/);
+		expect(input).toContain(`# Drafts that already became tickets\nThese are runs now. Do not re-submit these; refer to them by title where a new ticket depends on them.\n- API (run ${run})`);
+		expect(input).toMatch(/# The current drafts\n.*\n\n## UI \(edited by the human\)\nB2, edited\n/);
+		expect(input).toMatch(/# The human's instructions\nonly the rest$/);
+		// the first drafting had nothing to build on
+		expect(t!.control.discussantInputs.at(-2)).not.toContain("# The current drafts");
+		expect(t!.control.discussantInputs.at(-2)).not.toContain("# Drafts that already became tickets");
+	});
+
+	test("a drafts event marks a new submission, not an edit", async () => {
+		const got: FactoryEvent[] = [];
+		t!.factory.subscribe({ discussion: id }, (e) => got.push(e));
+		await draft();
+		await t!.factory.updateDraft(id, "D1", { body: "x" });
+		await t!.factory.deleteDraft(id, "D2");
+		await new Promise((r) => setTimeout(r, 100));
+		const drafts = got.filter((e) => e.type === "discussion.updated" && e.what === "drafts");
+		expect(drafts.map((e) => (e as any).submission ?? false)).toEqual([true, false, false]);
+	});
+
 	test("draftInstructions starts with # Draft tickets and appends the human's instructions", () => {
 		expect(draftInstructions()).toMatch(/^# Draft tickets\n/);
 		expect(draftInstructions()).toContain("one ticket per piece of work that can be specified, built and reviewed on its own");
@@ -508,6 +673,19 @@ describe("handoff", () => {
 		await t!.factory.requestDrafts(id);
 		await expect(t!.factory.createTicket(id, "D1")).rejects.toMatchObject({ code: "conflict" });
 		t!.control.discussantHang = false;
+		await t!.factory.waitForDiscussion(id, open);
+	});
+
+	test("createTicket works on a FAILED discussion", async () => {
+		await t!.factory.closeDiscussion(id);
+		await t!.factory.waitForDiscussion(id, (x) => x.state === "CLOSED");
+		vi.spyOn(GitHub.prototype, "refresh").mockRejectedValueOnce(new Error("GitHub is down"));
+		await t!.factory.reopenDiscussion(id);
+		await t!.factory.waitForDiscussion(id, (x) => x.state === "FAILED");
+		const run = await t!.factory.createTicket(id, "D1");
+		expect((await t!.factory.getRun(run)).request).toMatchObject({ source: "discussion", title: "API" });
+		expect((await t!.factory.getDiscussion(id)).drafts[0]!.runId).toBe(run);
+		await t!.factory.retryDiscussion(id);
 		await t!.factory.waitForDiscussion(id, open);
 	});
 

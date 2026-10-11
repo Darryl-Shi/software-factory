@@ -356,7 +356,8 @@ export type FactoryEvent =
 	| { type: "run.message"; run: RunId; message: { id: string; to: Role; conversationId?: string } }
 	| { type: "settings.changed"; scope: Scope; path: string }
 	| { type: "discussion.state"; discussion: DiscussionId; project: string; from: DiscussionState | null; to: DiscussionState }
-	| { type: "discussion.updated"; discussion: DiscussionId; project: string; what: "turn.started" | "turn.ended" | "drafts" | "ticket" | "notice" }
+	/** `submission`: with `what: "drafts"`, a new submit_tickets was applied (absent for a human's edit or delete). */
+	| { type: "discussion.updated"; discussion: DiscussionId; project: string; what: "turn.started" | "turn.ended" | "drafts" | "ticket" | "notice"; submission?: true }
 	| { type: "discussion.conversation.updated"; discussion: DiscussionId; conversationId: string };
 
 export interface FactoryCore {
