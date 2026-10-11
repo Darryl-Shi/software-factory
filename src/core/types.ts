@@ -3,7 +3,7 @@
 export type RunId = string;
 export type AskId = string;
 export type RepoRef = string; // "owner/name"
-export type Role = "architect" | "builder" | "helper" | "reviewer" | "qa";
+export type Role = "architect" | "builder" | "helper" | "reviewer" | "qa" | "discussant";
 /** Whether AQ testing ran in a review round (§2 "QA status"). */
 export type QaStatus = "ran" | "off" | "skipped" | "unavailable";
 export type Gate = "spec" | "delivery" | "merge";
@@ -26,6 +26,52 @@ export const RUN_STATES = [
 ] as const;
 export type RunState = (typeof RUN_STATES)[number];
 export const TERMINAL_STATES: readonly RunState[] = ["DELIVERED", "FAILED", "CANCELLED"];
+
+// ---------------------------------------------------------------- discussions (a pre-ticket chat with the discussant)
+export type DiscussionId = string;
+export const DISCUSSION_STATES = ["PREPARING", "OPEN", "CLOSED", "FAILED"] as const;
+export type DiscussionState = (typeof DISCUSSION_STATES)[number];
+export interface Draft {
+	id: string;
+	title: string;
+	body: string;
+	edited: boolean;
+	/** Which submit_tickets submission it came from (1-based). */
+	batch: number;
+	runId?: RunId;
+}
+export interface DiscussionNotice {
+	at: number;
+	kind: "error" | "stopped" | "no_submission";
+	text: string;
+}
+export interface TurnCost {
+	turn: number;
+	kind: "say" | "draft";
+	usd: number;
+	totalTokens: number;
+	durationMs: number;
+}
+export interface DiscussionView {
+	id: DiscussionId;
+	project: string;
+	repo: RepoRef;
+	title: string;
+	state: DiscussionState;
+	error?: string;
+	model: { model: string; thinking: string };
+	conversationId?: string;
+	turn: { kind: "say" | "draft"; startedAt: number } | null;
+	summary?: string;
+	drafts: Draft[];
+	notices: DiscussionNotice[];
+	cost: { usd: number; totalTokens: number };
+	turnCosts: TurnCost[];
+	runs: { id: RunId; state: RunState }[];
+	workspace?: Workspace;
+	createdAt: number;
+	updatedAt: number;
+}
 
 export interface Request {
 	id: string;

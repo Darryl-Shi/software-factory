@@ -21,7 +21,7 @@ import { join } from "node:path";
 import { ScreenshotsDoc } from "../core/bridge.ts";
 import { runConfigOf } from "../core/run-config.ts";
 import type { Role } from "../core/types.ts";
-import { RoleArchitect, RoleBuilder, RoleHelper, RoleQa, RoleReviewer } from "./prompts.ts";
+import { RoleArchitect, RoleBuilder, RoleDiscussant, RoleHelper, RoleQa, RoleReviewer } from "./prompts.ts";
 import { WebSearch } from "./web-search.ts";
 
 export const Coding = defineExtension({ name: "coding", tools: [createReadTool(), createWriteTool(), createEditTool(), createBashTool()] });
@@ -210,6 +210,7 @@ export const ROLE_TOOLS: Record<Role, Extension[]> = {
 	helper: [RoleHelper, Coding, TestRunner, WebSearch],
 	reviewer: [RoleReviewer, CodingReadonly, TestRunner, WebSearch],
 	qa: [RoleQa, CodingReadonly, Computer, WebSearch],
+	discussant: [RoleDiscussant, CodingReadonly, WebSearch],
 };
 
 /**
