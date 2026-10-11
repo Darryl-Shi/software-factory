@@ -1,14 +1,18 @@
-# Dry run of spec §8 — 2026-10-10T13:50:14.792Z
+# Dry run of spec §8 — 2026-10-11T07:17:11.040Z
 
-Directory: /tmp/sf-dry1. Scripted agents (no model credentials), sandbox OFF (DRYRUN_SANDBOX=0), fake GitHub with local CI runner, SQLite storage, a daemonized `factory serve` driven through the web HTTP API (`POST /api/op/<op>`, `GET /api/events`).
+Directory: .dryrun (DRYRUN_DIR). Scripted agents (no model credentials), sandbox OFF (DRYRUN_SANDBOX=0), fake GitHub with local CI runner, SQLite storage, a daemonized `factory serve` driven through the web HTTP API (`POST /api/op/<op>`, `GET /api/events`).
 
 Dropped CLI-only checks: none. The terminal attach view check is replaced by the SSE event stream check.
 
-**62/62 checks passed.**
+**66/66 checks passed.**
 
-## §8.1 zero-to-MVP: createProject todo → me/todo and startRun (repo does not exist)
+## §8.1 zero-to-MVP: createProject todo → me/todo, a discussion, then a ticket from its draft (repo does not exist)
+- ✅ discussion reached OPEN and answered both messages (after an ls, then a web search)
+- ✅ drafts submitted with a summary
+- ✅ the run's request came from the discussion (source, meta)
 - ✅ repo did not exist before the run
 - ✅ spec rejection returns the run to the discussion (same architect)
+- ✅ the architect's first input carried the discussion summary
 - ✅ discussion asked two questions, one at a time
 - ✅ spec v2 after the rejection carries the feedback
 
