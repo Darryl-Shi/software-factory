@@ -82,6 +82,16 @@ export interface Request {
 	meta?: Record<string, unknown>;
 }
 
+/** `Request.meta.discussion` of a run created from a discussion draft (`createTicket`): copied, never read back. */
+export interface DiscussionLink {
+	id: DiscussionId;
+	title: string;
+	draftId: string;
+	summary: string;
+	/** The titles of the other drafts from the same submit_tickets submission. */
+	siblings: string[];
+}
+
 export interface ArtifactRef {
 	kind: "spec" | "delivery" | "workspace";
 	path?: string;
@@ -385,6 +395,8 @@ export interface FactoryCore {
 	/** Edit a draft that has not become a run; marks it `edited`. */
 	updateDraft(id: DiscussionId, draft: string, change: { title?: string; body?: string }): Promise<void>;
 	deleteDraft(id: DiscussionId, draft: string): Promise<void>;
+	/** Turn a draft into a run (OPEN or CLOSED; not while a `draft` turn runs); the draft then records the run and is read-only. */
+	createTicket(id: DiscussionId, draft: string): Promise<RunId>;
 	closeDiscussion(id: DiscussionId): Promise<void>;
 	reopenDiscussion(id: DiscussionId): Promise<void>;
 	retryDiscussion(id: DiscussionId): Promise<void>;
@@ -423,6 +435,7 @@ export const CORE_OPS = [
 	"requestDrafts",
 	"updateDraft",
 	"deleteDraft",
+	"createTicket",
 	"closeDiscussion",
 	"reopenDiscussion",
 	"retryDiscussion",

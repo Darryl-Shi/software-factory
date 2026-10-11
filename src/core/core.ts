@@ -37,6 +37,7 @@ import {
 	type AskId,
 	type AskResponse,
 	type DiscussionId,
+	type DiscussionLink,
 	type DiscussionState,
 	type DiscussionView,
 	type EffectiveSettings,
@@ -432,6 +433,16 @@ export class Factory implements FactoryCore {
 
 	// ------------------------------------------------------------------ runs
 	async startRun(project: string, request: Omit<Request, "id" | "project">): Promise<RunId> {
+		let runId!: RunId;
+		await this.root.commit(async (tx) => {
+			runId = await this.createRunIn(tx, project, request);
+		}, this.ctx);
+		this.harness.resume();
+		return runId;
+	}
+
+	/** Create a run in `tx`: its `RunIndex` entry, its `RunDoc` seed and its Task (startRun, createTicket). Call `harness.resume()` after the commit. */
+	private async createRunIn(tx: Tx, project: string, request: Omit<Request, "id" | "project">): Promise<RunId> {
 		const p = this.config.project(project);
 		const eff = this.config.effective({ project });
 		const runId = `run-${this.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
@@ -460,13 +471,10 @@ export class Factory implements FactoryCore {
 			notices: [],
 			history: [{ from: null, to: "RECEIVED", at: now, round: 1 }],
 		};
-		await this.root.commit(async (tx) => {
-			(await tx.doc(RunIndex)).runs.push(runId);
-			const d = (await tx.doc(RunDoc, runId, seed as never)) as unknown as RunDocState;
-			const taskId = await tx.createTask(this.runTask, { runId, start: "RECEIVED" as RunState }, { ownership: { kind: "conversation" }, background: true });
-			d.taskId = taskId as unknown as string;
-		}, this.ctx);
-		this.harness.resume();
+		(await tx.doc(RunIndex)).runs.push(runId);
+		const d = (await tx.doc(RunDoc, runId, seed as never)) as unknown as RunDocState;
+		const taskId = await tx.createTask(this.runTask, { runId, start: "RECEIVED" as RunState }, { ownership: { kind: "conversation" }, background: true });
+		d.taskId = taskId as unknown as string;
 		return runId;
 	}
 
@@ -795,13 +803,12 @@ export class Factory implements FactoryCore {
 
 	private async discussionView(d: DiscussionDocState): Promise<DiscussionView> {
 		const usage = d.conversationId !== undefined ? sumUsage((await this.harness.snapshot(UsageDoc, d.conversationId as never, this.ctx)) as any) : undefined;
-		const runs: DiscussionView["runs"] = [];
-		for (const x of d.drafts) {
-			if (x.runId === undefined) continue;
-			const state = this.cache.get(x.runId)?.state ?? ((await this.harness.snapshot(RunDoc, x.runId, this.ctx)) as RunDocState | undefined)?.state;
-			if (state) runs.push({ id: x.runId, state });
-		}
-		return toDiscussionView(d, { usd: usage?.usd ?? 0, totalTokens: usage?.totalTokens ?? 0 }, runs);
+		// The run cache, or the document for a run the watch has not delivered yet (just created by createTicket).
+		const uncached = new Map<RunId, RunState | undefined>();
+		for (const x of d.drafts)
+			if (x.runId !== undefined && !this.cache.has(x.runId))
+				uncached.set(x.runId, ((await this.harness.snapshot(RunDoc, x.runId, this.ctx)) as RunDocState | undefined)?.state);
+		return toDiscussionView(d, { usd: usage?.usd ?? 0, totalTokens: usage?.totalTokens ?? 0 }, (run) => this.cache.get(run)?.state ?? uncached.get(run));
 	}
 
 	async getDiscussion(id: DiscussionId): Promise<DiscussionView> {
@@ -902,6 +909,27 @@ export class Factory implements FactoryCore {
 			const x = this.editableDraft(d, draft);
 			d.drafts = d.drafts.filter((y) => y !== x);
 		});
+	}
+
+	async createTicket(id: DiscussionId, draft: string): Promise<RunId> {
+		// One commit: the run (index entry, seed, Task) and the draft's runId, checked inside it, so a second call is refused.
+		const runId = await this.changeDiscussion(id, async (d, tx) => {
+			if (d.state !== "OPEN" && d.state !== "CLOSED")
+				throw new FactoryError("conflict", `discussion ${id} is ${d.state}; only an OPEN or CLOSED discussion's drafts can become tickets`);
+			const x = this.editableDraft(d, draft);
+			const discussion: DiscussionLink = {
+				id,
+				title: d.title,
+				draftId: x.id,
+				summary: d.summary ?? "",
+				siblings: d.drafts.filter((y) => y !== x && y.batch === x.batch).map((y) => y.title),
+			};
+			const run = await this.createRunIn(tx, d.project, { source: "discussion", title: x.title, body: x.body, meta: { discussion } });
+			x.runId = run;
+			return run;
+		});
+		this.harness.resume();
+		return runId;
 	}
 
 	/** The draft, if the human may change it: it has not become a run and no `draft` turn is running. */

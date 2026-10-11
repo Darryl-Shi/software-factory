@@ -9,7 +9,7 @@ import { draftInstructions } from "../src/core/discussion-task.ts";
 import type { DiscussionView, FactoryEvent, RunCtx } from "../src/core/types.ts";
 import { git, gitOut } from "../src/github/git.ts";
 import { GitHub } from "../src/github/github.ts";
-import { makeFactory, type TestEnv, untilDiscussion } from "./helpers.ts";
+import { makeFactory, type TestEnv, until, untilDiscussion } from "./helpers.ts";
 
 let t: TestEnv | undefined;
 afterEach(async () => {
@@ -460,5 +460,80 @@ describe("drafting", () => {
 		expect(draftInstructions()).not.toContain("# The human's instructions");
 		expect(draftInstructions("  ")).toBe(draftInstructions());
 		expect(draftInstructions("only the API")).toMatch(/only the API$/);
+	});
+});
+
+describe("handoff", () => {
+	let id: string;
+	beforeEach(async () => {
+		await setup();
+		id = await t!.factory.startDiscussion("p", { title: "auth?", message: "how should login work?" });
+		await t!.factory.waitForDiscussion(id, open);
+		await t!.factory.requestDrafts(id);
+		await t!.factory.waitForDiscussion(id, (v) => open(v) && v.drafts.length === 2); // D1 "API", D2 "UI"
+	});
+
+	test("createTicket starts a run whose architect gets the summary and the sibling titles", async () => {
+		const run = await t!.factory.createTicket(id, "D1");
+		const r = await t!.factory.getRun(run);
+		expect(r.request).toMatchObject({
+			source: "discussion",
+			title: "API",
+			body: "B1",
+			meta: { discussion: { id, title: "auth?", draftId: "D1", summary: "S: settled X; open Y", siblings: ["UI"] } },
+		});
+		await until(t!.factory, run, (v) => v.conversations.architect !== undefined && t!.control.architectInputs.length > 0);
+		expect(t!.control.architectInputs.at(-1)).toMatch(
+			/# Prior discussion\n[\s\S]*S: settled X; open Y[\s\S]*- UI[\s\S]*Treat points the summary marks as settled as settled/,
+		);
+		expect(t!.control.architectInputs.at(-1)).toMatch(/Treat points the summary marks as settled as settled; ask only about what is still open\.\n\nDiscuss the architecture/);
+		expect((await t!.factory.getDiscussion(id)).drafts[0]!.runId).toBe(run);
+		expect((await t!.factory.getDiscussion(id)).runs).toEqual([{ id: run, state: expect.any(String) }]);
+	});
+
+	test("a second createTicket on the same draft is refused; two at once give one run", async () => {
+		const results = await Promise.allSettled([t!.factory.createTicket(id, "D2"), t!.factory.createTicket(id, "D2")]);
+		expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+		expect((results.find((r) => r.status === "rejected") as PromiseRejectedResult).reason).toMatchObject({ code: "conflict" });
+		expect((await t!.factory.listRuns()).filter((r) => (r.request.meta as any)?.discussion?.draftId === "D2")).toHaveLength(1);
+		await expect(t!.factory.createTicket(id, "D2")).rejects.toMatchObject({ code: "conflict" });
+		await expect(t!.factory.createTicket(id, "D9")).rejects.toMatchObject({ code: "not_found" });
+		await expect(t!.factory.createTicket("disc-99", "D1")).rejects.toMatchObject({ code: "not_found" });
+	});
+
+	test("createTicket is refused while a draft turn runs", async () => {
+		t!.control.discussantHang = true;
+		await t!.factory.requestDrafts(id);
+		await expect(t!.factory.createTicket(id, "D1")).rejects.toMatchObject({ code: "conflict" });
+		t!.control.discussantHang = false;
+		await t!.factory.waitForDiscussion(id, open);
+	});
+
+	test("createTicket works on a CLOSED discussion; converted drafts are read-only and survive a redraft", async () => {
+		await t!.factory.closeDiscussion(id);
+		await t!.factory.waitForDiscussion(id, (x) => x.state === "CLOSED");
+		const run = await t!.factory.createTicket(id, "D1");
+		await expect(t!.factory.updateDraft(id, "D1", { body: "x" })).rejects.toMatchObject({ code: "conflict" });
+		await expect(t!.factory.deleteDraft(id, "D1")).rejects.toMatchObject({ code: "conflict" });
+		await t!.factory.reopenDiscussion(id);
+		await t!.factory.waitForDiscussion(id, open);
+		t!.control.draftPlan = ["one"];
+		await t!.factory.requestDrafts(id);
+		const v = await t!.factory.waitForDiscussion(id, (x) => open(x) && x.drafts.some((d) => d.id === "D3"));
+		expect(v.drafts).toEqual([
+			{ id: "D1", title: "API", body: "B1", edited: false, batch: 1, runId: run },
+			{ id: "D3", title: "Only", body: "B", edited: false, batch: 2 },
+		]);
+		// siblings are the drafts of the same submission only
+		const run3 = await t!.factory.createTicket(id, "D3");
+		expect((await t!.factory.getRun(run3)).request.meta).toMatchObject({ discussion: { draftId: "D3", siblings: [] } });
+		expect((await t!.factory.getDiscussion(id)).runs.map((r) => r.id)).toEqual([run, run3]);
+	});
+
+	test("runs without a discussion keep the old architect input", async () => {
+		const run = await t!.factory.startRun("p", { source: "t", title: "x", body: "x" });
+		await until(t!.factory, run, (v) => v.conversations.architect !== undefined && t!.control.architectInputs.length > 0);
+		expect(t!.control.architectInputs.at(-1)).not.toContain("# Prior discussion");
+		expect(t!.control.architectInputs.at(-1)).toMatch(/\n\nDiscuss the architecture with the human/);
 	});
 });
