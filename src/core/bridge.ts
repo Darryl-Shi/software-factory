@@ -2,10 +2,10 @@
 // is waiting on; they never call layer-2 code. The core turns what they commit into state transitions.
 import { Type } from "@earendil-works/pi-ai";
 import { defineDoc, defineExtension, defineTool, type ToolRegistration } from "@earendil-works/pi-durable";
-import { validateQa, validateResponses, validateReview } from "./findings.ts";
+import { validateQa, validateResponses, validateReview, validateTickets } from "./findings.ts";
 import type { Role } from "./types.ts";
 
-export type BridgeTool = "ask_human" | "submit_spec" | "report_done" | "submit_review" | "submit_qa";
+export type BridgeTool = "ask_human" | "submit_spec" | "report_done" | "submit_review" | "submit_qa" | "submit_tickets";
 
 export type BridgeState = {
 	runId?: string;
@@ -51,6 +51,7 @@ export const ROLE_TOOLS: Record<Role, BridgeTool[]> = {
 	reviewer: ["submit_review"],
 	qa: ["submit_qa"],
 	helper: [],
+	discussant: ["submit_tickets"],
 };
 
 const text = (t: string) => [{ type: "text" as const, text: t }];
@@ -173,12 +174,28 @@ export const submitQa = bridgeTool(
 	},
 );
 
+export const submitTickets = bridgeTool(
+	"submit_tickets",
+	"Submit draft tickets and a summary of the discussion. Write one ticket per piece of work that can be specified, built and reviewed on its own. Each body is a self-contained request for the factory's architect: the goal, the constraints, what is in and out of scope, and acceptance criteria; refer to other tickets by title where they depend on each other. 1 to 20 tickets.",
+	Type.Object({
+		summary: Type.String({
+			description: "What the discussion established, in markdown: the problem, decisions (marked as settled), rejected options and why, open questions, risks",
+		}),
+		tickets: Type.Array(Type.Object({ title: Type.String({ description: "At most 200 characters" }), body: Type.String() })),
+	}),
+	(args) => {
+		const checked = validateTickets(args);
+		return checked.ok ? { ok: true, payload: checked.payload, reply: "Tickets submitted." } : checked;
+	},
+);
+
 const ALL: Record<BridgeTool, ToolRegistration> = {
 	ask_human: askHuman,
 	submit_spec: submitSpec,
 	report_done: reportDone,
 	submit_review: submitReview,
 	submit_qa: submitQa,
+	submit_tickets: submitTickets,
 };
 
 export const Bridge = defineExtension({ name: "factory.bridge", tools: Object.values(ALL) });

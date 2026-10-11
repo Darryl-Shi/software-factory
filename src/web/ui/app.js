@@ -95,7 +95,7 @@ function conn(down) {
 }
 
 // ===================================================================== client state (filled only from core reads and events)
-const ui = { runs: new Map(), projects: [], schema: null, keys: new Map(), touched: new Map(), filter: { project: "", turn: false, active: false, closed: false, q: "" }, open: null, rendered: false };
+const ui = { runs: new Map(), discs: new Map(), mode: null, projects: [], schema: null, keys: new Map(), touched: new Map(), filter: { project: "", turn: false, active: false, closed: false, q: "" }, open: null, rendered: false };
 function computeKeys() {
   const by = {};
   [...ui.runs.values()].sort((a, b) => a.createdAt - b.createdAt).forEach((r) => {
@@ -190,11 +190,12 @@ function cardHtml(r) {
   if (r.ciFixes > 0 || r.state === "AWAITING_CI") chips.push(`<span class="rchip" title="CI fix rounds used">CI ${r.ciFixes}/${r.caps.ciFix}</span>`);
   const flag = r.state === "ESCALATED" ? `<span class="flag">▲ ${r.escalation?.cap === "ciFix" ? "CI fix cap hit" : r.escalation?.cap === "review" ? "Review cap hit" : "Needs a decision"}</span>` : "";
   const cls = ["card", pa ? "turn" : "", r.state === "ESCALATED" ? "esc" : "", r.state === "FAILED" || r.state === "CANCELLED" ? "closed" : ""].join(" ");
+  const from = r.request.meta?.discussion;
   return `<button type="button" class="${cls}" data-id="${esc(r.id)}">
     <div class="card-title">${esc(r.request.title)}</div>
     <div class="card-row">${stateLabel(r)}${pa ? `<span class="turn-badge">${esc(turnText(pa.question))}</span>` : ""}${flag}</div>
     <div class="card-foot">
-      <div class="card-row"><span class="key">${esc(keyOf(r.id))}</span>${ui.filter.project ? "" : `<span class="pchip">${esc(r.project)}</span>`}<span class="rounds">${chips.join("")}</span></div>
+      <div class="card-row"><span class="key">${esc(keyOf(r.id))}</span>${from ? `<span class="disc-mark" title="From discussion: ${esc(from.title)}" aria-label="From discussion: ${esc(from.title)}">${ICON.chat}</span>` : ""}${ui.filter.project ? "" : `<span class="pchip">${esc(r.project)}</span>`}<span class="rounds">${chips.join("")}</span></div>
       <div class="card-row"><span class="meta">${money(totalUsd(r))} · ${ago(r.createdAt)}</span>${role ? avatar(role, live) : ""}</div>
     </div>
   </button>`;
@@ -266,6 +267,7 @@ async function flush() {
   if (newProject) { ui.projects = await core.listProjects().catch(() => ui.projects); renderProjectFilter(); }
   renderBoard();
   if (ui.open && ids.includes(ui.open)) renderRunView();
+  withDiscussions(() => discussionRunsChanged(ids));
 }
 // Transcripts of the open run: refetched (throttled) when the conversation changes.
 const convTimers = new Map();
@@ -284,6 +286,7 @@ function refreshConv(run, cid) {
   }, 120);
 }
 function onEvent(e) {
+  if (e.type.startsWith("discussion.")) return withDiscussions(() => onDiscussionEvent(e));
   if (e.type === "conversation.updated") {
     ui.touched.set(String(e.conversationId), Date.now());
     const r = ui.runs.get(e.run);
@@ -306,10 +309,12 @@ let boardTimer = 0;
 function scheduleBoard() { if (!boardTimer) boardTimer = setTimeout(() => { boardTimer = 0; if (!$("#view-board").hidden) renderBoard(); }, 120); }
 async function resync() {
   try {
-    const [projects, runs] = await Promise.all([core.listProjects(), core.listRuns()]);
-    ui.projects = projects; ui.runs = new Map(runs.map((r) => [r.id, r]));
+    const [projects, runs, discs] = await Promise.all([core.listProjects(), core.listRuns(), core.listDiscussions()]);
+    ui.projects = projects; ui.runs = new Map(runs.map((r) => [r.id, r])); ui.discs = new Map(discs.map((d) => [d.id, d]));
     renderProjectFilter(); renderBoard();
-    if (ui.open) { if (ui.runs.has(ui.open)) { renderRunView(); loadThread(false); } else closeRun(); }
+    if (ui.mode === "discussion") withDiscussions(resyncDiscussion);
+    else if (ui.open) { if (ui.runs.has(ui.open)) { renderRunView(); loadThread(false); } else closeRun(); }
+    if (!$("#view-discussions").hidden) withDiscussions(renderDiscussions);
     if (!$("#view-settings").hidden) renderSettings();
   } catch (e) { toast(String(e.message ?? e), "error"); }
 }
@@ -389,6 +394,7 @@ const ICON = {
   check: '<svg viewBox="0 0 16 16"><path d="M6.3 11.2 2.8 7.7l1.06-1.06 2.44 2.44 5.84-5.84L13.2 4.3z"/></svg>',
   retry: '<svg viewBox="0 0 16 16"><path d="M8 2.5a5.5 5.5 0 1 1-5.2 7.3l1.42-.5A4 4 0 1 0 5.2 5.2L7 7H2.5V2.5l1.6 1.6A5.48 5.48 0 0 1 8 2.5z"/></svg>',
   stop: '<svg viewBox="0 0 16 16"><path d="M4 4h8v8H4z"/></svg>',
+  chat: '<svg viewBox="0 0 16 16"><path d="M2.5 2.5h11a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H7.2L4 14v-2.5H2.5a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1zm.5 1.5v6h2.5v1.2L6.7 10H13V4z"/></svg>',
 };
 
 // ---------------------------------------------------------------- open and close (the sheet grows out of the card and shrinks back into it)
@@ -432,26 +438,30 @@ async function openRun(id, fromEl) {
   for (const c of new Set(extra.map(String))) {
     try { ui.tx.set(c, await core.getConversation(id, c)); } catch {}
   }
-  if (ui.open === id) { renderThreads(openRunData()); updateComposerLive(openRunData()); }
+  if (ui.open !== id || ui.mode === "discussion") return;
+  renderThreads(openRunData()); updateComposerLive(openRunData());
   ($("#cmp-answer") ?? $("#cmp-chat") ?? $("#rv-close")).focus({ preventScroll: true });
 }
 let closing = false;
 async function closeRun() {
   if (!ui.open || closing) return;
   closing = true;
-  const id = ui.open, rv = $("#runview"), bd = $("#rv-backdrop");
+  const id = ui.open, rv = $("#runview"), bd = $("#rv-backdrop"), wasDiscussion = ui.mode === "discussion";
+  // A run shrinks back into its board card, a discussion into its row in the list.
+  const home = () => (wasDiscussion ? (typeof discRowEl === "function" ? discRowEl(id) : null) : cardEl(id));
   $("#rv-threads").classList.remove("open");
   bd.classList.remove("on");
   try { history.replaceState(null, "", location.pathname); } catch {}
   if (!reduceMotion()) {
-    const to = insetOf(cardEl(id));
+    const to = insetOf(home());
     const a = rv.animate([{ clipPath: "inset(0px 0px 0px 0px round 0px)", opacity: 1 }, { clipPath: to ?? "inset(3% 3% 3% 3% round 18px)", opacity: to ? 1 : 0 }], { duration: 380, easing: "cubic-bezier(.4, 0, .2, 1)" });
     rv.querySelectorAll(".rv-top, .rv-body").forEach((el) => el.animate([{ opacity: 1 }, { opacity: 0, offset: 0.45 }, { opacity: 0 }], { duration: 380 }));
     await a.finished.catch(() => {});
   }
-  ui.open = null; ui.tx.clear(); rv.hidden = true; bd.hidden = true; closing = false;
+  ui.open = null; ui.mode = null; delete rv.dataset.mode; sheetLabels(false); ui.tx.clear(); rv.hidden = true; bd.hidden = true; closing = false;
   renderBoard();
-  const c = cardEl(id);
+  if (wasDiscussion) withDiscussions(renderDiscussions);
+  const c = home();
   if (c) { c.focus({ preventScroll: true }); if (!reduceMotion()) c.animate([{ boxShadow: "0 0 0 3px var(--accent-line)" }, { boxShadow: "0 0 0 0 transparent" }], { duration: 900, easing: "ease-out" }); }
 }
 
@@ -574,9 +584,9 @@ function patch(container, blocks, live) {
   const old = new Map([...container.children].map((el) => [el.dataset.k, el]));
   let prev = null, added = 0;
   for (const b of blocks) {
-    let el = old.get(b.k);
+    let el = old.get(String(b.k)); // keys come back from the DOM as strings; entry ids are numbers
     if (el) {
-      old.delete(b.k);
+      old.delete(String(b.k));
       if (el._h !== b.html) {
         const n = mkBlock(b);
         if (live && /\bstep\b/.test(b.cls ?? "")) n.classList.add("upd");
@@ -629,7 +639,7 @@ async function loadThread(first) {
   let t;
   try { t = await core.getConversation(r.id, id); }
   catch (e) { toast(String(e.message ?? e), "error"); return; }
-  if (!ui.open || String(ui.thread) !== String(id)) return;
+  if (ui.open !== r.id || ui.mode === "discussion" || String(ui.thread) !== String(id)) return;
   ui.tx.set(String(id), t);
   renderTranscript(openRunData(), t, first);
   renderThreads(openRunData());
@@ -893,7 +903,9 @@ function renderDetails(r) {
   r.cost.forEach((c) => { const k = `${c.role}:${c.round}:${c.trigger ?? ""}`; byRole[k] ??= { role: c.role, round: c.round, trigger: c.trigger, tokens: 0, usd: 0 }; byRole[k].tokens += c.totalTokens || 0; byRole[k].usd += c.usd || 0; });
   const ktok = (n) => (n >= 10000 ? `${(n / 1000).toFixed(0)}k` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
   const costRows = Object.values(byRole).map((c) => `<tr><td>${roleName(c.role)}${c.trigger === "message" ? ` <span class="meta" title="Turns your messages started">· replies</span>` : ""}</td><td class="n">${c.round}</td><td class="n">${ktok(c.tokens)}</td><td class="n">${money(c.usd)}</td></tr>`).join("");
+  const from = r.request.meta?.discussion;
   $("#rv-details-inner").innerHTML = `
+    ${from ? `<section class="d-sec from-disc">${ICON.chat}<span>From discussion: <button type="button" class="linkish" id="d-disc">${esc(from.title)}</button></span></section>` : ""}
     <div class="kpis"><div class="kpi"><span class="k">Stage</span><span class="v">${allDone ? "Done" : name}</span></div><div class="kpi"><span class="k">Review</span><span class="v">${r.conversations.reviewers.length ? `${r.reviewRound}/${r.caps.review}` : "—"}</span></div>${r.qaStatus ? `<div class="kpi"><span class="k">AQ testing</span><span class="v" title="${esc(QA_LABEL[r.qaStatus] ?? r.qaStatus)}">${esc(cap1(r.qaStatus))}</span></div>` : ""}<div class="kpi"><span class="k">Cost</span><span class="v">${money(totalUsd(r))}</span></div></div>
     <section class="d-sec"><h4>Progress</h4><div class="pipeline">${pipe}</div></section>
     ${r.request.body ? `<section class="d-sec"><h4>Request</h4><div class="f-body">${md(r.request.body)}</div></section>` : ""}
@@ -915,6 +927,7 @@ function renderDetails(r) {
       ${terminal ? (r.state !== "DELIVERED" ? `<button type="button" class="btn primary" id="d-retry">${ICON.retry} Retry run</button>` : `<span class="meta">Delivered runs are final.</span>`) : `<button type="button" class="btn danger" id="d-cancel">${ui.confirmCancel ? "Click again to cancel" : "Cancel run"}</button>`}
     </div></section>`;
   $("#d-spec")?.addEventListener("click", () => openSpec(r));
+  $("#d-disc")?.addEventListener("click", () => withDiscussions(() => openDiscussion(from.id)));
   $("#d-retry")?.addEventListener("click", () => act(() => core.retryRun(r.id), "Retrying").then(() => refreshRun(r.id)));
   $("#d-cancel")?.addEventListener("click", () => {
     if (!ui.confirmCancel) { ui.confirmCancel = true; renderDetails(r); setTimeout(() => { ui.confirmCancel = false; if (ui.open === r.id) renderDetails(openRunData()); }, 4000); return; }
@@ -997,9 +1010,21 @@ async function saveSetting(el) {
 
 // ===================================================================== wiring
 function showView(name) {
-  for (const v of ["board", "settings"]) $(`#view-${v}`).hidden = v !== name;
+  for (const v of ["board", "discussions", "settings"]) $(`#view-${v}`).hidden = v !== name;
   document.querySelectorAll(".nav button").forEach((b) => (b.dataset.view === name ? b.setAttribute("aria-current", "page") : b.removeAttribute("aria-current")));
-  if (name === "settings") renderSettings(); else renderBoard();
+  if (name === "settings") renderSettings(); else if (name === "discussions") withDiscussions(renderDiscussions); else renderBoard();
+}
+// discussions.js (a deferred script after this one) defines the discussion globals; run `f` once it has loaded.
+function withDiscussions(f) {
+  if (typeof openDiscussion === "function") return f();
+  addEventListener("DOMContentLoaded", () => { if (typeof openDiscussion === "function") f(); }, { once: true });
+}
+// The sheet's labels: a run's ticket, or a discussion.
+function sheetLabels(discussion) {
+  const close = discussion ? "Close discussion view" : "Close ticket", details = discussion ? "Discussion details" : "Ticket details";
+  $("#rv-close").setAttribute("aria-label", close); $("#rv-close").title = `${discussion ? "Back to the list" : "Close"} (Esc)`;
+  $("#rv-details-btn").setAttribute("aria-label", details); $("#rv-details-btn").title = details;
+  $("#rv-details").setAttribute("aria-label", details);
 }
 function wire() {
   document.querySelectorAll(".nav button").forEach((b) => b.addEventListener("click", () => showView(b.dataset.view)));
@@ -1068,12 +1093,14 @@ async function boot() {
   wire();
   core.subscribe({}, onEvent); // empty filter: settings.changed only reaches unfiltered subscribers
   try {
-    const [projects, runs] = await Promise.all([core.listProjects(), core.listRuns()]);
+    const [projects, runs, discs] = await Promise.all([core.listProjects(), core.listRuns(), core.listDiscussions()]);
     ui.projects = projects;
     for (const r of runs) ui.runs.set(r.id, r);
+    for (const d of discs) ui.discs.set(d.id, d);
   } catch (e) { toast(String(e.message ?? e), "error"); }
   renderProjectFilter(); renderBoard();
-  const m = /^#run=(.+)$/.exec(location.hash);
+  const m = /^#run=(.+)$/.exec(location.hash), d = /^#disc=(.+)$/.exec(location.hash);
   if (m && ui.runs.has(decodeURIComponent(m[1]))) openRun(decodeURIComponent(m[1]), null);
+  else if (d) withDiscussions(() => { showView("discussions"); openDiscussion(decodeURIComponent(d[1])); });
 }
 boot();

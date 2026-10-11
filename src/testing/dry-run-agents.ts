@@ -4,6 +4,7 @@
 // helper that writes the QA run script); the reviewer really runs the test suite and the acceptance behaviours and
 // reports evidence it observed; the QA agent uses the product in the (fake) boat.dev VM and cites screenshots.
 // Round 1 of a new todo build deliberately ships without `remove`, so the first review fails for a real reason.
+// Before all that, the discussant talks the todo CLI through with the human and drafts the first ticket.
 import { call, calls, humanText, type Script, type ScriptContext, say } from "./scripted.ts";
 
 const delay = Number(process.env.DRYRUN_TURN_DELAY_MS ?? 0);
@@ -536,8 +537,67 @@ function reviewer(strict: boolean): Script {
 	};
 }
 
+// ------------------------------------------------------------------ discussant (a discussion before the first ticket)
+// The human starts a discussion about the todo CLI. The discussant replies to the first message, checks the empty
+// workspace with `ls` before answering the next one, searches the web before answering the one after, and on
+// "# Draft tickets" submits one ticket whose body is the request the §8 trial starts from.
+export const TODO_REQUEST = "CLI todo tool: add/list/done/remove, JSON file storage, tests";
+export const TODO_SUMMARY = `## Problem
+A small command-line tool to keep a todo list. There is no repo yet.
+
+## Settled
+- Commands: add, list, done, remove.
+- storage: one JSON file, no database.
+- Tests with Node's built-in node:test runner.
+
+## Rejected
+- SQLite: a native dependency and a binary file, for a list of a few dozen items.
+
+## Open
+- Where the JSON file lives (a fixed path, the current directory or an environment variable).
+- The Node.js version and whether third-party dependencies are allowed.
+`;
+
+export const discussant: Script = async (ctx) => {
+	if (/^(# Draft tickets|You stopped without calling submit_tickets)/.test(ctx.input)) {
+		if (ctx.results.some((r) => r.name === "submit_tickets" && !r.isError)) return say("I drafted one ticket.");
+		return slow(call("submit_tickets", { summary: TODO_SUMMARY, tickets: [{ title: "CLI todo tool", body: TODO_REQUEST }] }));
+	}
+	// the first input: the project context and the human's first message
+	return slow(say("A todo CLI is a good first product. Which commands do you need, and how much should storage do: a file, or a database?"));
+};
+
+// Human messages (`say`): the first is answered after an `ls` of the workspace, the second after a web search.
+discussant.onMessage = (ctx) => {
+	const side = ctx.side!;
+	const nth = ctx.human.length;
+	const text = humanText(side.message).trim();
+	if (nth === 1) {
+		if (side.turn === 0) return slow(call("bash", { command: 'ls -A; echo "files besides .git: $(ls -A | grep -vx .git | wc -l)"' }));
+		const empty = /files besides \.git: 0\b/.test(side.results.at(-1)?.text ?? "");
+		return slow(
+			say(
+				`I checked the workspace with \`ls\`: ${empty ? "it is empty, so this is a new repo" : "it already has files"}. For add/list/done/remove, one JSON file is enough: SQLite would add a native dependency and a binary file for a list of a few dozen items. Shall we settle on one JSON file?`,
+			),
+		);
+	}
+	if (nth === 2) {
+		if (side.turn === 0) return slow(call("web_search", { objective: "Is Node's built-in node:test runner stable enough to use for a small CLI's tests?", queries: ["node:test runner stable"] }));
+		const r = side.results.at(-1);
+		return slow(
+			say(
+				r && !r.isError
+					? `Settled: one JSON file. I searched the web, and the Node.js docs say: "${r.text.split("\n").find((l) => /^ {3}/.test(l) && !/^\s*https?:/.test(l))?.trim() ?? "node:test is stable"}" So the built-in runner is enough and the tool needs no dependencies. Still open: where the file lives, and the Node.js version. Ask me for draft tickets when you're ready.`
+					: `Settled: one JSON file. My web search failed (${r?.text.split("\n")[0] ?? "no result"}), so this is from memory: node:test is built into Node.js and stable. Still open: where the file lives, and the Node.js version.`,
+			),
+		);
+	}
+	return slow(say(side.turn === 0 ? `Noted: ${text.split("\n")[0]}` : "Done."));
+};
+
 export const DRY_RUN_SCRIPTS: Record<string, Script> = {
 	architect,
+	discussant,
 	builder,
 	helper,
 	qa,

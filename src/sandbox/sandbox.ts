@@ -39,6 +39,8 @@ type EnvRecord = {
 	credentials?: { envVars: string[]; files: string[] };
 	/** The run's `storage.path` (the harness database), denied with its -wal/-shm/-journal files (missing on older records). */
 	storage?: string;
+	/** Set by `dispose`; a later `provision` of the same environment (a reopened discussion) clears it. */
+	disposed?: boolean;
 };
 
 /**
@@ -323,7 +325,13 @@ export class Sandbox {
 		const root = expandHome(rc.config.workdir ?? "~/factory/work");
 		const envId = `${rc.runId}-${role}`;
 		const existing = existsSync(this.recordPath(envId)) ? this.load(envId) : undefined;
-		if (existing) return { envId, cwd: existing.cwd };
+		if (existing) {
+			if (existing.disposed) {
+				delete existing.disposed;
+				writeFileSync(this.recordPath(envId), JSON.stringify(existing, null, 2));
+			}
+			return { envId, cwd: existing.cwd };
+		}
 		const sb = rc.config.sandbox ?? {};
 		const rec: EnvRecord = {
 			envId,

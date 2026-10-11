@@ -28,6 +28,7 @@ import { addCost, sumUsage, type UsageSum } from "./usage.ts";
 import type {
 	CiStatus,
 	DeliveryContext,
+	DiscussionLink,
 	EscalationInfo,
 	Finding,
 	FindingResponse,
@@ -64,7 +65,8 @@ export interface CoreServices {
 }
 
 const MAX_NUDGES = 2;
-const WRITE_TOOLS: ToolRegistration[] = [createWriteTool() as ToolRegistration, createEditTool() as ToolRegistration];
+/** Removed from every role but the builder (and its helpers). */
+export const WRITE_TOOLS: ToolRegistration[] = [createWriteTool() as ToolRegistration, createEditTool() as ToolRegistration];
 
 class Cancelled extends Error {}
 
@@ -341,6 +343,21 @@ export function createRunTask(svc: CoreServices) {
 	// ------------------------------------------------------------------ prompts the core hands to roles (data, not guidance)
 	function architectFirstInput(d: RunDocState): string {
 		const ws = d.workspace!;
+		// Interfaces may pass any meta to startRun: read it defensively.
+		const disc = d.request.meta?.discussion as Partial<DiscussionLink> | undefined;
+		// The discussion the ticket was drafted in (discussions spec §2.3); without one, the input is unchanged.
+		const prior = disc
+			? [
+					`# Prior discussion`,
+					`The human discussed this with a model before writing the ticket ("${disc.title ?? ""}"). Its summary:`,
+					String(disc.summary ?? ""),
+					...(Array.isArray(disc.siblings) && disc.siblings.length > 0
+						? [`Other tickets drafted from the same discussion (out of scope here unless this ticket depends on them):`, ...disc.siblings.map((s) => `- ${s}`)]
+						: []),
+					`Treat points the summary marks as settled as settled; ask only about what is still open.`,
+					"",
+				]
+			: [];
 		return [
 			`# Request (${d.request.source})`,
 			`Title: ${d.request.title}`,
@@ -351,6 +368,7 @@ export function createRunTask(svc: CoreServices) {
 			`Project: ${d.project}; repo binding: ${d.repo} (${ws.newRepo ? "the repo does not exist yet: this is a new product" : "existing repo: this is an incremental change"}).`,
 			`Workspace (read-only for you): ${ws.path}${ws.newRepo ? " (empty)" : "; read AGENTS.md and docs/spec.md first if present"}.`,
 			"",
+			...prior,
 			"Discuss the architecture with the human, one question at a time (ask_human), then call submit_spec.",
 		].join("\n");
 	}

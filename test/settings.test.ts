@@ -3,6 +3,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import { ROLE_TOOLS } from "../src/agents/tools.ts";
+import { bridgeToolsNotFor } from "../src/core/bridge.ts";
 import { ConfigStore } from "../src/core/settings.ts";
 import { makeFactory, type TestEnv } from "./helpers.ts";
 
@@ -150,7 +151,7 @@ describe("settings layering", () => {
 	test("settingsSchema is the fixed core schema", async () => {
 		t = await makeFactory();
 		const schema = t.factory.settingsSchema();
-		expect(Object.keys(schema)).toEqual(["version", "workdir", "roles", "policy", "github", "ci", "sandbox", "qa", "boat", "web", "webSearch", "storage"]);
+		expect(Object.keys(schema)).toEqual(["version", "workdir", "roles", "discussion", "policy", "github", "ci", "sandbox", "qa", "boat", "web", "webSearch", "storage"]);
 		expect(Object.keys((schema.roles as any).fields)).toEqual(["architect", "builder", "helper", "reviewer", "qa"]);
 		expect(Object.keys((schema.boat as any).fields)).toEqual(["apiKey", "size", "ttl", "runScripts"]);
 		expect(Object.keys((schema.ci as any).fields)).toEqual(["mode", "fixRounds", "checks", "noChecksTimeout"]);
@@ -218,6 +219,26 @@ describe("settings layering", () => {
 		expect(s["roles.helper.thinking"]).toEqual({ value: "low", source: "default" });
 	});
 
+	test("discussion.model falls back to the architect's model and thinking; a project override wins", async () => {
+		t = await makeFactory();
+		const f = t.factory;
+		const eff = (s: { global: true } | { project: string }) => f.config.effective(s);
+		await f.createProject("p", "me/p");
+		// global: roles.architect = { model: scripted/architect, thinking: high }; the test config's discussion model removed
+		await f.unsetSetting({ global: true }, "discussion.model.model");
+		expect(eff({ global: true }).discussion.model).toEqual({ model: "scripted/architect", thinking: "high" });
+		await f.setSetting({ project: "p" }, "discussion.model.model", "scripted/builder");
+		expect(eff({ project: "p" }).discussion.model).toEqual({ model: "scripted/builder", thinking: "high" });
+		expect((await f.getSettings({ project: "p" }))["discussion.model.model"]).toEqual({ value: "scripted/builder", source: "project" });
+	});
+
+	test("discussion.model.model must be a known model; policy.messages cannot list discussant", async () => {
+		t = await makeFactory();
+		const f = t.factory;
+		await expect(f.setSetting({ global: true }, "discussion.model.model", "scripted/nope")).rejects.toThrow(/discussion\.model\.model: .* is not a model/);
+		await expect(f.setSetting({ global: true }, "policy.messages", ["discussant"])).rejects.toThrow(/expected one of/);
+	});
+
 	test("roles have fixed tool sets", async () => {
 		t = await makeFactory();
 		expect(Object.keys((t.factory.settingsSchema().roles as any).fields.builder.fields)).toEqual(["model", "thinking"]);
@@ -225,6 +246,9 @@ describe("settings layering", () => {
 		expect(ROLE_TOOLS.helper.map((e) => e.name)).toEqual(["role-helper", "coding", "test-runner", "web-search"]);
 		expect(ROLE_TOOLS.qa.map((e) => e.name)).toEqual(["role-qa", "coding-readonly", "computer", "web-search"]);
 		expect(ROLE_TOOLS.builder.map((e) => e.name)).toEqual(["role-builder", "coding", "subagent", "test-runner", "web-search"]);
+		expect(ROLE_TOOLS.discussant.map((e) => e.name)).toEqual(["role-discussant", "coding-readonly", "web-search"]);
+		expect(bridgeToolsNotFor("architect").map((t) => t.name)).toContain("submit_tickets");
+		expect(bridgeToolsNotFor("discussant").map((t) => t.name)).not.toContain("submit_tickets");
 	});
 
 	test("projects: createProject is idempotent, validates names and repo bindings, and rejects rebinding", async () => {

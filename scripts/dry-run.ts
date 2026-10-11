@@ -1,13 +1,17 @@
 // Dry trial of spec §8 through the web HTTP API: a daemonized `factory serve` (SQLite storage, sandbox ON unless DRYRUN_SANDBOX=0, a fake
 // GitHub on the local disk with a local CI runner, scripted agents) driven by `POST /api/op/<op>` calls and the
 // `GET /api/events` stream; `factory serve`, `web` and `stop` are the only CLI commands it runs. Every step names the
-// §8 item it exercises. Writes <dir>/report.md and exits non-zero if a check fails.
+// §8 item it exercises. The first ticket comes from a discussion (startDiscussion, two `say`s, requestDrafts,
+// updateDraft, createTicket); the discussant's web_search goes to a fake Parallel endpoint served here.
+// Writes <dir>/report.md and exits non-zero if a check fails.
 //
 //   npm run dry-run                  # fresh dir under /tmp
 //   DRYRUN_DIR=/tmp/x npm run dry-run
 //   DRYRUN_SANDBOX=0 npm run dry-run   # where the sandbox runtime can't run (e.g. no socat on Linux)
 import { execFile } from "node:child_process";
 import { appendFileSync, createWriteStream, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -15,7 +19,8 @@ import YAML from "yaml";
 import { fieldAt } from "../src/core/settings.ts";
 import { daemonFiles, livePid } from "../src/daemon.ts";
 import { LocalGitHubHost } from "../src/github/host.ts";
-import type { FactoryEvent, RunView, Scope, SettingField, TranscriptView } from "../src/core/types.ts";
+import { TODO_REQUEST } from "../src/testing/dry-run-agents.ts";
+import type { DiscussionLink, DiscussionView, FactoryEvent, RunView, Scope, SettingField, TranscriptView } from "../src/core/types.ts";
 
 const pexec = promisify(execFile);
 const ROOT = resolve(import.meta.dirname, "..");
@@ -26,6 +31,26 @@ const GH = join(DIR, "github");
 const BIN = join(ROOT, "bin/factory");
 const ME = "me";
 const SANDBOX = process.env.DRYRUN_SANDBOX !== "0";
+
+// A stand-in for Parallel's Search API, so the discussant's web_search gets a result without leaving the machine.
+const searches: unknown[] = [];
+const searchServer = createServer((req, res) => {
+	let body = "";
+	req.on("data", (c) => (body += c));
+	req.on("end", () => {
+		searches.push(JSON.parse(body || "{}"));
+		res.writeHead(200, { "content-type": "application/json" });
+		res.end(
+			JSON.stringify({
+				search_id: `dry-${searches.length}`,
+				results: [{ url: "https://nodejs.org/api/test.html", title: "Test runner | Node.js documentation", excerpts: ["The node:test module facilitates the creation of JavaScript tests. Stability: 2 - Stable."] }],
+			}),
+		);
+	});
+});
+await new Promise<void>((r) => searchServer.listen(0, "127.0.0.1", r));
+searchServer.unref();
+const SEARCH_ENDPOINT = `http://127.0.0.1:${(searchServer.address() as AddressInfo).port}/v1beta/search`;
 
 writeFileSync(
 	CONFIG,
@@ -39,6 +64,11 @@ roles:
   helper: { model: scripted/helper }
   reviewer: { model: scripted/reviewer }
   qa: { model: scripted/qa }
+discussion:
+  model: { model: scripted/discussant }
+webSearch:
+  apiKey: env:DRYRUN_SEARCH_KEY
+  endpoint: ${SEARCH_ENDPOINT}
 qa:
   enabled: true
 boat:
@@ -75,7 +105,7 @@ async function factory(...args: string[]): Promise<string> {
 	try {
 		const { stdout, stderr } = await pexec(BIN, args, {
 			cwd: DIR,
-			env: { ...process.env, NO_COLOR: "1", DRYRUN_BOAT_KEY: "fake-boat-key", DRYRUN_TURN_DELAY_MS: process.env.DRYRUN_TURN_DELAY_MS ?? "250" },
+			env: { ...process.env, NO_COLOR: "1", DRYRUN_BOAT_KEY: "fake-boat-key", DRYRUN_SEARCH_KEY: "fake-search-key", DRYRUN_TURN_DELAY_MS: process.env.DRYRUN_TURN_DELAY_MS ?? "250" },
 			maxBuffer: 64 << 20,
 		});
 		appendFileSync(join(DIR, "serve.log"), `$ factory ${args.join(" ")}\n${stdout}${stderr}`);
@@ -205,6 +235,26 @@ async function until(run: string, pred: (v: RunView) => boolean, what: string, m
 		await sleep(150);
 	}
 }
+async function untilDiscussion(id: string, pred: (d: DiscussionView) => boolean, what: string, ms = 60_000): Promise<DiscussionView> {
+	const t0 = Date.now();
+	for (;;) {
+		const d = await api<DiscussionView>("getDiscussion", id);
+		if (pred(d)) return d;
+		if (d.state === "FAILED") throw new Error(`discussion ${id} FAILED while waiting for ${what}: ${d.error ?? ""}`);
+		if (Date.now() - t0 > ms) throw new Error(`timeout waiting for ${what}; discussion is ${d.state}${d.turn ? `, ${d.turn.kind} turn running` : ""}`);
+		await sleep(150);
+	}
+}
+/** Sends a human message to a discussion and waits for the turn it starts to end. */
+async function discuss(id: string, text: string): Promise<DiscussionView> {
+	say(`  human says: ${text}`);
+	await api("say", id, text);
+	const d = await untilDiscussion(id, (x) => !x.turn, "the reply");
+	const reply = (await api<TranscriptView>("getDiscussionConversation", id)).items.filter((i: any) => i.role === "assistant" && i.text).at(-1)?.text ?? "";
+	say(`  discussant replies: ${reply}`);
+	return d;
+}
+
 const pendingKind = (v: RunView, kind: string, gate?: string) =>
 	v.pendingAsk?.question.kind === kind && (!gate || (v.pendingAsk.question as any).gate === gate);
 
@@ -246,10 +296,47 @@ async function main() {
 	const host = new LocalGitHubHost(GH); // the driver's view of the fake GitHub (state file + bare remotes)
 
 	// ---------------------------------------------------------------- §8.1 zero-to-MVP
-	section("§8.1 zero-to-MVP: createProject todo → me/todo and startRun (repo does not exist)");
+	section("§8.1 zero-to-MVP: createProject todo → me/todo, a discussion, then a ticket from its draft (repo does not exist)");
 	await api("createProject", "todo", `${ME}/todo`);
-	const run1 = await startRun("todo", "CLI todo tool", "CLI todo tool: add/list/done/remove, JSON file storage, tests");
-	say(`  run ${run1}`);
+	const first = "I'd like a small command-line todo tool, but I'm not sure how much it should do.";
+	say(`  human starts a discussion: ${first}`);
+	const disc = await api<string>("startDiscussion", "todo", { title: "A todo CLI", message: first });
+	say(`  discussion ${disc}`);
+	await untilDiscussion(disc, (d) => d.state === "OPEN" && !d.turn, "the discussion to open and reply");
+	await discuss(disc, "add, list, done and remove. Keep storage as simple as possible.");
+	const open = await discuss(disc, "One JSON file is fine. Are Node's built-in tests good enough, or do we need a framework?");
+	const items = (await api<TranscriptView>("getDiscussionConversation", disc)).items as any[];
+	const humans = items.flatMap((i, k) => (i.author === "human" ? [k] : []));
+	const answered = humans.filter((h, k) => items.slice(h + 1, humans[k + 1] ?? items.length).some((i) => i.role === "assistant" && i.text));
+	const ranOk = (name: string) => items.some((i) => i.toolResult?.name === name && !i.toolResult.isError);
+	check(
+		"discussion reached OPEN and answered both messages (after an ls, then a web search)",
+		open.state === "OPEN" && open.notices.length === 0 && humans.length === 2 && answered.length === 2 && ranOk("bash") && ranOk("web_search") && searches.length === 1,
+		`state ${open.state}; human messages ${humans.length}, answered ${answered.length}; bash ${ranOk("bash")}, web_search ${ranOk("web_search")} (${searches.length} searches); notices ${JSON.stringify(open.notices)}`,
+	);
+	say("  human asks for draft tickets");
+	await api("requestDrafts", disc);
+	const drafted = await untilDiscussion(disc, (d) => !d.turn && (d.drafts.length > 0 || d.notices.length > 0), "the drafts");
+	const draft = drafted.drafts[0];
+	check(
+		"drafts submitted with a summary",
+		drafted.drafts.length === 1 && draft?.body === TODO_REQUEST && !draft.edited && /## Settled[\s\S]*storage: one JSON file/.test(drafted.summary ?? ""),
+		JSON.stringify({ summary: drafted.summary, drafts: drafted.drafts, notices: drafted.notices }),
+	);
+	if (!draft) throw new Error("no draft to create the ticket from");
+	const added = "The list must survive between invocations.";
+	say(`  human edits draft ${draft.id}: appends "${added}"`);
+	await api("updateDraft", disc, draft.id, { body: `${draft.body}\n\n${added}` });
+	const run1 = await api<string>("createTicket", disc, draft.id);
+	say(`  createTicket → run ${run1}`);
+	const req1 = (await status(run1)).request;
+	const link1 = req1.meta?.discussion as DiscussionLink | undefined;
+	const linked = (await api<DiscussionView>("getDiscussion", disc)).drafts.find((x) => x.id === draft.id);
+	check(
+		"the run's request came from the discussion (source, meta)",
+		req1.source === "discussion" && req1.title === draft.title && req1.body === `${TODO_REQUEST}\n\n${added}` && link1?.id === disc && link1.draftId === draft.id && link1.title === "A todo CLI" && link1.summary === drafted.summary && linked?.runId === run1 && linked.edited,
+		JSON.stringify({ request: req1, draft: linked }),
+	);
 	check("repo did not exist before the run", !existsSync(join(GH, "remotes", ME, "todo.git")) || !host.state().created.includes(`${ME}/todo`));
 	const answers1 = ["Node.js 22, no third-party dependencies; use the built-in node:test runner.", "Configurable with the TODO_FILE environment variable, default ./todo.json."];
 	let rejected = false;
@@ -267,7 +354,10 @@ async function main() {
 			return false;
 		},
 	});
-	check("discussion asked two questions, one at a time", (await transcript(run1, "architect")).items.filter((i: any) => i.toolCalls?.some((t: any) => t.name === "ask_human")).length === 2);
+	const trA = await transcript(run1, "architect");
+	const archIn = (trA.items.find((i: any) => i.role === "user") as any)?.text ?? "";
+	check("the architect's first input carried the discussion summary", /# Prior discussion/.test(archIn) && archIn.includes(drafted.summary!.trim()) && archIn.includes("A todo CLI"), archIn.slice(0, 1500));
+	check("discussion asked two questions, one at a time", trA.items.filter((i: any) => i.toolCalls?.some((t: any) => t.name === "ask_human")).length === 2);
 	check("spec v2 after the rejection carries the feedback", (await status(run1)).artifacts.spec!.version === 2 && /todo\.json/.test((await status(run1)).artifacts.spec!.text));
 
 	// §8.3 kill the process mid-build

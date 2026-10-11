@@ -102,7 +102,7 @@ leaves open, and the places where the code still differs from it.
     - **Spec:** every stage (intake, interface, repo, delivery, environment) is an extension selected by `stages.<kind>.use`, and each role's worker extensions are chosen in its settings (§3.2, §3.3, §5, §6).
     - **Built:** the core calls a `GitHub` class and a `Sandbox` class directly; the web UI is the only interface; each role has a fixed tool set; settings live at `workdir`, `github.*`, `ci.*`, `sandbox.*`, `web.*` and `webSearch.*`. `factory serve` runs in the background, and `stop`, `status`, `web` and `doctor` are the only other commands.
     - **Why:** every stage had exactly one implementation, so the pluggability added contracts, lookups, schema merging and docs without buying anything.
-    - *(Since then, `factory setup` was added as a further command; see 36–42.)*
+    - *(Since then, `factory setup` was added as a further command; see 52–58.)*
 
 ## AQ testing and helpers that write (§2, §3.7, §9, §9.1 — added after the fixed architecture)
 
@@ -115,34 +115,64 @@ leaves open, and the places where the code still differs from it.
 34. **Helpers write code** in the builder's environment (its worktree, scratch dir and write rules). No helper environment is provisioned for new runs. `roles.helper` has no defaults; unset, it takes the builder's effective model and thinking (shown with source `default`).
 35. **Combined round verdict.** The reviewer and the QA agent run in parallel (`Promise.allSettled`); the round fails if either submitted a blocking finding. Findings are numbered across both (`F1…`), logged as separate `review` and `qa` entries with the same `reviewSeq`, and the next round's reviewer and QA agent each see only their own prior findings plus the builder's responses.
 
+## Discussions (added after AQ testing)
+
+The [discussions spec](docs/superpowers/specs/2026-10-11-discussion-flow-design.md) adds a chat with one model about
+one project before any ticket exists. The entries below are where the code differs from it, or from the design spec
+because of it.
+
+36. **Discussions may cover product questions.** Design spec §1 says "the discussion covers architecture only". That still holds for the architect's discussion inside a run. A discussion is a separate, optional step before a ticket, and the discussant's prompt invites product questions as well as technical ones.
+37. **The `# Prior discussion` section drops the sibling line when there are no siblings.** Discussions spec §2.3 shows "Other tickets drafted from the same discussion (out of scope here unless this ticket depends on them):" unconditionally. When the draft was the only ticket of its submission, that line and its empty list are left out: an empty list tells the architect nothing. Siblings are the other drafts of the same `submit_tickets` submission, which `Draft.batch` records.
+38. **Labels in the discussion view.**
+    - The header's action reads **Close discussion**, not **Close**.
+    - The sheet's exit button (the run view's close button, top right) reads **Close discussion view**. "Close discussion" was already taken by the header action, which closes the discussion itself; two controls with the same name would be ambiguous to screen readers and tests.
+    - The first input (the project context and the human's first message) shows as a factory card addressed to the discussant, as the model saw it, not as a message bubble from you.
+39. **`GET /api/events` takes `?discussion=<id>`.** Discussions spec §2.1 says the event stream needs no change. It passes `run`, `project` and now `discussion` to `subscribe`, so the UI can follow one discussion.
+40. **Stop is asynchronous.** Spec §1.2: `stopTurn` aborts, clears `turn` and adds the notice. Built: `stopTurn` marks the turn as stopped and aborts the Conversation's work; the discussion Task clears `turn` and adds the `stopped` notice ("Stopped by <who>") once that work has ended. Right after `stopTurn` returns, a `say` can still be refused for a moment. `stopTurn` aborts only while the stopped turn is still the one running, so a late Stop doesn't abort the next turn (a tiny window remains between that check and the abort).
+41. **Close and reopen wait for the discussion Task.** `closeDiscussion` waits up to 10 s for the discussion's Task to end, so a reopen can follow at once. `reopenDiscussion` and `retryDiscussion` are refused with `conflict` ("still finishing") while the previous Task is still running.
+42. **The checkout is on a local branch.** Spec §1.4 says a worktree of the default branch. Built: a worktree on branch `factory/<discussion id>`, started (or restarted, if the branch is left over) from the default branch and resynced to `origin/<default>` on reopen and retry (`GitHub.refresh`, see 45). If the discussion started before its repo existed and the repo exists at reopen, the empty workspace is replaced by a checkout of the repo.
+43. **Small additions to the spec's types and checks.**
+    - `DiscussionView.cost` is `{ usd, totalTokens }`, not the whole `UsageSum`.
+    - Each notice carries the `turn` it belongs to, so the UI can place it after that turn.
+    - `updateDraft` refuses an empty change and a title over 200 characters (the `submit_tickets` limit). Drafts can be edited and deleted in a `CLOSED` discussion and during a `say` turn; only a `draft` turn locks them.
+    - A model error during a `draft` turn ends it with an `error` notice and no reminders.
+44. **`factory doctor` doesn't check `discussion.model`.** It checks the role models. A `discussion.model.model` the factory doesn't know is still refused on save and at `startDiscussion`.
+45. **Reopen resyncs the checkout instead of fast-forwarding it** (changed after the final review; the spec was amended to match). The first design fast-forwarded the checkout on reopen and failed the discussion when it couldn't, so a deleted checkout, a force-pushed default branch or a stray local change (possible only with the sandbox off) made every Retry fail the same way. Because the checkout is read-only by design, `GitHub.refresh` now resets it to `origin/<default>` (`checkout -f -B`) and cleans untracked files; a missing checkout, manifest or clone, or a worktree git can't reset, is made again with `GitHub.open`. Only a git failure such as a missing remote fails the discussion, with git's message. Cost: a local change in the checkout is discarded on reopen. `GitHub.open` also ignores a manifest whose repo differs from the one asked for (a discussion id reused after the factory's storage was reset) and makes the checkout again.
+46. **`createTicket` works in every discussion state** except while a `draft` turn runs (spec §2.1 first allowed only `OPEN` and `CLOSED`; amended). A run never depends on the discussion, so a `FAILED` or `PREPARING` discussion must not strand its drafts.
+47. **A redraft is told about earlier drafts** (spec §2.2 amended). The drafting input lists the drafts that already became tickets (title and run id, "do not re-submit these") and the current drafts' texts, marking the ones the human edited, so the model doesn't re-submit a ticket that is already a run and can keep the human's edits. The submission still replaces every draft that hasn't become a run.
+48. **The next turn after a changed checkout carries a factory note** (spec §1.4 amended). When a reopen or retry moved the checkout to another commit, or the repo now exists where the workspace was empty, the next turn tells the model: in a `say` turn the note is in the message's header after the sender (the UI still shows the human's text alone); in a `draft` turn it is a `# Factory note` section at the end of the drafting input.
+49. **The discussant's environment is disposed when the discussion leaves `OPEN`** (closed or failed), as a run's environments are when it ends, so its allowed domains leave the process-wide network allowlist. A reopen or retry provisions it again (`Sandbox.provision` reuses the record and clears its `disposed` mark).
+50. **`discussion.updated {what: "drafts"}` carries `submission: true` for a new submission.** Edits and deletes emit the same event without it, so interfaces refresh on both but only announce new drafts (the web UI's "Draft tickets are ready" toast).
+51. **`states` filters are checked.** `listRuns` and `listDiscussions` refuse a `states` filter that isn't an array of known states with `invalid` (a string used to match by substring and a number gave HTTP 500).
+
 ## Setup and model providers (added after AQ testing; [setup spec](docs/superpowers/specs/2026-10-11-setup-flow-design.md))
 
-36. **pi-coding-agent as the model host.** The factory now depends on `@earendil-works/pi-coding-agent@1.1.0` (pinned; it depends on the same `pi-ai ^1.1.0`, so there is one copy of pi-ai).
+52. **pi-coding-agent as the model host.** The factory now depends on `@earendil-works/pi-coding-agent@1.1.0` (pinned; it depends on the same `pi-ai ^1.1.0`, so there is one copy of pi-ai).
     - **Spec:** the core receives `createModels()` with pi-ai's providers "straight from Pi" (§3), and a role's `model` is one that `createModels()` knows (§6).
     - **Built:** `createModelHost` (`src/models/host.ts`) runs pi-coding-agent's services over `<factory home>/pi`, with that directory as `cwd` too, so nothing is read from `~/.pi/agent` or from a `.pi/` directory where `serve` starts. `Factory` receives the `ModelRuntime` as its `Models` and is otherwise unchanged. Only what extensions register as **providers and virtual models** is used; their tools, commands, flags and event hooks attach to pi-coding-agent sessions, which the factory never creates, and each role's tool set stays fixed (27).
     - **Why:** pi-durable takes a pi-ai `Models` object and has no extension or package loader. Provider packages, `models.json` endpoints and stored logins (API key or OAuth, with locking and refresh in `auth.json`) are pi-coding-agent's: its `DefaultPackageManager` installs packages, its resource loader runs their extensions, and its `ModelRuntime` combines all of them into one `Models`. Using it avoids reimplementing that, and keeps the formats `pi` users know.
     - **Cost:** extensions are loaded and **run in-process**, outside the sandbox, with access to the factory's credentials. `factory setup` shows a warning and asks before it installs a package. Extension load errors are diagnostics (`serve` logs them, `doctor` warns), never a failed start. New packages and `models.json` changes need a restart; credentials apply live.
-37. **A failed login offers Retry / Skip, not Save anyway.**
+53. **A failed login offers Retry / Skip, not Save anyway.**
     - **Spec:** a check that fails, a failed login included, always offers Retry / Save anyway / Skip (§3.4, §5).
     - **Built:** a failed login, and a failed save of a compatible endpoint's key, offer **Retry** / **Skip**. A missing `gh` in the `github` section does too. Failed verifications (`GET /user`, missing token scopes, the App token, boat, the Parallel test search, the endpoint test call) offer all three.
     - **Why:** a login that failed stored nothing, so there is nothing to save anyway.
-38. **A rejected setting is not asked again, except in `roles`.**
+54. **A rejected setting is not asked again, except in `roles`.**
     - **Spec:** when validation rejects a value, setup shows the message and prompts again; the file is unchanged (§3.3, §5).
     - **Built:** `roles` offers **Retry**, which asks again for the roles the error names, or **Skip**. `github` puts back the secrets it just stored, shows the error with `fix the problem (e.g. factory setup roles), then run factory setup github`, and returns; the wizard goes on to the next section. `prereqs`, `qa` and `search` show the error and return. The config file is unchanged in every case.
     - **Why:** the config is validated as a whole, so outside `roles` a rejection is about another setting (for example a role model pi doesn't know); asking the same question again can't fix it.
-39. **A package install shows no spinner.**
+55. **A package install shows no spinner.**
     - **Spec:** `packages.install(source)` with a progress spinner (§3.4).
     - **Built:** setup prints a plain `Installing <source>…` line, and npm's and git's output streams to the terminal.
     - **Why:** pi runs npm and git with the terminal inherited, so their output would garble a spinner's animation.
-40. **Package removal and re-installs.**
+56. **Package removal and re-installs.**
     - **Spec:** removing a package is refused while a role uses a provider it supplied; a package that registers no provider is offered for removal (§3.4).
     - **Built:** setup records the providers each package it installs adds, in `pi/factory-packages.json`, and the in-use refusal applies to those. A package installed another way gets a confirm instead: `setup can't tell which providers <source> supplies; remove it anyway?` (default No). Installing the same package at another version or ref replaces it (pi's own behaviour); setup then warns about providers it no longer supplies and never offers removal. Removal is offered only for a new source that registers no provider.
     - **Why:** pi doesn't record which providers a package registered, and removing the replaced package would bypass the in-use refusal.
-41. **Additions to the wizard** (none relax the spec):
+57. **Additions to the wizard** (none relax the spec):
     - **Credentials the service won't see.** Before installing the service, setup lists the credentials the factory would read from the environment (`env:` refs that resolve, providers whose key pi reads from an env var), since the unit or plist sets only `PATH`, and asks `Install the service anyway?` (default Yes). The `Keep env:…` options in `github`, `qa` and `search` carry the hint `not seen by a service`.
     - **The outro.** The spec ends with the link "if the service is running, else `next: factory serve`" (§3.1). Setup shows the link whenever the factory runs and has written it, and `the service is starting; factory web prints the link` when the service is active but has not written it yet.
     - **Endpoint keys.** Adding a compatible endpoint first deletes a credential left under its id, and removing one deletes its key from `auth.json` unless a provider with that id remains (a built-in or package provider the entry overrode).
-42. **The sandbox re-exposes the environment's own paths inside the factory home.**
+58. **The sandbox re-exposes the environment's own paths inside the factory home.**
     - **Spec:** the sandbox always denies the factory home (`dirname(configPath)`) (§2.3).
     - **Built:** it still denies the whole home, but re-exposes the environment's own worktree, git directory, scratch dir and `extraWrite` paths when they lie inside it. `secrets.json`, `pi/`, `web-token`, `web-url`, `factory.log`, `factory.sqlite*`, `environments/` and `qa-vms/` are denied regardless, as is the `storage.path` database. A write root at, inside or around the home (or around the database) is dropped, and `extraWrite` rejects one at config time.
     - **Why:** a `workdir` inside the factory home (a custom `--config` layout, or the dry run) otherwise hid the agents' own worktrees from them.

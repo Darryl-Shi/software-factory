@@ -1,8 +1,9 @@
 # Architecture
 
-This page covers how the code is organised and how a run flows through it. [`design-spec.md`](design-spec.md) is the
-design the code implements, as amended by the
-[fixed architecture cleanup](superpowers/specs/2026-10-09-fixed-architecture-cleanup-design.md), and
+This page covers how the code is organised and how a run, and a discussion before it, flow through it.
+[`design-spec.md`](design-spec.md) is the design the code implements, as amended by the
+[fixed architecture cleanup](superpowers/specs/2026-10-09-fixed-architecture-cleanup-design.md) and extended by
+[discussions](superpowers/specs/2026-10-11-discussion-flow-design.md), and
 [`../DEVIATIONS.md`](../DEVIATIONS.md) lists every place the code differs from them.
 
 ## Core and its backends
@@ -12,21 +13,24 @@ design the code implements, as amended by the
                  │  operations ▲ events
                  ▼             │
         ┌──────────────── FactoryCore (src/core) ────────────────┐
-        │ state machine (Pi Durable Task) · bridge · projects ·  │
-        │ layered settings · durable pending asks                │
+        │ run and discussion state machines (Pi Durable Tasks) · │
+        │ bridge · projects · layered settings · pending asks    │
         └───┬──────────────────────┬─────────────────────┬───────┘
             ▼                      ▼                     ▼
          GitHub                 Sandbox             role Conversations (fixed tools)
     (src/github: GhApiHost   (src/sandbox:         architect · builder (+ helpers) · reviewer
-     or LocalGitHubHost)      sandbox-runtime)     (src/agents)
+     or LocalGitHubHost)      sandbox-runtime)     · qa · discussant (src/agents)
 ```
 
 **The core** (`src/core/`) is model-free and knows nothing about the web UI.
 - `run-task.ts` is the state machine: one phase per run state, running as a Pi Durable Task.
 - `run-doc.ts` defines the `factory.run` Document. It holds the run's state, counters, pending ask, artifacts,
   findings log, cost records and pinned config.
-- `bridge.ts` holds the tools agents use to hand results to the core: `ask_human`, `submit_spec`, `report_done` and
-  `submit_review`. `findings.ts` validates what agents submit through them.
+- `discussion-task.ts` is the discussion's state machine, a second kind of Pi Durable Task beside the run's, and
+  `discussion-doc.ts` defines its `factory.discussion` Document: state, the turn in progress, drafts, summary,
+  notices, turn costs and pinned config (see [Discussions](#discussions)).
+- `bridge.ts` holds the tools agents use to hand results to the core: `ask_human`, `submit_spec`, `report_done`,
+  `submit_review`, `submit_qa` and `submit_tickets`. `findings.ts` validates what agents submit through them.
 - `messages.ts` decides who a human message goes to and when (`message`), and builds what the agent sees.
   `usage.ts` turns Conversation usage into cost records without counting a turn twice.
 - `run-config.ts` is the `factory.runConfig` Document that carries a run's pinned `webSearch` settings to the
@@ -50,7 +54,7 @@ not selectable: `ROLE_TOOLS` in `tools.ts` gives each role a fixed set, after it
 | Tool set | Provides | Roles |
 |---|---|---|
 | `coding` | read, write, edit and bash tools | builder, helper |
-| `coding-readonly` | read and bash tools | architect, reviewer, qa |
+| `coding-readonly` | read and bash tools | architect, reviewer, qa, discussant |
 | `subagent` | helpers (which write code) as owned Conversations | builder |
 | `test-runner` | `run_tests` | builder, helper, reviewer |
 | `computer` | the Cua Driver in the QA VM; every screenshot is stored as a run artifact | qa |
@@ -181,12 +185,58 @@ Any non-terminal state ──cancel──► CANCELLED;  errors → FAILED;  ret
    - **Gate rejections.** Rejecting the delivery or merge gate sends the human's feedback to the builder as blocking
      findings with `source: "human"`. This doesn't use up a review round or a CI fix round.
 
+## Discussions
+
+A discussion is a chat with one model, the **discussant**, about one project, before any ticket exists. It is optional:
+Create still starts a run directly. It runs as its own Pi Durable Task (`createDiscussionTask`), beside the run Tasks
+and on the same services, and never appears on the board.
+
+```
+PREPARING ──ok──► OPEN ──closeDiscussion──► CLOSED ──reopenDiscussion──► PREPARING
+    └──error──► FAILED ──retryDiscussion──► PREPARING
+```
+
+1. **Preparing.** `GitHub.open` makes a checkout of the project's repo under `<workdir>/discussions/<id>` (an empty
+   workspace if the repo doesn't exist yet), and `Sandbox.provision` gives the `discussant` role the architect's
+   rules: the worktree is read-only, its scratch dir is writable, setup scripts don't run. The first time, the core
+   creates the discussion's one Conversation with the pinned model and submits the project context followed by the
+   human's first message. A reopen or retry keeps the Conversation and resyncs the checkout (`GitHub.refresh`):
+   the checkout is read-only, so it is reset to `origin/<default>` and cleaned rather than merged, which survives a
+   force-pushed default branch or stray local changes. A missing checkout, manifest or clone is made again with
+   `GitHub.open`, as is a new-repo workspace whose repo now exists. Only a git failure (e.g. the remote is gone)
+   fails the discussion. When the checkout changed (another head, or the repo now exists), the next turn's input
+   carries a short factory note saying so. Leaving `OPEN` (close or failure) disposes the discussant's environment,
+   as a run's end does; a reopen or retry provisions it again.
+2. **Turns.** One at a time. `say` submits the human's text as a message; the turn ends when the model stops.
+   `requestDrafts` submits drafting instructions; the turn ends when the model calls `submit_tickets`, after up to
+   2 reminders. `stopTurn` asks for the turn to stop and aborts the Conversation's work; it returns at once, and the
+   discussion Task clears the turn and adds the `stopped` notice when that work has ended. A stopped turn is not
+   resumed. A provider error ends the turn with a notice and leaves the discussion `OPEN`.
+3. **Drafts.** A valid `submit_tickets` sets the summary and replaces the drafts that haven't become runs. A redraft's
+   input lists the drafts that already became tickets (title and run, not to be submitted again) and the current
+   drafts' texts, with the human's edits marked, so the model builds on them. The human edits or deletes drafts with
+   `updateDraft` and `deleteDraft`.
+4. **Handoff.** `createTicket` works in any discussion state, except while a `draft` turn runs; it creates the run and
+   records the draft's `runId` in one commit, through the same helper
+   as `startRun`, so a crash can't leave one without the other. The run's request has `source: "discussion"` and a
+   copy of the link in `meta.discussion` (discussion id and title, draft id, summary, the titles of the other drafts
+   of the same submission). The run never reads the discussion again. Its architect gets a `# Prior discussion`
+   section with the summary and those titles, and still runs its own discussion, which the summary should make
+   shorter.
+
+The discussant's tools are `coding-readonly` and `web-search`; `submit_tickets` is its only bridge tool, accepted
+only during a `draft` turn. It can't be messaged through `message`: the human talks to it with `say`.
+
 ## Durability
 
 - **One Pi Durable Task per run** (task `factory.run`). Each phase does its side effects and then commits a
   *transition*: the `factory.run` Document and the task checkpoint are written atomically. After a crash, the task
   resumes at the last committed phase. `test/durability.test.ts` checks this with `kill -9` at two points (mid-build
   and at a pending approval), followed by a reopen.
+- **One Pi Durable Task per discussion.** A pending `PREPARING` runs again after a crash; a turn in progress resumes
+  waiting on its Conversation; a `submit_tickets` that was recorded but not applied is applied once. Turn inputs are
+  submitted with the request ID `<id>:turn<n>`. `test/durability.test.ts` kills the factory mid-turn, mid-draft and
+  right after `createTicket`.
 - **Agent work is idempotent.** Input to a role Conversation is submitted with a request ID derived from the run,
   phase and sequence number, such as `<run>:BUILDING:<n>`. A resumed phase therefore reattaches to the same turn
   instead of submitting it twice. The builder Conversation persists across rounds, so its context survives fix
@@ -223,23 +273,34 @@ server is its transport.
     right after that input.
   - At the spec gate the architect may revise the spec (`submit_spec`), which replaces the version waiting for
     approval. If the builder changes files after the review, delivery first sends the run back through review.
+- **Discussions:** `startDiscussion`, `getDiscussion`, `listDiscussions`, `getDiscussionConversation`, `say`,
+  `stopTurn`, `requestDrafts`, `updateDraft`, `deleteDraft`, `createTicket`, `closeDiscussion`, `reopenDiscussion`,
+  `retryDiscussion`. An operation in the wrong state is refused with `conflict`, naming the state.
+- **Filters:** `listRuns` and `listDiscussions` take `{ project?, states? }`; `states` must be an array of known
+  states, else the call is refused with `invalid`.
 - **Settings:** `settingsSchema`, `getSettings`, `setSetting`, `unsetSetting`.
-- **Events:** `subscribe(filter, on)`. A filter can select a project or a run. Event types:
+- **Events:** `subscribe(filter, on)`. A filter can select a project, a run or a discussion; a project filter matches
+  both run and discussion events. Event types:
   - `run.state`: a state transition.
   - `run.ask`: a question, approval or escalation is pending.
   - `run.askResolved`: carries `by`, who answered (`web` for the web UI).
   - `run.notice`: progress and the final result.
   - `conversation.updated`: a role transcript changed.
   - `run.message`: a message was sent, and again once it was handed to a Conversation.
+  - `discussion.state`: a discussion's state transition.
+  - `discussion.updated`: a turn started or ended, drafts were submitted (`submission: true`) or edited, a ticket was
+    created, or a notice was added.
+  - `discussion.conversation.updated`: the discussion's transcript changed.
   - `settings.changed`
 
 `main.ts` gives the web server the handle `Factory.as("web")`, so the answers and messages it sends are attributed to
 `web`. The operations it may call are listed in `CORE_OPS` (`src/core/types.ts`).
 - The web server (`startWebServer` in `src/web/server.ts`) maps them onto HTTP on localhost: `POST /api/op/<op>` with
-  `{ args }`, and `subscribe` as server-sent events at `/api/events`.
+  `{ args }`, and `subscribe` as server-sent events at `/api/events` (`?run=`, `?project=`, `?discussion=`).
 - It also serves the UI: a board whose columns are pipeline stages, a full-screen run view with the run's
-  conversations, a chat box addressed by `message`, and approvals in a card that floats over the transcript, and a
-  Settings form generated from `settingsSchema()`. The UI only calls these operations; it has no state of its own
+  conversations, a chat box addressed by `message`, and approvals in a card that floats over the transcript, a
+  Discussions tab whose discussion view reuses the run view's sheet with a drafts panel, and a Settings form
+  generated from `settingsSchema()`. The UI only calls these operations; it has no state of its own
   beyond a cache.
 
 ## The process
@@ -266,7 +327,7 @@ server is its transport.
   the worktree.
 - **Every agent command runs inside `@anthropic-ai/sandbox-runtime`.**
   - Each role has its own write rules. The builder and its helpers can write the worktree and scratch dir; the
-    architect and reviewer are read-only. The QA agent runs in a boat.dev VM (created with `noEnv`), not here.
+    architect, reviewer and discussant are read-only (they can write only their scratch dir). The QA agent runs in a boat.dev VM (created with `noEnv`), not here.
   - `denyRead` hides secret paths.
   - Network access goes through an allowlist.
   - Commands start from an empty environment, so no credential env vars reach them.

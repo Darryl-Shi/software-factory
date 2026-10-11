@@ -71,6 +71,18 @@ describe.skipIf(!available)("Sandbox (bubblewrap)", () => {
 		expect((await exec(reviewer, 'echo x > "$HOME/scratch.txt" && echo x > "$TMPDIR/t.txt" && echo "$TMPDIR" && echo OK')).out).toMatch(/scratch\/r1-reviewer\/tmp\nOK/);
 	});
 
+	test("the discussant cannot write the worktree with bash but can write its scratch dir", async () => {
+		const p = await sandbox.provision(ws, "discussant", { runId: "r1", config: { workdir, sandbox: settings.sandbox } });
+		const discussant = sandbox.env({ conversationId: "c3", envId: p.envId });
+		// it reads the repo and runs commands in it
+		expect((await exec(discussant, "cat scripts/setup.sh")).out).toContain("setup-ran");
+		const rb = await exec(discussant, "echo x > discussant.txt");
+		expect(rb.code).not.toBe(0);
+		expect(rb.out).toMatch(/Read-only file system|Permission denied/);
+		expect(existsSync(join(ws.path, "discussant.txt"))).toBe(false);
+		expect((await exec(discussant, 'echo x > "$HOME/scratch.txt" && echo x > "$TMPDIR/t.txt" && echo "$TMPDIR" && echo OK')).out).toMatch(/scratch\/r1-discussant\/tmp\nOK/);
+	});
+
 	test("git hooks and config of the shared git dir are not writable by the builder", async () => {
 		const r = await exec(builder, "echo 'echo pwned' > .git/hooks/pre-commit");
 		expect(r.code).not.toBe(0);
