@@ -287,6 +287,8 @@ export interface RunView {
 	messages: HumanMessage[];
 	history: { from: RunState | null; to: RunState; at: number; round: number }[];
 	workspace?: Workspace;
+	/** Set once the run was cleared from the board (`clearRuns`): when, and by which interface. */
+	cleared?: { at: number; by: string };
 	createdAt: number;
 	updatedAt: number;
 }
@@ -349,6 +351,8 @@ export interface TranscriptView {
 
 export type FactoryEvent =
 	| { type: "run.state"; run: RunId; project: string; from: RunState | null; to: RunState; round: number }
+	/** A terminal run was cleared from the board (`clearRuns`). */
+	| { type: "run.cleared"; run: RunId; project: string }
 	| { type: "run.ask"; run: RunId; ask: AskId; question: Question }
 	| { type: "run.askResolved"; run: RunId; ask: AskId; by: string }
 	| { type: "run.notice"; run: RunId; notice: Notice }
@@ -366,10 +370,13 @@ export interface FactoryCore {
 	listProjects(): Promise<Project[]>;
 	startRun(project: string, request: Omit<Request, "id" | "project">): Promise<RunId>;
 	getRun(run: RunId): Promise<RunView>;
-	listRuns(filter?: { project?: string; states?: RunState[] }): Promise<RunView[]>;
+	/** Cleared runs are left out unless `includeCleared` is set. */
+	listRuns(filter?: { project?: string; states?: RunState[]; includeCleared?: boolean }): Promise<RunView[]>;
 	getConversation(run: RunId, conversationId: string): Promise<TranscriptView>;
 	cancelRun(run: RunId, reason?: string): Promise<void>;
 	retryRun(run: RunId): Promise<void>;
+	/** Archive terminal runs: they leave the board and default listings; nothing is deleted. */
+	clearRuns(runs: RunId[]): Promise<{ cleared: RunId[] }>;
 	answer(run: RunId, ask: AskId, text: string): Promise<void>;
 	approve(run: RunId, gate: Gate): Promise<void>;
 	reject(run: RunId, gate: Gate, feedback: string): Promise<void>;
@@ -418,6 +425,7 @@ export const CORE_OPS = [
 	"getConversation",
 	"cancelRun",
 	"retryRun",
+	"clearRuns",
 	"answer",
 	"approve",
 	"reject",

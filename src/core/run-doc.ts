@@ -86,6 +86,8 @@ export type RunDocState = {
 	usage?: Record<string, { input: number; output: number; cacheRead: number; cacheWrite: number; totalTokens: number; usd: number }>;
 	/** The last ask the core closed without a human response, and who closed it (a superseded spec approval). */
 	closedAsk?: { id: string; by: string };
+	/** Set by `clearRuns`: the run is archived (off the board and default listings); nothing is deleted. */
+	cleared?: { at: number; by: string };
 };
 
 // Typed loosely for Chord's JSON constraint; use `as RunDocState` at read sites.
@@ -145,6 +147,7 @@ export function toView(d: RunDocState): RunView {
 		messages: d.messages ?? [],
 		history: d.history,
 		...(d.workspace ? { workspace: d.workspace } : {}),
+		...(d.cleared ? { cleared: { at: d.cleared.at, by: d.cleared.by } } : {}),
 		createdAt: d.createdAt,
 		updatedAt: d.updatedAt,
 	};
