@@ -29,6 +29,23 @@ type TurnOutcome = { notice?: Omit<DiscussionNotice, "at">; apply?: (d: Discussi
 
 class Cancelled extends Error {}
 
+/** Reminders after the model stops without calling submit_tickets (as `runAgent`'s). */
+const MAX_NUDGES = 2;
+
+/** What a `draft` turn submits (spec §2.2): the drafting instructions, then the human's, if any. */
+export function draftInstructions(instructions?: string): string {
+	const lines = [
+		"# Draft tickets",
+		"Draft tickets from this discussion and submit them, with a summary, by calling submit_tickets.",
+		"- Write one ticket per piece of work that can be specified, built and reviewed on its own.",
+		"- Each body is a self-contained request for the factory's architect: the goal, the constraints, what is in and out of scope, and acceptance criteria. Refer to other tickets by title where they depend on each other.",
+		"- The summary separates what is settled from what is still open.",
+	];
+	const extra = instructions?.trim();
+	if (extra) lines.push("", "# The human's instructions", extra);
+	return lines.join("\n");
+}
+
 export function createDiscussionTask(svc: DiscussionServices) {
 	// ------------------------------------------------------------------ helpers
 	const read = async (rt: RT, id: string, c: Context) => {
@@ -53,6 +70,15 @@ export function createDiscussionTask(svc: DiscussionServices) {
 
 	function notice(d: DiscussionDocState, n: Omit<DiscussionNotice, "at">) {
 		d.notices.push({ at: svc.now(), kind: n.kind, text: n.text });
+	}
+
+	/** Clear the turn and, for a `draft` turn, what the bridge expects for it (a late submit_tickets is refused). */
+	async function clearTurn(tx: Tx, d: DiscussionDocState) {
+		if (d.turn && d.conversationId !== undefined) {
+			const b = await tx.doc(BridgeDoc, d.conversationId as never);
+			if (b.expect?.key === d.turn.key) b.expect = null;
+		}
+		d.turn = null;
 	}
 
 	/** The Conversation, configured like a role Conversation (`createRoleConversation`), with the pinned model. */
@@ -117,16 +143,19 @@ export function createDiscussionTask(svc: DiscussionServices) {
 
 	/** The provider's message when the last model response of the input failed (auth, rate limit, unknown model, …). */
 	async function modelError(rt: RT, c: Context, conversationId: string, settled: SettledSubmissionRecord): Promise<string | undefined> {
+		const failed = settled.status === "unanswered" && settled.reason === "model_error" ? String(settled.detail ?? "the model failed") : undefined;
+		// No entry: the input never reached the transcript, so no response there is this input's.
+		if (settled.entry === undefined) return failed;
 		const view = await rt.context(conversationId as never, c);
-		const from = settled.entry !== undefined ? view.entries.findIndex((e) => e.id === settled.entry) : -1;
+		const from = view.entries.findIndex((e) => e.id === settled.entry);
+		if (from < 0) return failed;
 		const last = view.entries
 			.slice(from + 1)
 			.map((e) => e.model?.[0])
 			.filter((m) => m?.role === "assistant")
 			.at(-1) as AssistantMessage | undefined;
 		if (last?.stopReason === "error") return last.errorMessage ?? "the model failed";
-		if (settled.status === "unanswered" && settled.reason === "model_error") return String(settled.detail ?? "the model failed");
-		return undefined;
+		return failed;
 	}
 
 	/** A `say` turn: the first turn submits the project context and the first message, later ones the human's text. */
@@ -137,9 +166,37 @@ export function createDiscussionTask(svc: DiscussionServices) {
 		return r.error !== undefined ? { notice: { kind: "error", text: r.error } } : {};
 	}
 
-	/** A `draft` turn: drafting instructions, the bridge's `submit_tickets` and reminders (added with drafting). */
-	async function draftTurn(_rt: RT, _c: Context, _d: DiscussionDocState, _handle: ConversationHandle): Promise<TurnOutcome> {
-		throw new Error("not implemented");
+	/**
+	 * A `draft` turn: the drafting instructions (`turn.text`), then up to `MAX_NUDGES` reminders while the model stops
+	 * without calling submit_tickets. A submission already recorded (a rerun after a crash) is applied without asking
+	 * again. A stopped turn applies nothing (`runTurn`).
+	 */
+	async function draftTurn(rt: RT, c: Context, d: DiscussionDocState, handle: ConversationHandle): Promise<TurnOutcome> {
+		const turn = d.turn!;
+		const submitted = async () => (await rt.snapshot(BridgeDoc, d.conversationId as never, c))?.results[turn.key];
+		let result = await submitted();
+		for (let attempt = 0; attempt <= MAX_NUDGES && result === undefined; attempt++) {
+			const requestId = attempt === 0 ? turn.key : `${turn.key}:nudge${attempt}`;
+			const text =
+				attempt === 0
+					? turn.text
+					: "You stopped without calling submit_tickets. The factory only continues when you call submit_tickets. Continue your work if needed, then call it.";
+			const r = await submitAndWait(rt, c, d, handle, requestId, text);
+			if (r.stopped) return {};
+			result = await submitted();
+			if (result === undefined && r.error !== undefined) return { notice: { kind: "error", text: r.error } };
+		}
+		if (result === undefined) return { notice: { kind: "no_submission", text: "The model did not submit draft tickets; the drafts are unchanged" } };
+		const payload = result.payload as { summary: string; tickets: { title: string; body: string }[] };
+		return {
+			apply: (doc) => {
+				doc.summary = payload.summary;
+				doc.counters.batch += 1;
+				doc.drafts = doc.drafts.filter((x) => x.runId !== undefined);
+				for (const t of payload.tickets)
+					doc.drafts.push({ id: `D${++doc.counters.draftSeq}`, title: t.title, body: t.body, edited: false, batch: doc.counters.batch });
+			},
+		};
 	}
 
 	/**
@@ -171,7 +228,7 @@ export function createDiscussionTask(svc: DiscussionServices) {
 				totalTokens: Math.max(0, after.totalTokens - before.totalTokens),
 				durationMs: svc.now() - startedAt,
 			});
-			doc.turn = null;
+			await clearTurn(tx, doc);
 			doc.updatedAt = svc.now();
 			return undefined;
 		}, c);
@@ -229,11 +286,18 @@ export function createDiscussionTask(svc: DiscussionServices) {
 						if (rt.signal.aborted || e instanceof Cancelled || phase === "FINAL") throw e;
 						const reason = e instanceof Error ? e.message : String(e);
 						svc.log(`discussion ${d.id} failed in ${phase}: ${reason}`);
+						// A turn that was running has nobody waiting on it any more: stop the Conversation's work (best effort).
+						try {
+							const now = await read(rt, d.id, c);
+							if (now.turn && now.conversationId !== undefined) await (await rt.conversation(now.conversationId as never, c))?.abort(c);
+						} catch (abortError) {
+							svc.log(`discussion ${d.id}: could not abort the conversation: ${abortError instanceof Error ? abortError.message : String(abortError)}`);
+						}
 						// FAILED and the end of the Task in one commit, so that Retry can follow at once.
-						await transition(rt, c, d.id, (doc) => {
+						await transition(rt, c, d.id, async (doc, tx): Promise<Phase> => {
 							doc.state = "FAILED";
 							doc.error = reason;
-							doc.turn = null;
+							await clearTurn(tx, doc);
 							return "FINAL";
 						});
 					}
@@ -248,7 +312,7 @@ export function createDiscussionTask(svc: DiscussionServices) {
 				if (doc.state === "PREPARING" || doc.state === "OPEN") {
 					doc.state = "FAILED";
 					doc.error = "the discussion's task was aborted";
-					doc.turn = null;
+					await clearTurn(tx, doc);
 					doc.updatedAt = svc.now();
 				}
 				return { status: "terminal", outcome: { status: "aborted", reason: "aborted" } };

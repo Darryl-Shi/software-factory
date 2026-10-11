@@ -25,7 +25,7 @@ import { type GitHub, githubProblems } from "../github/github.ts";
 import { type Sandbox, sandboxProblems } from "../sandbox/sandbox.ts";
 import { Bridge, BridgeDoc, bridgeToolsNotFor, EnvDoc } from "./bridge.ts";
 import { DiscussionDoc, type DiscussionDocState, DiscussionIndex, toDiscussionView } from "./discussion-doc.ts";
-import { createDiscussionTask } from "./discussion-task.ts";
+import { createDiscussionTask, draftInstructions } from "./discussion-task.ts";
 import { humanFindings } from "./findings.ts";
 import { DEFAULT_MESSAGE_ROLES, holdMessage, messageContent, messageTarget, parseMessage } from "./messages.ts";
 import { RunDoc, type RunDocState, RunIndex, toView } from "./run-doc.ts";
@@ -827,12 +827,12 @@ export class Factory implements FactoryCore {
 	}
 
 	/** Change a discussion in one commit; `change` checks the state and throws a FactoryError to refuse. */
-	private async changeDiscussion<T>(id: DiscussionId, change: (d: DiscussionDocState) => T): Promise<T> {
+	private async changeDiscussion<T>(id: DiscussionId, change: (d: DiscussionDocState, tx: Tx) => T | Promise<T>): Promise<T> {
 		await this.discussionDoc(id); // not_found
 		let out!: T;
 		await this.root.commit(async (tx) => {
 			const d = (await tx.doc(DiscussionDoc, id, null as never)) as unknown as DiscussionDocState;
-			out = change(d);
+			out = await change(d, tx);
 			d.updatedAt = this.now();
 		}, this.ctx);
 		return out;
@@ -852,16 +852,65 @@ export class Factory implements FactoryCore {
 
 	async stopTurn(id: DiscussionId): Promise<void> {
 		const by = this.by;
-		const conversationId = await this.changeDiscussion(id, (d) => {
+		const { key, conversationId } = await this.changeDiscussion(id, (d) => {
 			if (!d.turn) throw new FactoryError("conflict", `discussion ${id} has no turn running`);
 			d.turn.stopRequested = true;
 			d.turn.stoppedBy = by;
-			return d.conversationId;
+			return { key: d.turn.key, conversationId: d.conversationId };
 		});
 		// The Task clears the turn and adds the notice once the Conversation's work has stopped.
 		if (conversationId === undefined) return;
 		const conv = await this.harness.conversation(conversationId as never, this.ctx);
+		// A late Stop must not abort the next turn: abort only while the stopped turn is still the one running (if it
+		// already ended, the Task saw the request; the Task also delivers a Stop this abort misses).
+		if ((await this.discussionDoc(id)).turn?.key !== key) return;
 		await conv?.abort(this.ctx);
+	}
+
+	async requestDrafts(id: DiscussionId, instructions?: string): Promise<void> {
+		const by = this.by;
+		if (instructions !== undefined && typeof instructions !== "string") throw new FactoryError("invalid", "instructions must be text");
+		await this.changeDiscussion(id, async (d, tx) => {
+			if (d.state !== "OPEN") throw new FactoryError("conflict", `discussion ${id} is ${d.state}; only an OPEN discussion can draft tickets`);
+			if (d.turn) throw new FactoryError("conflict", `discussion ${id} has a turn running; wait for it or stop it`);
+			d.counters.turnSeq += 1;
+			const seq = d.counters.turnSeq;
+			const key = `${id}:turn${seq}`;
+			d.turn = { kind: "draft", key, seq, text: draftInstructions(instructions), by, startedAt: this.now() };
+			// The bridge takes submit_tickets for this turn only; the Task clears `expect` when the turn ends.
+			const b = await tx.doc(BridgeDoc, d.conversationId as never);
+			b.expect = { key, tools: ["submit_tickets"] };
+		});
+	}
+
+	async updateDraft(id: DiscussionId, draft: string, change: { title?: string; body?: string }): Promise<void> {
+		const { title, body } = change ?? {};
+		if (title === undefined && body === undefined) throw new FactoryError("invalid", "updateDraft needs a title or a body");
+		if (title !== undefined && (typeof title !== "string" || !title.trim())) throw new FactoryError("invalid", "a draft needs a title");
+		if (title !== undefined && title.trim().length > 200) throw new FactoryError("invalid", "a draft's title is at most 200 characters");
+		if (body !== undefined && (typeof body !== "string" || !body.trim())) throw new FactoryError("invalid", "a draft needs a body");
+		await this.changeDiscussion(id, (d) => {
+			const x = this.editableDraft(d, draft);
+			if (title !== undefined) x.title = title.trim();
+			if (body !== undefined) x.body = body;
+			x.edited = true;
+		});
+	}
+
+	async deleteDraft(id: DiscussionId, draft: string): Promise<void> {
+		await this.changeDiscussion(id, (d) => {
+			const x = this.editableDraft(d, draft);
+			d.drafts = d.drafts.filter((y) => y !== x);
+		});
+	}
+
+	/** The draft, if the human may change it: it has not become a run and no `draft` turn is running. */
+	private editableDraft(d: DiscussionDocState, draft: string) {
+		const x = d.drafts.find((y) => y.id === draft);
+		if (!x) throw new FactoryError("not_found", `discussion ${d.id} has no draft ${draft}`);
+		if (x.runId !== undefined) throw new FactoryError("conflict", `draft ${draft} already became run ${x.runId}; it is read-only`);
+		if (d.turn?.kind === "draft") throw new FactoryError("conflict", `discussion ${d.id} is drafting tickets; wait for it or stop it`);
+		return x;
 	}
 
 	async closeDiscussion(id: DiscussionId): Promise<void> {
