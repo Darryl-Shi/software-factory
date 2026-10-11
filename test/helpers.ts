@@ -54,11 +54,15 @@ export interface Control {
 	discussantHeard: string[];
 	/** The model id of each discussant turn. */
 	discussantModels: string[];
-	/** Hang the discussant's reply to a human message (Stop, refusals during a turn). */
+	/** Hang the discussant's reply to a human message, and its first step on drafting instructions (Stop, refusals during a turn). */
 	discussantHang?: boolean;
 	/** The discussant's replies to human messages fail with this provider error. */
 	discussantFail?: string;
-	/** Per draft turn, what the discussant does (drafting). */
+	/**
+	 * Per draft turn, what the discussant does: ok | invalid-then-ok | none | one | ok-then-hang (default ok).
+	 * ok-then-hang submits along with a bash call (so the loop goes on), then sets `discussantHang` and hangs on the
+	 * next step (crash tests).
+	 */
 	draftPlan: string[];
 }
 
@@ -171,13 +175,37 @@ export function scripts(control: Control): Record<string, Script> {
 		if (ctx.side!.turn === 0 && text.startsWith("EDIT:")) return call("write", { path: "CHANGELOG.md", content: `${text.slice(5).trim()}\n` });
 		return say(ctx.side!.turn === 0 ? `re: ${text}` : "changed CHANGELOG.md");
 	};
-	// Factory inputs: the first input ("# Discussion") makes it look at the repo, then reply.
-	const discussant: Script = (ctx) => {
+	// Factory inputs: the first input ("# Discussion") makes it look at the repo, then reply. Drafting instructions
+	// ("# Draft tickets", and the reminders after them) follow the turn's `control.draftPlan` entry.
+	const TICKETS = { summary: "S: settled X; open Y", tickets: [{ title: "API", body: "B1" }, { title: "UI", body: "B2" }] };
+	let draftMode = "ok";
+	const discussant: Script = async (ctx) => {
 		if (ctx.turn === 0) {
 			control.discussantInputs.push(ctx.input);
 			control.discussantModels.push(ctx.model);
 		}
 		if (ctx.input.startsWith("# Discussion")) return ctx.turn === 0 ? call("bash", { command: "ls -1a" }) : say("first reply");
+		const reminder = ctx.input.startsWith("You stopped without calling submit_tickets");
+		if (ctx.input.startsWith("# Draft tickets") || reminder) {
+			if (ctx.input.startsWith("# Draft tickets") && ctx.turn === 0) {
+				while (control.discussantHang) await new Promise((r) => setTimeout(r, 50));
+				draftMode = control.draftPlan.shift() ?? "ok";
+			}
+			const tried = ctx.results.some((r) => r.name === "submit_tickets");
+			// the step after a recorded submission that did not end the loop (ok-then-hang, or its resumption after a crash)
+			if (ctx.results.some((r) => r.name === "submit_tickets" && !r.isError)) {
+				if (draftMode === "ok-then-hang") {
+					control.discussantHang = true;
+					while (control.discussantHang) await new Promise((r) => setTimeout(r, 50));
+				}
+				return say("submitted");
+			}
+			if (draftMode === "ok-then-hang") return calls(["submit_tickets", TICKETS], ["bash", { command: "true" }]);
+			if (draftMode === "none") return say("thinking");
+			if (draftMode === "one") return call("submit_tickets", { summary: TICKETS.summary, tickets: [{ title: "Only", body: "B" }] });
+			if (draftMode === "invalid-then-ok" && !tried) return call("submit_tickets", { ...TICKETS, summary: "" });
+			return call("submit_tickets", TICKETS);
+		}
 		return say("ok");
 	};
 	// Human turns (say): "WRITE: x" makes it try to write a file; anything else gets "re: <text>".

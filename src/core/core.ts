@@ -25,7 +25,7 @@ import { type GitHub, githubProblems } from "../github/github.ts";
 import { type Sandbox, sandboxProblems } from "../sandbox/sandbox.ts";
 import { Bridge, BridgeDoc, bridgeToolsNotFor, EnvDoc } from "./bridge.ts";
 import { DiscussionDoc, type DiscussionDocState, DiscussionIndex, toDiscussionView } from "./discussion-doc.ts";
-import { createDiscussionTask } from "./discussion-task.ts";
+import { createDiscussionTask, draftInstructions } from "./discussion-task.ts";
 import { humanFindings } from "./findings.ts";
 import { DEFAULT_MESSAGE_ROLES, holdMessage, messageContent, messageTarget, parseMessage } from "./messages.ts";
 import { RunDoc, type RunDocState, RunIndex, toView } from "./run-doc.ts";
@@ -37,6 +37,7 @@ import {
 	type AskId,
 	type AskResponse,
 	type DiscussionId,
+	type DiscussionLink,
 	type DiscussionState,
 	type DiscussionView,
 	type EffectiveSettings,
@@ -432,6 +433,20 @@ export class Factory implements FactoryCore {
 
 	// ------------------------------------------------------------------ runs
 	async startRun(project: string, request: Omit<Request, "id" | "project">): Promise<RunId> {
+		const by = this.by; // before any await: `as(name)` sets `by` only for the synchronous part of the call
+		let runId!: RunId;
+		await this.root.commit(async (tx) => {
+			runId = await this.createRunIn(tx, project, request, by);
+		}, this.ctx);
+		this.harness.resume();
+		return runId;
+	}
+
+	/**
+	 * Create a run in `tx`: its `RunIndex` entry, its `RunDoc` seed and its Task (startRun, createTicket). Call
+	 * `harness.resume()` after the commit. `by`: the calling interface, captured before the caller's first await.
+	 */
+	private async createRunIn(tx: Tx, project: string, request: Omit<Request, "id" | "project">, by: string): Promise<RunId> {
 		const p = this.config.project(project);
 		const eff = this.config.effective({ project });
 		const runId = `run-${this.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
@@ -440,7 +455,7 @@ export class Factory implements FactoryCore {
 			id: runId,
 			project,
 			repo: p.repo,
-			request: { ...request, id: runId, project, source: request.source || this.by },
+			request: { ...request, id: runId, project, source: request.source || by },
 			state: "RECEIVED",
 			createdAt: now,
 			updatedAt: now,
@@ -460,13 +475,10 @@ export class Factory implements FactoryCore {
 			notices: [],
 			history: [{ from: null, to: "RECEIVED", at: now, round: 1 }],
 		};
-		await this.root.commit(async (tx) => {
-			(await tx.doc(RunIndex)).runs.push(runId);
-			const d = (await tx.doc(RunDoc, runId, seed as never)) as unknown as RunDocState;
-			const taskId = await tx.createTask(this.runTask, { runId, start: "RECEIVED" as RunState }, { ownership: { kind: "conversation" }, background: true });
-			d.taskId = taskId as unknown as string;
-		}, this.ctx);
-		this.harness.resume();
+		(await tx.doc(RunIndex)).runs.push(runId);
+		const d = (await tx.doc(RunDoc, runId, seed as never)) as unknown as RunDocState;
+		const taskId = await tx.createTask(this.runTask, { runId, start: "RECEIVED" as RunState }, { ownership: { kind: "conversation" }, background: true });
+		d.taskId = taskId as unknown as string;
 		return runId;
 	}
 
@@ -795,13 +807,12 @@ export class Factory implements FactoryCore {
 
 	private async discussionView(d: DiscussionDocState): Promise<DiscussionView> {
 		const usage = d.conversationId !== undefined ? sumUsage((await this.harness.snapshot(UsageDoc, d.conversationId as never, this.ctx)) as any) : undefined;
-		const runs: DiscussionView["runs"] = [];
-		for (const x of d.drafts) {
-			if (x.runId === undefined) continue;
-			const state = this.cache.get(x.runId)?.state ?? ((await this.harness.snapshot(RunDoc, x.runId, this.ctx)) as RunDocState | undefined)?.state;
-			if (state) runs.push({ id: x.runId, state });
-		}
-		return toDiscussionView(d, { usd: usage?.usd ?? 0, totalTokens: usage?.totalTokens ?? 0 }, runs);
+		// The run cache, or the document for a run the watch has not delivered yet (just created by createTicket).
+		const uncached = new Map<RunId, RunState | undefined>();
+		for (const x of d.drafts)
+			if (x.runId !== undefined && !this.cache.has(x.runId))
+				uncached.set(x.runId, ((await this.harness.snapshot(RunDoc, x.runId, this.ctx)) as RunDocState | undefined)?.state);
+		return toDiscussionView(d, { usd: usage?.usd ?? 0, totalTokens: usage?.totalTokens ?? 0 }, (run) => this.cache.get(run)?.state ?? uncached.get(run));
 	}
 
 	async getDiscussion(id: DiscussionId): Promise<DiscussionView> {
@@ -827,12 +838,12 @@ export class Factory implements FactoryCore {
 	}
 
 	/** Change a discussion in one commit; `change` checks the state and throws a FactoryError to refuse. */
-	private async changeDiscussion<T>(id: DiscussionId, change: (d: DiscussionDocState) => T): Promise<T> {
+	private async changeDiscussion<T>(id: DiscussionId, change: (d: DiscussionDocState, tx: Tx) => T | Promise<T>): Promise<T> {
 		await this.discussionDoc(id); // not_found
 		let out!: T;
 		await this.root.commit(async (tx) => {
 			const d = (await tx.doc(DiscussionDoc, id, null as never)) as unknown as DiscussionDocState;
-			out = change(d);
+			out = await change(d, tx);
 			d.updatedAt = this.now();
 		}, this.ctx);
 		return out;
@@ -852,16 +863,87 @@ export class Factory implements FactoryCore {
 
 	async stopTurn(id: DiscussionId): Promise<void> {
 		const by = this.by;
-		const conversationId = await this.changeDiscussion(id, (d) => {
+		const { key, conversationId } = await this.changeDiscussion(id, (d) => {
 			if (!d.turn) throw new FactoryError("conflict", `discussion ${id} has no turn running`);
 			d.turn.stopRequested = true;
 			d.turn.stoppedBy = by;
-			return d.conversationId;
+			return { key: d.turn.key, conversationId: d.conversationId };
 		});
 		// The Task clears the turn and adds the notice once the Conversation's work has stopped.
 		if (conversationId === undefined) return;
 		const conv = await this.harness.conversation(conversationId as never, this.ctx);
+		// A late Stop must not abort the next turn: abort only while the stopped turn is still the one running (if it
+		// already ended, the Task saw the request; the Task also delivers a Stop this abort misses).
+		if ((await this.discussionDoc(id)).turn?.key !== key) return;
 		await conv?.abort(this.ctx);
+	}
+
+	async requestDrafts(id: DiscussionId, instructions?: string): Promise<void> {
+		const by = this.by;
+		if (instructions !== undefined && typeof instructions !== "string") throw new FactoryError("invalid", "instructions must be text");
+		await this.changeDiscussion(id, async (d, tx) => {
+			if (d.state !== "OPEN") throw new FactoryError("conflict", `discussion ${id} is ${d.state}; only an OPEN discussion can draft tickets`);
+			if (d.turn) throw new FactoryError("conflict", `discussion ${id} has a turn running; wait for it or stop it`);
+			d.counters.turnSeq += 1;
+			const seq = d.counters.turnSeq;
+			const key = `${id}:turn${seq}`;
+			d.turn = { kind: "draft", key, seq, text: draftInstructions(instructions), by, startedAt: this.now() };
+			// The bridge takes submit_tickets for this turn only; the Task clears `expect` when the turn ends.
+			const b = await tx.doc(BridgeDoc, d.conversationId as never);
+			b.expect = { key, tools: ["submit_tickets"] };
+		});
+	}
+
+	async updateDraft(id: DiscussionId, draft: string, change: { title?: string; body?: string }): Promise<void> {
+		const { title, body } = change ?? {};
+		if (title === undefined && body === undefined) throw new FactoryError("invalid", "updateDraft needs a title or a body");
+		if (title !== undefined && (typeof title !== "string" || !title.trim())) throw new FactoryError("invalid", "a draft needs a title");
+		if (title !== undefined && title.trim().length > 200) throw new FactoryError("invalid", "a draft's title is at most 200 characters");
+		if (body !== undefined && (typeof body !== "string" || !body.trim())) throw new FactoryError("invalid", "a draft needs a body");
+		await this.changeDiscussion(id, (d) => {
+			const x = this.editableDraft(d, draft);
+			if (title !== undefined) x.title = title.trim();
+			if (body !== undefined) x.body = body;
+			x.edited = true;
+		});
+	}
+
+	async deleteDraft(id: DiscussionId, draft: string): Promise<void> {
+		await this.changeDiscussion(id, (d) => {
+			const x = this.editableDraft(d, draft);
+			d.drafts = d.drafts.filter((y) => y !== x);
+		});
+	}
+
+	async createTicket(id: DiscussionId, draft: string): Promise<RunId> {
+		const by = this.by; // before any await (see startRun)
+		// One commit: the run (index entry, seed, Task) and the draft's runId, checked inside it, so a second call is refused.
+		const runId = await this.changeDiscussion(id, async (d, tx) => {
+			if (d.state !== "OPEN" && d.state !== "CLOSED")
+				throw new FactoryError("conflict", `discussion ${id} is ${d.state}; only an OPEN or CLOSED discussion's drafts can become tickets`);
+			const x = this.editableDraft(d, draft);
+			const discussion: DiscussionLink = {
+				id,
+				title: d.title,
+				draftId: x.id,
+				summary: d.summary ?? "",
+				siblings: d.drafts.filter((y) => y !== x && y.batch === x.batch).map((y) => y.title),
+			};
+			const run = await this.createRunIn(tx, d.project, { source: "discussion", title: x.title, body: x.body, meta: { discussion } }, by);
+			x.runId = run;
+			return run;
+		});
+		this.harness.resume();
+		return runId;
+	}
+
+	/** The draft, if the human may change it: it has not become a run and no `draft` turn is running. */
+	private editableDraft(d: DiscussionDocState, draft: string) {
+		const x = d.drafts.find((y) => y.id === draft);
+		if (!x) throw new FactoryError("not_found", `discussion ${d.id} has no draft ${draft}`);
+		if (x.runId !== undefined) throw new FactoryError("conflict", `draft ${draft} already became run ${x.runId}; it is read-only`);
+		if (d.turn?.kind === "draft") throw new FactoryError("conflict", `discussion ${d.id} is drafting tickets; wait for it or stop it`);
+		return x;
 	}
 
 	async closeDiscussion(id: DiscussionId): Promise<void> {

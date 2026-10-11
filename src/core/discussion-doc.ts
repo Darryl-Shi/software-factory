@@ -66,8 +66,13 @@ export const DiscussionIndex = defineDoc<{ ids: string[] }>({
 	initial: () => ({ ids: [] }),
 });
 
-/** The view interfaces get: `cost` is the Conversation's usage so far; `runs` the states of the runs drafts became. */
-export function toDiscussionView(d: DiscussionDocState, cost: { usd: number; totalTokens: number }, runs: { id: RunId; state: RunState }[]): DiscussionView {
+/** The view interfaces get: `cost` is the Conversation's usage so far; `runState` looks up the state of a run a draft became. */
+export function toDiscussionView(d: DiscussionDocState, cost: { usd: number; totalTokens: number }, runState: (id: RunId) => RunState | undefined): DiscussionView {
+	const runs: { id: RunId; state: RunState }[] = [];
+	for (const x of d.drafts) {
+		const state = x.runId !== undefined ? runState(x.runId) : undefined;
+		if (state) runs.push({ id: x.runId!, state });
+	}
 	return {
 		id: d.id,
 		project: d.project,
