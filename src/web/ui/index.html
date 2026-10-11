@@ -15,12 +15,14 @@
     <div class="brand"><span class="brand-mark"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1 14V7l4 2.5V7l4 2.5V4l2-2h2l2 2v10z"/></svg></span>Factory</div>
     <nav class="nav" aria-label="Views">
       <button type="button" data-view="board" aria-current="page">Board</button>
-      <button type="button" data-view="discussions">Discussions</button>
       <button type="button" data-view="settings">Settings</button>
     </nav>
     <div class="top-spacer"></div>
     <label class="search"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6.5 1a5.5 5.5 0 0 1 4.38 8.83l3.65 3.64-1.06 1.06-3.64-3.65A5.5 5.5 0 1 1 6.5 1zm0 1.5a4 4 0 1 0 0 8 4 4 0 0 0 0-8z"/></svg><input id="q" type="search" placeholder="Search tickets" aria-label="Search tickets"></label>
-    <button type="button" class="btn primary" id="create-btn"><span aria-hidden="true">+</span> Create</button>
+    <div class="top-actions">
+      <button type="button" class="btn primary" id="create-btn"><span aria-hidden="true">+</span> Create</button>
+      <button type="button" class="btn" id="chat-btn" title="Talk a problem through with a model before it becomes a ticket"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 2.5h11a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H7.2L4 14v-2.5H2.5a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1zm.5 1.5v6h2.5v1.2L6.7 10H13V4z"/></svg> Chat</button>
+    </div>
   </header>
 
   <main class="view" id="view-board">
@@ -35,21 +37,6 @@
         </div>
       </div>
       <div class="board" id="board" aria-label="Pipeline board"></div>
-    </div>
-  </main>
-
-  <main class="view" id="view-discussions" hidden>
-    <div class="disc-wrap">
-      <div class="board-head">
-        <h1 class="board-title">Discussions</h1>
-        <select class="proj" id="disc-proj" aria-label="Project"></select>
-        <div class="chips" role="group" aria-label="Quick filters">
-          <button type="button" class="chip" id="disc-closed" aria-pressed="false">Show closed <span class="n" id="disc-n-closed">0</span></button>
-        </div>
-        <div class="top-spacer"></div>
-        <button type="button" class="btn" id="disc-new"><span aria-hidden="true">+</span> New discussion</button>
-      </div>
-      <div class="disc-list" id="disc-list" aria-label="Discussions"></div>
     </div>
   </main>
 
@@ -69,6 +56,7 @@
       <span class="rv-key" id="rv-key"></span>
       <h2 class="rv-title" id="rv-title"></h2>
       <span id="rv-state"></span>
+      <div class="chatbar" id="chatbar" aria-label="Chat settings"></div>
     </div>
     <div class="rv-progress" id="rv-progress" aria-label="Pipeline progress"></div>
     <div class="rv-actions">

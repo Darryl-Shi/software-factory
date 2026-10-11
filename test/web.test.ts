@@ -281,7 +281,13 @@ describe("static UI", () => {
 		// a classic script after app.js: it shares app.js's globals and parses in the same global scope
 		expect(() => new Script(`${js}\n;${disc}`, { filename: "app.js+discussions.js" })).not.toThrow();
 		expect([...html.matchAll(/<script\b[^>]*>/g)].map((m) => m[0])).toEqual(['<script src="/app.js" defer>', '<script src="/discussions.js" defer>']);
-		expect(html).toContain('data-view="discussions"');
+		// the nav is Board and Settings; the Chat button sits right after Create; the Discussions list and modal are gone
+		expect([...html.matchAll(/data-view="([a-z]+)"/g)].map((m) => m[1])).toEqual(["board", "settings"]);
+		expect(html).toMatch(/id="create-btn"[^]*?<\/button>\s*<button type="button" class="btn" id="chat-btn"/);
+		expect(html).not.toContain("view-discussions");
+		expect(html).toContain('id="chatbar"');
+		for (const gone of ["openNewDiscussion", "renderDiscussions", "#disc-list", "#view-discussions"]) expect(`${js}\n${disc}`).not.toContain(gone);
+		expect(disc).toContain("core.listModels(");
 		expect(html).not.toMatch(/https?:\/\//);
 		expect(readFileSync(join(UI, "app.css"), "utf8")).not.toMatch(/@import|url\(https?:/);
 		// every operation the UI calls is one the server allows
