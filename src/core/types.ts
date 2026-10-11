@@ -3,7 +3,7 @@
 export type RunId = string;
 export type AskId = string;
 export type RepoRef = string; // "owner/name"
-export type Role = "architect" | "builder" | "helper" | "reviewer" | "qa" | "discussant";
+export type Role = "architect" | "builder" | "helper" | "reviewer" | "qa" | "discussant" | "integrator";
 /** Whether AQ testing ran in a review round (§2 "QA status"). */
 export type QaStatus = "ran" | "off" | "skipped" | "unavailable";
 export type Gate = "spec" | "delivery" | "merge";
@@ -19,6 +19,7 @@ export const RUN_STATES = [
 	"REVIEWING",
 	"ESCALATED",
 	"DELIVERING",
+	"READY",
 	"AWAITING_CI",
 	"DELIVERED",
 	"FAILED",
@@ -26,6 +27,93 @@ export const RUN_STATES = [
 ] as const;
 export type RunState = (typeof RUN_STATES)[number];
 export const TERMINAL_STATES: readonly RunState[] = ["DELIVERED", "FAILED", "CANCELLED"];
+
+// ---------------------------------------------------------------- bundles (several Ready tickets shipped as one PR)
+export type BundleId = string;
+export const BUNDLE_STATES = [
+	"INTEGRATING",
+	"FIXING",
+	"REVIEWING",
+	"DELIVERING",
+	"AWAITING_CI",
+	"AWAITING_MERGE",
+	"ESCALATED",
+	"MERGED",
+	"FAILED",
+	"CANCELLED",
+] as const;
+export type BundleState = (typeof BUNDLE_STATES)[number];
+/** Terminal bundle states. A FAILED bundle keeps its members until it is retried or cancelled. */
+export const BUNDLE_TERMINAL_STATES: readonly BundleState[] = ["MERGED", "FAILED", "CANCELLED"];
+/** A bundle in one of these states holds its members: they cannot join another bundle, be cancelled or messaged. */
+export const BUNDLE_RELEASED_STATES: readonly BundleState[] = ["MERGED", "CANCELLED"];
+export const MERGE_METHODS = ["merge", "squash", "rebase"] as const;
+export type MergeMethod = (typeof MERGE_METHODS)[number];
+
+export type BundleQuestion =
+	| { kind: "merge"; options: ["merge", "request-changes", "drop"] }
+	| { kind: "escalation"; reason: string; options: ["more-rounds", "drop", "abort"] };
+
+export type BundleAskResponse =
+	| { type: "merge"; by: string }
+	| { type: "changes"; feedback: string; by: string }
+	| { type: "drop"; runs: RunId[]; by: string }
+	| { type: "escalation"; choice: { moreRounds: number } | { drop: RunId[] } | { abort: true }; by: string };
+
+export interface BundlePendingAsk {
+	id: AskId;
+	question: BundleQuestion;
+	createdAt: number;
+	response?: BundleAskResponse;
+}
+
+export interface BundleMember {
+	run: RunId;
+	title: string;
+	/** The ticket key the board shows (PROJECT-N). */
+	key: string;
+	/** The run's spec path in the repo (docs/specs/<run-id>.md, or docs/spec.md for older runs). */
+	specPath: string;
+	branch: string;
+}
+
+export interface BundleView {
+	id: BundleId;
+	project: string;
+	repo: RepoRef;
+	state: BundleState;
+	members: BundleMember[];
+	/** Runs dropped from the bundle (they went back to Ready). */
+	dropped: RunId[];
+	mergeMethod: MergeMethod;
+	delivery?: Delivery;
+	ci?: CiStatus;
+	noCi?: boolean;
+	pendingAsk?: BundlePendingAsk;
+	escalation?: EscalationInfo;
+	/** Merge was clicked and the bundle is being updated onto the latest default branch: it merges by itself when clean and green. */
+	mergeRequested?: boolean;
+	/** The latest integration: its base commit, the conflicts the integrator resolved, and whether it changed anything. */
+	integration?: { n: number; base: string; resolved: { run: RunId; files: string[] }[]; conflict?: { run: RunId; files: string[] }; changed: boolean };
+	round: number;
+	reviewRound: number;
+	ciFixes: number;
+	caps: { review: number; ciFix: number };
+	conversations: { integrator?: string; reviewers: { id: string; seq: number }[]; qa: { id: string; seq: number }[]; active?: string };
+	reviews: ReviewRoundView[];
+	qaStatus?: QaStatus;
+	findingsLog: FindingsLogEntry[];
+	advisory: Finding[];
+	acceptedBlocking: Finding[];
+	notices: Notice[];
+	messages: HumanMessage[];
+	history: { from: BundleState | null; to: BundleState; at: number; round: number }[];
+	cost: CostRecord[];
+	failure?: { state: BundleState; reason: string };
+	workspace?: Workspace;
+	createdAt: number;
+	updatedAt: number;
+}
 
 // ---------------------------------------------------------------- discussions (a pre-ticket chat with the discussant)
 export type DiscussionId = string;
@@ -287,6 +375,10 @@ export interface RunView {
 	messages: HumanMessage[];
 	history: { from: RunState | null; to: RunState; at: number; round: number }[];
 	workspace?: Workspace;
+	/** The run's spec path in the repo: docs/specs/<run-id>.md (docs/spec.md for runs past SPEC_READY before bundles). */
+	specPath: string;
+	/** The active or merged bundle the run belongs to. */
+	bundle?: BundleId;
 	createdAt: number;
 	updatedAt: number;
 }
@@ -358,7 +450,12 @@ export type FactoryEvent =
 	| { type: "discussion.state"; discussion: DiscussionId; project: string; from: DiscussionState | null; to: DiscussionState }
 	/** `submission`: with `what: "drafts"`, a new submit_tickets was applied (absent for a human's edit or delete). */
 	| { type: "discussion.updated"; discussion: DiscussionId; project: string; what: "turn.started" | "turn.ended" | "drafts" | "ticket" | "notice"; submission?: true }
-	| { type: "discussion.conversation.updated"; discussion: DiscussionId; conversationId: string };
+	| { type: "discussion.conversation.updated"; discussion: DiscussionId; conversationId: string }
+	| { type: "bundle.state"; bundle: BundleId; project: string; from: BundleState | null; to: BundleState; round: number }
+	| { type: "bundle.ask"; bundle: BundleId; ask: AskId; question: BundleQuestion }
+	| { type: "bundle.askResolved"; bundle: BundleId; ask: AskId; by: string }
+	| { type: "bundle.notice"; bundle: BundleId; notice: Notice }
+	| { type: "bundle.conversation.updated"; bundle: BundleId; conversationId: string; role: Role };
 
 export interface FactoryCore {
 	createProject(name: string, repo: RepoRef): Promise<Project>;
@@ -403,8 +500,25 @@ export interface FactoryCore {
 	closeDiscussion(id: DiscussionId): Promise<void>;
 	reopenDiscussion(id: DiscussionId): Promise<void>;
 	retryDiscussion(id: DiscussionId): Promise<void>;
-	/** A `project` filter matches run and discussion events; `run` and `discussion` match only that run's or discussion's. */
-	subscribe(filter: { project?: string; run?: RunId; discussion?: DiscussionId }, on: (e: FactoryEvent) => void): Unsubscribe;
+	/** Ship Ready runs of one project as a bundle (one PR). `invalid`: empty, another project, not READY; `conflict`: already in an active bundle. */
+	createBundle(project: string, runs: RunId[]): Promise<BundleId>;
+	getBundle(id: BundleId): Promise<BundleView>;
+	listBundles(filter?: { project?: string; states?: BundleState[] }): Promise<BundleView[]>;
+	getBundleConversation(id: BundleId, conversationId: string): Promise<TranscriptView>;
+	/** Merge the bundle's PR (at AWAITING_MERGE); updates it onto the latest default branch first when that moved. */
+	mergeBundle(id: BundleId): Promise<void>;
+	requestBundleChanges(id: BundleId, feedback: string): Promise<void>;
+	/** Drop members (at AWAITING_MERGE or ESCALATED); at least one must remain. They return to plain READY. */
+	dropFromBundle(id: BundleId, runs: RunId[]): Promise<void>;
+	resolveBundleEscalation(id: BundleId, ask: AskId, choice: { moreRounds: number } | { drop: RunId[] } | { abort: true }): Promise<void>;
+	cancelBundle(id: BundleId, reason?: string): Promise<void>;
+	retryBundle(id: BundleId): Promise<void>;
+	/** A message to the agent the bundle is with (the reviewer while REVIEWING, else the integrator). */
+	messageBundle(id: BundleId, text: string): Promise<{ message: string; to: Role; conversationId?: string }>;
+	/** A QA screenshot of a bundle review. Over HTTP: GET /api/bundles/<id>/screenshots/<sid>. */
+	getBundleScreenshot(id: BundleId, screenshotId: string): Promise<{ mime: string; bytes: Uint8Array }>;
+	/** A `project` filter matches run, discussion and bundle events; `run`, `discussion` and `bundle` match only that one's. */
+	subscribe(filter: { project?: string; run?: RunId; discussion?: DiscussionId; bundle?: BundleId }, on: (e: FactoryEvent) => void): Unsubscribe;
 }
 
 /** The operations an interface may call over its transport (everything but `subscribe`). */
@@ -442,6 +556,18 @@ export const CORE_OPS = [
 	"closeDiscussion",
 	"reopenDiscussion",
 	"retryDiscussion",
+	"createBundle",
+	"getBundle",
+	"listBundles",
+	"getBundleConversation",
+	"mergeBundle",
+	"requestBundleChanges",
+	"dropFromBundle",
+	"resolveBundleEscalation",
+	"cancelBundle",
+	"retryBundle",
+	"messageBundle",
+	"getBundleScreenshot",
 ] as const satisfies readonly (keyof FactoryCore)[];
 
 export class FactoryError extends Error {
