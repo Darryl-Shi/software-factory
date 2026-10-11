@@ -113,3 +113,26 @@ leaves open, and the places where the code still differs from it.
 33. **Cost.** QA agent tokens are recorded under role `qa` for the review round; the VM's machine time is a separate `qa` record with `vmSeconds` (from create to dispose) and no USD figure, because the SDK's usage call is account-wide.
 34. **Helpers write code** in the builder's environment (its worktree, scratch dir and write rules). No helper environment is provisioned for new runs. `roles.helper` has no defaults; unset, it takes the builder's effective model and thinking (shown with source `default`).
 35. **Combined round verdict.** The reviewer and the QA agent run in parallel (`Promise.allSettled`); the round fails if either submitted a blocking finding. Findings are numbered across both (`F1…`), logged as separate `review` and `qa` entries with the same `reviewSeq`, and the next round's reviewer and QA agent each see only their own prior findings plus the builder's responses.
+
+## Discussions (added after AQ testing)
+
+The [discussions spec](docs/superpowers/specs/2026-10-11-discussion-flow-design.md) adds a chat with one model about
+one project before any ticket exists. The entries below are where the code differs from it, or from the design spec
+because of it.
+
+36. **Discussions may cover product questions.** Design spec §1 says "the discussion covers architecture only". That still holds for the architect's discussion inside a run. A discussion is a separate, optional step before a ticket, and the discussant's prompt invites product questions as well as technical ones.
+37. **The `# Prior discussion` section drops the sibling line when there are no siblings.** Discussions spec §2.3 shows "Other tickets drafted from the same discussion (out of scope here unless this ticket depends on them):" unconditionally. When the draft was the only ticket of its submission, that line and its empty list are left out: an empty list tells the architect nothing. Siblings are the other drafts of the same `submit_tickets` submission, which `Draft.batch` records.
+38. **Labels in the discussion view.**
+    - The header's action reads **Close discussion**, not **Close**.
+    - The sheet's exit button (the run view's close button, top right) reads **Close discussion view**. "Close discussion" was already taken by the header action, which closes the discussion itself; two controls with the same name would be ambiguous to screen readers and tests.
+    - The first input (the project context and the human's first message) shows as a factory card addressed to the discussant, as the model saw it, not as a message bubble from you.
+39. **`GET /api/events` takes `?discussion=<id>`.** Discussions spec §2.1 says the event stream needs no change. It passes `run`, `project` and now `discussion` to `subscribe`, so the UI can follow one discussion.
+40. **Stop is asynchronous.** Spec §1.2: `stopTurn` aborts, clears `turn` and adds the notice. Built: `stopTurn` marks the turn as stopped and aborts the Conversation's work; the discussion Task clears `turn` and adds the `stopped` notice ("Stopped by <who>") once that work has ended. Right after `stopTurn` returns, a `say` can still be refused for a moment. `stopTurn` aborts only while the stopped turn is still the one running, so a late Stop doesn't abort the next turn (a tiny window remains between that check and the abort).
+41. **Close and reopen wait for the discussion Task.** `closeDiscussion` waits up to 10 s for the discussion's Task to end, so a reopen can follow at once. `reopenDiscussion` and `retryDiscussion` are refused with `conflict` ("still finishing") while the previous Task is still running.
+42. **The checkout is on a local branch.** Spec §1.4 says a worktree of the default branch. Built: a worktree on branch `factory/<discussion id>`, started from the default branch and fast-forwarded to `origin/<default>` on reopen (`GitHub.refresh`). If the discussion started before its repo existed and the repo exists at reopen, the empty workspace is replaced by a checkout of the repo.
+43. **Small additions to the spec's types and checks.**
+    - `DiscussionView.cost` is `{ usd, totalTokens }`, not the whole `UsageSum`.
+    - Each notice carries the `turn` it belongs to, so the UI can place it after that turn.
+    - `updateDraft` refuses an empty change and a title over 200 characters (the `submit_tickets` limit). Drafts can be edited and deleted in a `CLOSED` discussion and during a `say` turn; only a `draft` turn locks them.
+    - A model error during a `draft` turn ends it with an `error` notice and no reminders.
+44. **`factory doctor` doesn't check `discussion.model`.** It checks the role models. A `discussion.model.model` the factory doesn't know is still refused on save and at `startDiscussion`.

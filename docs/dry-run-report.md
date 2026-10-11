@@ -1,4 +1,4 @@
-# Dry run of spec §8 — 2026-10-11T07:17:11.040Z
+# Dry run of spec §8 — 2026-10-11T07:28:36.811Z
 
 Directory: .dryrun (DRYRUN_DIR). Scripted agents (no model credentials), sandbox OFF (DRYRUN_SANDBOX=0), fake GitHub with local CI runner, SQLite storage, a daemonized `factory serve` driven through the web HTTP API (`POST /api/op/<op>`, `GET /api/events`).
 

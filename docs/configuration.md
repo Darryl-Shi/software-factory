@@ -48,6 +48,7 @@ If any check fails, the change is rejected and the file is left unchanged.
 | `roles.helper` | unset = the builder's model and thinking | Helpers the builder spawns; they write code in the builder's worktree |
 | `roles.reviewer` | `openai/gpt-6-sol`, `high` | Product vs spec, runs the tests, reviews the diff and code for quality and security |
 | `roles.qa` | `anthropic/claude-sonnet-5-5`, `medium` | AQ testing in a boat.dev VM; the model must accept images |
+| `discussion.model` | unset = the architect's model and thinking | The model a new discussion starts with (see below) |
 | `qa.enabled` | `true` | Run AQ testing beside each review. Set `false` per project to turn it off |
 | `boat.apiKey` | `env:BOAT_API_KEY` | Reference to the boat.dev API key (`env:` or `file:`, never the key). Needed when `qa.enabled` |
 | `boat.size` | `default` | VM size: `small`, `default` or `large` |
@@ -56,8 +57,8 @@ If any check fails, the change is rejected and the file is left unchanged.
 | `policy.approvals` | `[spec]` | Approval gates, any of `spec`, `delivery`, `merge` |
 | `policy.reviewRoundCap` | `3` (1–20) | Review rounds before escalation |
 | `policy.escalateOnNoProgress` | `true` | Escalate when a fix round leaves the diff unchanged |
-| `policy.messages` | `[architect, builder, reviewer]` | Roles a human can message while a run is going (the web UI's chat box). Drop `reviewer` for a review no human can sway |
-| `workdir` | `~/factory/work` | Clones, per-run worktrees and the roles' scratch dirs |
+| `policy.messages` | `[architect, builder, reviewer]` | Roles a human can message while a run is going (the web UI's chat box). Drop `reviewer` for a review no human can sway. `discussant` can't be listed: you talk to it in its discussion |
+| `workdir` | `~/factory/work` | Clones, per-run worktrees, discussions' read-only checkouts (`discussions/<id>`) and the roles' scratch dirs |
 | `github.identity` | `{ kind: pat, tokenRef: env:GH_TOKEN }` | How the factory authenticates to GitHub (see below) |
 | `github.visibility` | `private` | Visibility of the repos the factory creates |
 | `ci.mode` | `if-present` | `off` / `if-present` / `required` (see below) |
@@ -89,9 +90,27 @@ Each role's tools are fixed, not settings. The role's prompt (`role-<role>`) alw
 | helper | `coding`, `test-runner`, `web-search` (no `subagent`, no bridge tools) |
 | reviewer | `coding-readonly`, `test-runner`, `web-search` |
 | qa | `coding-readonly` (bash runs in the VM), `computer`, `web-search` |
+| discussant | `coding-readonly`, `web-search` (bridge tool: `submit_tickets`) |
 
 Model credentials are not settings. pi-ai reads them from the environment, e.g. `ANTHROPIC_API_KEY` and
 `OPENAI_API_KEY`.
+
+### Discussions
+
+`discussion.model` has the same two fields as a role, `model` and `thinking`, with the same checks: the model must be
+known and the thinking level valid. Each field left unset at every layer takes the architect's effective value, so by
+default a discussion uses the architect's model. A project can override it like any setting.
+
+The value is only a default. The web UI's **New discussion** dialog prefills it from the chosen project, you can
+change it there, and the discussion pins what it started with: changing the setting later doesn't affect discussions
+that already exist. A discussion also pins the project's effective settings at start, as a run does; its checkout
+lives under `workdir` and gets the architect's sandbox rules (read-only worktree, writable scratch dir, the same
+network policy). `sandbox.setupScripts` don't run for discussions.
+
+```yaml
+discussion:
+  model: { model: anthropic/claude-opus-5-5, thinking: high }
+```
 
 ### Web UI
 

@@ -1,7 +1,9 @@
 // Dry trial of spec §8 through the web HTTP API: a daemonized `factory serve` (SQLite storage, sandbox ON unless DRYRUN_SANDBOX=0, a fake
 // GitHub on the local disk with a local CI runner, scripted agents) driven by `POST /api/op/<op>` calls and the
 // `GET /api/events` stream; `factory serve`, `web` and `stop` are the only CLI commands it runs. Every step names the
-// §8 item it exercises. Writes <dir>/report.md and exits non-zero if a check fails.
+// §8 item it exercises. The first ticket comes from a discussion (startDiscussion, two `say`s, requestDrafts,
+// updateDraft, createTicket); the discussant's web_search goes to a fake Parallel endpoint served here.
+// Writes <dir>/report.md and exits non-zero if a check fails.
 //
 //   npm run dry-run                  # fresh dir under /tmp
 //   DRYRUN_DIR=/tmp/x npm run dry-run

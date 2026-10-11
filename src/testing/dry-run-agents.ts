@@ -4,6 +4,7 @@
 // helper that writes the QA run script); the reviewer really runs the test suite and the acceptance behaviours and
 // reports evidence it observed; the QA agent uses the product in the (fake) boat.dev VM and cites screenshots.
 // Round 1 of a new todo build deliberately ships without `remove`, so the first review fails for a real reason.
+// Before all that, the discussant talks the todo CLI through with the human and drafts the first ticket.
 import { call, calls, humanText, type Script, type ScriptContext, say } from "./scripted.ts";
 
 const delay = Number(process.env.DRYRUN_TURN_DELAY_MS ?? 0);
@@ -591,7 +592,7 @@ discussant.onMessage = (ctx) => {
 			),
 		);
 	}
-	return say(side.turn === 0 ? `Noted: ${text.split("\n")[0]}` : "Done.");
+	return slow(say(side.turn === 0 ? `Noted: ${text.split("\n")[0]}` : "Done."));
 };
 
 export const DRY_RUN_SCRIPTS: Record<string, Script> = {
