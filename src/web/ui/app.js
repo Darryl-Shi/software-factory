@@ -267,7 +267,7 @@ async function flush() {
   if (newProject) { ui.projects = await core.listProjects().catch(() => ui.projects); renderProjectFilter(); }
   renderBoard();
   if (ui.open && ids.includes(ui.open)) renderRunView();
-  discussionRunsChanged(ids);
+  withDiscussions(() => discussionRunsChanged(ids));
 }
 // Transcripts of the open run: refetched (throttled) when the conversation changes.
 const convTimers = new Map();
@@ -286,7 +286,7 @@ function refreshConv(run, cid) {
   }, 120);
 }
 function onEvent(e) {
-  if (e.type.startsWith("discussion.")) return onDiscussionEvent(e);
+  if (e.type.startsWith("discussion.")) return withDiscussions(() => onDiscussionEvent(e));
   if (e.type === "conversation.updated") {
     ui.touched.set(String(e.conversationId), Date.now());
     const r = ui.runs.get(e.run);
@@ -312,9 +312,9 @@ async function resync() {
     const [projects, runs, discs] = await Promise.all([core.listProjects(), core.listRuns(), core.listDiscussions()]);
     ui.projects = projects; ui.runs = new Map(runs.map((r) => [r.id, r])); ui.discs = new Map(discs.map((d) => [d.id, d]));
     renderProjectFilter(); renderBoard();
-    if (ui.mode === "discussion") resyncDiscussion();
+    if (ui.mode === "discussion") withDiscussions(resyncDiscussion);
     else if (ui.open) { if (ui.runs.has(ui.open)) { renderRunView(); loadThread(false); } else closeRun(); }
-    if (!$("#view-discussions").hidden) renderDiscussions();
+    if (!$("#view-discussions").hidden) withDiscussions(renderDiscussions);
     if (!$("#view-settings").hidden) renderSettings();
   } catch (e) { toast(String(e.message ?? e), "error"); }
 }
@@ -438,28 +438,30 @@ async function openRun(id, fromEl) {
   for (const c of new Set(extra.map(String))) {
     try { ui.tx.set(c, await core.getConversation(id, c)); } catch {}
   }
-  if (ui.open === id) { renderThreads(openRunData()); updateComposerLive(openRunData()); }
+  if (ui.open !== id || ui.mode === "discussion") return;
+  renderThreads(openRunData()); updateComposerLive(openRunData());
   ($("#cmp-answer") ?? $("#cmp-chat") ?? $("#rv-close")).focus({ preventScroll: true });
 }
 let closing = false;
 async function closeRun() {
   if (!ui.open || closing) return;
   closing = true;
-  const id = ui.open, rv = $("#runview"), bd = $("#rv-backdrop");
+  const id = ui.open, rv = $("#runview"), bd = $("#rv-backdrop"), wasDiscussion = ui.mode === "discussion";
+  // A run shrinks back into its board card, a discussion into its row in the list.
+  const home = () => (wasDiscussion ? (typeof discRowEl === "function" ? discRowEl(id) : null) : cardEl(id));
   $("#rv-threads").classList.remove("open");
   bd.classList.remove("on");
   try { history.replaceState(null, "", location.pathname); } catch {}
   if (!reduceMotion()) {
-    const to = insetOf(cardEl(id));
+    const to = insetOf(home());
     const a = rv.animate([{ clipPath: "inset(0px 0px 0px 0px round 0px)", opacity: 1 }, { clipPath: to ?? "inset(3% 3% 3% 3% round 18px)", opacity: to ? 1 : 0 }], { duration: 380, easing: "cubic-bezier(.4, 0, .2, 1)" });
     rv.querySelectorAll(".rv-top, .rv-body").forEach((el) => el.animate([{ opacity: 1 }, { opacity: 0, offset: 0.45 }, { opacity: 0 }], { duration: 380 }));
     await a.finished.catch(() => {});
   }
-  const wasDiscussion = ui.mode === "discussion";
-  ui.open = null; ui.mode = null; delete rv.dataset.mode; ui.tx.clear(); rv.hidden = true; bd.hidden = true; closing = false;
+  ui.open = null; ui.mode = null; delete rv.dataset.mode; sheetLabels(false); ui.tx.clear(); rv.hidden = true; bd.hidden = true; closing = false;
   renderBoard();
-  if (wasDiscussion) renderDiscussions();
-  const c = cardEl(id);
+  if (wasDiscussion) withDiscussions(renderDiscussions);
+  const c = home();
   if (c) { c.focus({ preventScroll: true }); if (!reduceMotion()) c.animate([{ boxShadow: "0 0 0 3px var(--accent-line)" }, { boxShadow: "0 0 0 0 transparent" }], { duration: 900, easing: "ease-out" }); }
 }
 
@@ -637,7 +639,7 @@ async function loadThread(first) {
   let t;
   try { t = await core.getConversation(r.id, id); }
   catch (e) { toast(String(e.message ?? e), "error"); return; }
-  if (!ui.open || String(ui.thread) !== String(id)) return;
+  if (ui.open !== r.id || ui.mode === "discussion" || String(ui.thread) !== String(id)) return;
   ui.tx.set(String(id), t);
   renderTranscript(openRunData(), t, first);
   renderThreads(openRunData());
@@ -925,7 +927,7 @@ function renderDetails(r) {
       ${terminal ? (r.state !== "DELIVERED" ? `<button type="button" class="btn primary" id="d-retry">${ICON.retry} Retry run</button>` : `<span class="meta">Delivered runs are final.</span>`) : `<button type="button" class="btn danger" id="d-cancel">${ui.confirmCancel ? "Click again to cancel" : "Cancel run"}</button>`}
     </div></section>`;
   $("#d-spec")?.addEventListener("click", () => openSpec(r));
-  $("#d-disc")?.addEventListener("click", () => openDiscussion(from.id));
+  $("#d-disc")?.addEventListener("click", () => withDiscussions(() => openDiscussion(from.id)));
   $("#d-retry")?.addEventListener("click", () => act(() => core.retryRun(r.id), "Retrying").then(() => refreshRun(r.id)));
   $("#d-cancel")?.addEventListener("click", () => {
     if (!ui.confirmCancel) { ui.confirmCancel = true; renderDetails(r); setTimeout(() => { ui.confirmCancel = false; if (ui.open === r.id) renderDetails(openRunData()); }, 4000); return; }
@@ -1010,7 +1012,19 @@ async function saveSetting(el) {
 function showView(name) {
   for (const v of ["board", "discussions", "settings"]) $(`#view-${v}`).hidden = v !== name;
   document.querySelectorAll(".nav button").forEach((b) => (b.dataset.view === name ? b.setAttribute("aria-current", "page") : b.removeAttribute("aria-current")));
-  if (name === "settings") renderSettings(); else if (name === "discussions") renderDiscussions(); else renderBoard();
+  if (name === "settings") renderSettings(); else if (name === "discussions") withDiscussions(renderDiscussions); else renderBoard();
+}
+// discussions.js (a deferred script after this one) defines the discussion globals; run `f` once it has loaded.
+function withDiscussions(f) {
+  if (typeof openDiscussion === "function") return f();
+  addEventListener("DOMContentLoaded", () => { if (typeof openDiscussion === "function") f(); }, { once: true });
+}
+// The sheet's labels: a run's ticket, or a discussion.
+function sheetLabels(discussion) {
+  const close = discussion ? "Close discussion view" : "Close ticket", details = discussion ? "Discussion details" : "Ticket details";
+  $("#rv-close").setAttribute("aria-label", close); $("#rv-close").title = `${discussion ? "Back to the list" : "Close"} (Esc)`;
+  $("#rv-details-btn").setAttribute("aria-label", details); $("#rv-details-btn").title = details;
+  $("#rv-details").setAttribute("aria-label", details);
 }
 function wire() {
   document.querySelectorAll(".nav button").forEach((b) => b.addEventListener("click", () => showView(b.dataset.view)));
@@ -1087,6 +1101,6 @@ async function boot() {
   renderProjectFilter(); renderBoard();
   const m = /^#run=(.+)$/.exec(location.hash), d = /^#disc=(.+)$/.exec(location.hash);
   if (m && ui.runs.has(decodeURIComponent(m[1]))) openRun(decodeURIComponent(m[1]), null);
-  else if (d) openDiscussion(decodeURIComponent(d[1]));
+  else if (d) withDiscussions(() => { showView("discussions"); openDiscussion(decodeURIComponent(d[1])); });
 }
 boot();

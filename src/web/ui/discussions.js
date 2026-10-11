@@ -152,7 +152,7 @@ async function openDiscussion(id, fromEl) {
   Object.assign(ui, { open: id, mode: "discussion", dtx: null, dComposerKey: null, dRenderLater: false, stick: true, txConv: null });
   try { history.replaceState(null, "", `#disc=${encodeURIComponent(id)}`); } catch {}
   const rv = $("#runview"), bd = $("#rv-backdrop");
-  rv.dataset.mode = "discussion";
+  rv.dataset.mode = "discussion"; sheetLabels(true);
   $("#dock").hidden = true; $("#dock").innerHTML = ""; setDockPad();
   $("#composer").innerHTML = ""; $("#rv-progress").innerHTML = ""; $("#rv-threads").innerHTML = ""; $("#rv-details-inner").innerHTML = "";
   ui.tx.clear();
@@ -172,7 +172,7 @@ function renderDiscussionView() {
   const d = openDisc(); if (!d) return;
   $("#rv-key").textContent = d.project;
   $("#rv-title").textContent = d.title;
-  $("#rv-state").innerHTML = discLabel(d);
+  $("#rv-state").innerHTML = `${discLabel(d)}<span class="chip-model rv-model" title="Model · thinking (pinned at start)">${esc(d.model.model)} · ${esc(d.model.thinking)}</span>`;
   $("#rv-cost").textContent = money(d.cost.usd);
   renderDiscActions(d); renderDiscComposer(d); renderDrafts(d); renderDiscTranscript(false);
 }
@@ -260,7 +260,7 @@ function renderDiscTranscript(first) {
   const [st, cls] = d.state === "PREPARING" ? [`<span class="spin"></span> Preparing`, "live"]
     : busy ? [`<span class="spin"></span> ${d.turn?.kind === "draft" ? "Drafting tickets" : "Replying"}`, "live"]
     : d.state === "OPEN" ? ["Your turn", "wait"] : [DISC_STATE[d.state]?.[0] ?? d.state, ""];
-  $("#conv-head").innerHTML = `${avatar("discussant", busy)}<span class="who">Discussant</span><span class="chip-model">${esc(d.model.model)} · ${esc(d.model.thinking)}</span><span class="conv-status ${cls}">${st}</span>`;
+  $("#conv-head").innerHTML = `${avatar("discussant", busy)}<span class="who">Discussant</span><span class="conv-status ${cls}">${st}</span>`;
   const tx = $("#tx"), key = `disc:${d.id}`;
   if (first || ui.txConv !== key) { tx.replaceChildren(); ui.txConv = key; first = true; }
   settleScroll(first, patch(tx, discBlocks(d, t), !first));
@@ -465,7 +465,7 @@ function discussionRunsChanged(ids) {
   // A render held back while a field had focus happens when focus leaves; after a click, once the click is handled.
   let pointerDown = false;
   document.addEventListener("pointerdown", () => (pointerDown = true), true);
-  document.addEventListener("pointerup", () => { pointerDown = false; setTimeout(flushDraftRender, 0); }, true);
+  for (const ev of ["pointerup", "pointercancel"]) document.addEventListener(ev, () => { pointerDown = false; setTimeout(flushDraftRender, 0); }, true);
   inner.addEventListener("focusout", (e) => {
     if (e.target.matches?.("[data-field]")) saveDraftField(e.target);
     if (ui.mode === "discussion" && !pointerDown) setTimeout(flushDraftRender, 0);

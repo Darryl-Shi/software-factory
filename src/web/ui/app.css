@@ -526,6 +526,7 @@ table.cost tr.total td { font-weight: 600; border-bottom: 0; }
 .runview[data-mode="discussion"] .rv-progress, .runview[data-mode="discussion"] .rv-threads, .runview[data-mode="discussion"] .drawer-btn.threads { display: none; }
 .runview:not([data-mode="discussion"]) .rv-disc-actions { display: none; }
 .rv-disc-actions { display: inline-flex; gap: 6px; }
+#rv-state { display: inline-flex; align-items: center; gap: 8px; min-width: 0; }
 .runview[data-mode="discussion"] .rv-body { grid-template-columns: minmax(0, 1fr) 0px; }
 .runview[data-mode="discussion"] .rv-body.with-details { grid-template-columns: minmax(0, 1fr) 348px; }
 .blk.turn-cost { text-align: right; font-size: 11.5px; color: var(--fg-3); font-variant-numeric: tabular-nums; margin: 6px 0 0; }
@@ -555,4 +556,5 @@ table.cost tr.total td { font-weight: 600; border-bottom: 0; }
   .disc-row { grid-template-columns: minmax(0, 1fr); }
   .dr-side { justify-items: start; }
   .rv-disc-actions .btn { padding: 3px 6px; }
+  .rv-model { display: none; }
 }

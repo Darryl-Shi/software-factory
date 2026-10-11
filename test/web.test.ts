@@ -255,8 +255,6 @@ describe("static UI", () => {
 		// every operation the UI calls is one the server allows
 		const used = new Set([...`${js}\n${disc}`.matchAll(/core\.([a-zA-Z]+)\(/g)].map((m) => m[1]!));
 		used.delete("subscribe");
-		// Drafting and tickets come with the core's drafting task (built in parallel); drop this once they are in CORE_OPS.
-		for (const pending of ["requestDrafts", "updateDraft", "deleteDraft", "createTicket"]) used.delete(pending);
 		const server = readFileSync(join(import.meta.dirname, "../src/core/types.ts"), "utf8");
 		for (const name of used) expect(server).toContain(`"${name}",`);
 	});

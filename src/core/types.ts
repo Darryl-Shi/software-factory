@@ -44,6 +44,8 @@ export interface DiscussionNotice {
 	at: number;
 	kind: "error" | "stopped" | "no_submission";
 	text: string;
+	/** The turn (its seq, as in `turnCosts`) that ended with this notice. */
+	turn?: number;
 }
 export interface TurnCost {
 	turn: number;
