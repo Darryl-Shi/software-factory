@@ -6,13 +6,13 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFi
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT as c } from "@earendil-works/chord/context";
-import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
 import { beforeAll, describe, expect, test } from "vitest";
 import { git } from "../src/github/git.ts";
 import { Sandbox } from "../src/sandbox/sandbox.ts";
+import { sandboxAvailable } from "./sandbox-available.ts";
 import type { Workspace } from "../src/core/types.ts";
 
-const available = process.platform === "linux" && SandboxManager.checkDependencies().errors.length === 0;
+const available = sandboxAvailable;
 
 async function exec(env: any, cmd: string) {
 	let out = "";
