@@ -89,7 +89,7 @@ view that reuses the run view's shell.
   export type DiscussionId = string;
   export const DISCUSSION_STATES = ["PREPARING", "OPEN", "CLOSED", "FAILED"] as const;
   export type DiscussionState = (typeof DISCUSSION_STATES)[number];
-  export interface Draft { id: string; title: string; body: string; edited: boolean; runId?: RunId }
+  export interface Draft { id: string; title: string; body: string; edited: boolean; batch: number; runId?: RunId }   // batch: which submit_tickets submission it came from (1-based)
   export interface DiscussionNotice { at: number; kind: "error" | "stopped" | "no_submission"; text: string }
   export interface TurnCost { turn: number; kind: "say" | "draft"; usd: number; totalTokens: number; durationMs: number }
   export interface DiscussionView {
@@ -268,8 +268,10 @@ view that reuses the run view's shell.
     `{ kind: "say" | "draft"; key: string; seq: number; text: string; by: string; msgId?: string; startedAt: number; stopRequested?: boolean } | null`.
     `text` is the content to submit: for `say`, the human's text; for `draft`, the drafting instructions.
   - `firstMessage: { text: string; by: string }` (consumed by the first turn);
-  - `closedTaskIds?: string[]` is not needed. Like `retryRun`, check that the old task is terminal with
-    `harness.getTask`.
+  - `counters: { turnSeq: number; draftSeq: number; batch: number }`.
+
+  `reopenDiscussion` and `retryDiscussion` check that the old task is terminal with `harness.getTask`, as
+  `retryRun` does.
 - Produces: `DiscussionServices = Pick<CoreServices, "github" | "sandbox" | "bridge" | "now" | "log"> & { changed(id: string, ms: number): Promise<void> }`.
   `Factory.changed` is reused; its waiter map is keyed by any document id.
 - Produces: these `Factory` operations, with the refusals from spec §2.1:
@@ -359,7 +361,7 @@ view that reuses the run view's shell.
     const id = await t.factory.startDiscussion("p", { title: "auth?", message: "how should login work?" });
     expect(id).toBe("disc-1");
     const v = await t.factory.waitForDiscussion(id, open);
-    expect(v.model).toEqual({ model: "scripted/discussant", thinking: "medium" });
+    expect(v.model).toEqual({ model: "scripted/discussant", thinking: "high" });   // thinking falls back to the architect's default
     expect(t.control.discussantInputs[0]).toMatch(/^# Discussion\nTitle: auth\?[\s\S]*# Project\nProject: p; repo binding: me\/p[\s\S]*# The human's first message\nhow should login work\?/);
     const tv = await t.factory.getDiscussionConversation(id);
     expect(tv.role).toBe("discussant");
@@ -395,7 +397,7 @@ view that reuses the run view's shell.
     await t.factory.waitForDiscussion(id, open);
     const res = (await t.factory.getDiscussionConversation(id)).items.find((i) => i.toolResult?.name === "write");
     expect(res?.toolResult?.isError).toBe(true);
-    expect(existsSync(join(v.workspace!.path, "x.txt"))).toBe(false);
+    expect(existsSync(join((await t.factory.getDiscussion(id)).workspace!.path, "x.txt"))).toBe(false);
   });
   test("the pinned model is kept when discussion.model changes later", async () => {   // Review Focus 4
     await t.factory.setSetting({ project: "p" }, "discussion.model.model", "scripted/discussant-b");
@@ -464,15 +466,18 @@ view that reuses the run view's shell.
 - After each `sub.wait`, read `BridgeDoc.results[turn.key]`.
 - If there is no result and the turn wasn't stopped, send up to `MAX_NUDGES` reminders with request ids
   `<key>:nudge<k>`. Use the run task's reminder wording, with the tool name `submit_tickets`.
-- **With a result:** in one commit, set `summary`, drop the drafts without a `runId`, and append the new drafts
-  (`D<++draftSeq>`, `edited: false`).
+- **With a result:** in one commit:
+  - set `summary`;
+  - increment `counters.batch`;
+  - drop the drafts without a `runId`;
+  - append the new drafts (`D<++draftSeq>`, `edited: false`, `batch: counters.batch`).
 - **Without a result:** add a `no_submission` notice, "The model did not submit draft tickets; the drafts are
   unchanged".
 - **Stopped:** add a `stopped` notice and make no draft changes, even if a result arrived after the stop was
   requested.
 
-**The test script:** `discussant(ctx)` for an input starting with `# Draft tickets` follows
-`control.draftPlan.shift() ?? "ok"`:
+**The test script:** `discussant(ctx)` for an input starting with `# Draft tickets` first waits while
+`control.discussantHang` (at turn 0), then follows `control.draftPlan.shift() ?? "ok"`:
 - `"ok"`: call `submit_tickets` with summary `"S: settled X; open Y"` and tickets `[{title: "API", body: "B1"}, {title: "UI", body: "B2"}]`;
 - `"invalid-then-ok"`: first send an empty summary, then, after the error result, the ok payload;
 - `"none"`: say `"thinking"` on every turn, never submitting;
@@ -485,12 +490,12 @@ view that reuses the run view's shell.
     await t.factory.requestDrafts(id, "split API and UI");
     const v = await t.factory.waitForDiscussion(id, open);
     expect(v.summary).toBe("S: settled X; open Y");
-    expect(v.drafts).toEqual([{ id: "D1", title: "API", body: "B1", edited: false }, { id: "D2", title: "UI", body: "B2", edited: false }]);
+    expect(v.drafts).toEqual([{ id: "D1", title: "API", body: "B1", edited: false, batch: 1 }, { id: "D2", title: "UI", body: "B2", edited: false, batch: 1 }]);
     expect(t.control.discussantInputs.at(-1)).toMatch(/^# Draft tickets[\s\S]*split API and UI/);
   });
   test("an invalid submission gets the problems back and the next one counts", async () => { /* draftPlan ["invalid-then-ok"] → drafts length 2; transcript has a submit_tickets error result containing "summary is required" */ });
   test("no submission after 2 reminders: notice, drafts unchanged", async () => { /* drafts D1,D2 exist; draftPlan ["none"] → notices.at(-1).kind === "no_submission"; drafts unchanged; transcript has 2 user items matching /You stopped without calling submit_tickets/ */ });
-  test("a redraft replaces only drafts that are not runs yet", async () => { /* set D1.runId by createTicket in Task 5; here: updateDraft D1, redraft with "one" → drafts = [D3 Only] */ });
+  test("a redraft replaces every unconverted draft, edited or not", async () => { /* updateDraft D1; draftPlan ["one"]; requestDrafts → drafts = [{ id: "D3", title: "Only", batch: 2, … }] (converted drafts surviving a redraft are tested in Task 5) */ });
   test("updateDraft and deleteDraft; refused during a draft turn and for unknown drafts", async () => {
     await t.factory.updateDraft(id, "D1", { body: "edited" });
     expect((await t.factory.getDiscussion(id)).drafts[0]).toMatchObject({ body: "edited", edited: true });
@@ -554,8 +559,7 @@ view that reuses the run view's shell.
 - Consumes: Task 4's drafts and summary; `startRun`'s seed (`src/core/core.ts:375-403`).
 - Produces: `createTicket(id: DiscussionId, draft: string): Promise<RunId>`.
   - Allowed on `OPEN` or `CLOSED`, when the draft has no `runId` and no `draft` turn is running.
-  - The run's request is spec §2.3's, with `siblings` = the titles of the other drafts that are currently unconverted
-    or that came from the same submission. Simplest rule: all current drafts except this one.
+  - The run's request is spec §2.3's, with `siblings` = the titles of the other drafts with the same `batch`.
   - The `RunIndex` push, `RunDoc` seed, `createTask` and `draft.runId = runId` all happen in one
     `this.root.commit`. The draft check happens inside that commit, so the second of two concurrent calls throws
     `conflict`.
