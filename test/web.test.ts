@@ -186,6 +186,59 @@ describe("operations and events", () => {
 	});
 });
 
+/** Opens `/api/events?<query>` and collects its frames into `got`. */
+async function sse(port: number, token: string, query: string) {
+	const got: any[] = [];
+	const stream = await new Promise<import("node:http").IncomingMessage>((resolve, reject) => {
+		const req = request({ host: "127.0.0.1", port, path: `/api/events?${query}`, headers: { host: `127.0.0.1:${port}`, authorization: `Bearer ${token}` } }, resolve);
+		req.on("error", reject);
+		req.end();
+	});
+	stops.push(async () => void stream.destroy());
+	let buf = "";
+	stream.on("data", (c) => {
+		buf += c;
+		for (let i = buf.indexOf("\n\n"); i >= 0; i = buf.indexOf("\n\n")) {
+			const data = /^data: (.*)$/m.exec(buf.slice(0, i))?.[1];
+			buf = buf.slice(i + 2);
+			if (data) got.push(JSON.parse(data));
+		}
+	});
+	return { got, stream };
+}
+async function waitFor(cond: () => boolean | Promise<boolean>, ms = 10_000) {
+	for (const end = Date.now() + ms; !(await cond()); ) {
+		if (Date.now() > end) throw new Error("waitFor timed out");
+		await new Promise((r) => setTimeout(r, 20));
+	}
+}
+
+describe("discussions", () => {
+	test("discussion operations over HTTP, their error codes, and the discussion event filter", async () => {
+		const { port, token } = await serve();
+		await t!.host.seedRepo("me/p", { "README.md": "# p\n" });
+		await op(port, token, "createProject", ["p", "me/p"]);
+		const es = await sse(port, token, "discussion=disc-1");
+		const id = JSON.parse((await op(port, token, "startDiscussion", ["p", { title: "t", message: "m" }])).body).result;
+		expect(id).toBe("disc-1");
+		// a second discussion's events must not reach disc-1's stream
+		const other = JSON.parse((await op(port, token, "startDiscussion", ["p", { title: "u", message: "n" }])).body).result;
+		expect(other).toBe("disc-2");
+		await waitFor(() => es.got.some((e) => e.type === "discussion.state" && e.to === "OPEN"));
+		const v2 = await t!.factory.waitForDiscussion(other, (v) => v.state !== "PREPARING");
+		expect(v2.state).toBe("OPEN");
+		await new Promise((r) => setTimeout(r, 100));
+		expect(es.got.length).toBeGreaterThan(0);
+		expect(es.got.every((e) => e.discussion === id)).toBe(true);
+		const missing = await op(port, token, "say", ["disc-9", "x"]);
+		expect(missing.status).toBe(404);
+		expect(JSON.parse(missing.body).code).toBe("not_found");
+		const empty = await op(port, token, "say", [id, ""]);
+		expect(empty.status).toBe(400);
+		expect(JSON.parse(empty.body).code).toBe("invalid");
+	});
+});
+
 describe("static UI", () => {
 	test("app.js parses; index.html loads only same-origin files and has no inline script (CSP)", () => {
 		const js = readFileSync(join(UI, "app.js"), "utf8");
