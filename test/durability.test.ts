@@ -4,8 +4,8 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, expect, test } from "vitest";
-import type { RunView } from "../src/core/types.ts";
+import { afterEach, describe, expect, test } from "vitest";
+import type { DiscussionView, FactoryEvent, RunView } from "../src/core/types.ts";
 import { makeFactory, newControl, type TestEnv } from "./helpers.ts";
 
 let t: TestEnv | undefined;
@@ -14,7 +14,8 @@ afterEach(async () => {
 	t = undefined;
 });
 
-async function crashChild(dir: string, mode: string): Promise<{ run: string; before: RunView }> {
+/** `run`: the id the child wrote (a discussion's for the "disc-" modes); `before`: its view when it was killed. */
+async function crashChild<V = RunView>(dir: string, mode: string): Promise<{ run: string; before: V }> {
 	const child = spawn(process.execPath, ["--import", "tsx", join(__dirname, "fixtures/crash-child.ts"), dir, mode], { stdio: "pipe", cwd: join(__dirname, "..") });
 	let err = "";
 	child.stderr.on("data", (d) => (err += d));
@@ -145,4 +146,98 @@ test("a QA VM deleted by hand while the factory is down is replaced on resume, a
 	const tr = await t.factory.getConversation(run, v.conversations.qa[0]!.id);
 	expect(tr.items.some((i) => i.role === "user" && /has been replaced/.test(i.text ?? ""))).toBe(true);
 	expect((await t.boat.list()).filter((x) => x.name?.includes(run))).toEqual([]);
+});
+
+describe("discussions", () => {
+	/** A discussion that is OPEN with no turn running. */
+	const open = (v: DiscussionView) => v.state === "OPEN" && v.turn === null;
+	const ok = [
+		{ id: "D1", title: "API", body: "B1", edited: false, batch: 1 },
+		{ id: "D2", title: "UI", body: "B2", edited: false, batch: 1 },
+	];
+
+	test("restart while idle: still OPEN and say works at once", async () => {
+		t = await makeFactory({ storage: "sqlite" });
+		await t.host.seedRepo("me/p", { "README.md": "# p\n" });
+		await t.factory.createProject("p", "me/p");
+		const id = await t.factory.startDiscussion("p", { title: "t", message: "m" });
+		const v1 = await t.factory.waitForDiscussion(id, open);
+		await t.factory.close();
+		await t.reopen();
+		const v2 = await t.factory.getDiscussion(id);
+		expect(v2.state).toBe("OPEN");
+		expect(v2.conversationId).toBe(v1.conversationId);
+		// the rebuilt cache: no spurious state change, and the Conversation maps back to the discussion
+		const events: FactoryEvent[] = [];
+		t.factory.subscribe({ discussion: id }, (e) => events.push(e));
+		await t.factory.say(id, "after restart");
+		expect((await t.factory.waitForDiscussion(id, open, 10_000)).turnCosts).toHaveLength(2);
+		await new Promise((r) => setTimeout(r, 300)); // conversation events are throttled (150 ms)
+		expect(events.filter((e) => e.type === "discussion.state")).toEqual([]);
+		expect(events.some((e) => e.type === "discussion.conversation.updated" && e.conversationId === v1.conversationId)).toBe(true);
+		expect(t.control.discussantHeard).toContain("after restart");
+		expect((await t.factory.getDiscussionConversation(id)).items.at(-1)).toMatchObject({ role: "assistant", text: "re: after restart" });
+	});
+
+	test("kill -9 mid-turn: the turn resumes and finishes once", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "sf-crash-"));
+		const { run: id, before } = await crashChild<DiscussionView>(dir, "disc-say");
+		expect(before.turn).toMatchObject({ kind: "say" });
+		t = await makeFactory({ dir, storage: "sqlite" });
+		const v = await t.factory.waitForDiscussion(id, open);
+		expect(v.state).toBe("OPEN");
+		expect(v.conversationId).toBe(before.conversationId);
+		expect(v.turnCosts.map((c) => c.turn)).toEqual([1, 2]);
+		expect(v.notices).toEqual([]);
+		const items = (await t.factory.getDiscussionConversation(id)).items;
+		expect(items.filter((i) => i.author === "human" && i.text === "slow")).toHaveLength(1);
+		expect(items.filter((i) => i.role === "assistant" && i.text === "re: slow")).toHaveLength(1);
+		// say works at once after the resumed turn
+		await t.factory.say(id, "next");
+		expect((await t.factory.waitForDiscussion(id, open)).turnCosts).toHaveLength(3);
+	});
+
+	test("kill -9 after submit_tickets is recorded: the drafts are applied once", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "sf-crash-"));
+		const { run: id, before } = await crashChild<DiscussionView>(dir, "disc-draft");
+		expect(before.turn).toMatchObject({ kind: "draft" });
+		expect(before.drafts).toEqual([]);
+		t = await makeFactory({ dir, storage: "sqlite" });
+		const v = await t.factory.waitForDiscussion(id, open);
+		expect(v.drafts).toEqual(ok);
+		expect(v.summary).toBe("S: settled X; open Y");
+		expect(v.turnCosts.at(-1)).toMatchObject({ turn: 2, kind: "draft" });
+		expect(v.notices).toEqual([]);
+		// the model was not asked again: one drafting input, one submission, no reminders
+		expect(t.control.discussantInputs).toEqual([]);
+		const items = (await t.factory.getDiscussionConversation(id)).items;
+		expect(items.filter((i) => i.toolResult?.name === "submit_tickets" && !i.toolResult.isError)).toHaveLength(1);
+		expect(items.filter((i) => i.role === "user" && /You stopped without calling submit_tickets/.test(i.text ?? ""))).toEqual([]);
+		// a later redraft numbers on from D2
+		t.control.draftPlan = ["one"];
+		await t.factory.requestDrafts(id);
+		expect((await t.factory.waitForDiscussion(id, open)).drafts).toEqual([{ id: "D3", title: "Only", body: "B", edited: false, batch: 2 }]);
+	});
+
+	test("kill -9 right after createTicket commits: one run, linked, and it proceeds", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "sf-crash-"));
+		const { run: id, before } = await crashChild<DiscussionView & { runId: string }>(dir, "disc-ticket");
+		expect(before.drafts[0]!.runId).toBe(before.runId);
+		t = await makeFactory({ dir, storage: "sqlite" });
+		const runs = (await t.factory.listRuns()).filter((r) => (r.request.meta as any)?.discussion?.draftId === "D1");
+		expect(runs.map((r) => r.id)).toEqual([before.runId]);
+		const d = await t.factory.getDiscussion(id);
+		expect(d.state).toBe("OPEN");
+		expect(d.drafts[0]!.runId).toBe(before.runId);
+		expect(d.drafts[1]!.runId).toBeUndefined();
+		// it proceeds: the architect got its input and the run moved past DISCUSSING without failing
+		const r = await t.factory.waitForState(before.runId, (x) => !["RECEIVED", "PREPARING", "DISCUSSING"].includes(x.state));
+		expect(r.state).not.toBe("FAILED");
+		expect(r.history.map((h) => h.to).slice(0, 3)).toEqual(["RECEIVED", "PREPARING", "DISCUSSING"]);
+		expect((await t.factory.getDiscussion(id)).runs).toEqual([{ id: before.runId, state: expect.any(String) }]);
+		// the other draft can still be turned into a ticket (makeFactory rewrote config.yaml: add the project back)
+		await t.factory.createProject("p", "me/p");
+		const run2 = await t.factory.createTicket(id, "D2");
+		expect((await t.factory.listRuns()).map((x) => x.id).sort()).toEqual([before.runId, run2].sort());
+	});
 });

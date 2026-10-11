@@ -58,7 +58,11 @@ export interface Control {
 	discussantHang?: boolean;
 	/** The discussant's replies to human messages fail with this provider error. */
 	discussantFail?: string;
-	/** Per draft turn, what the discussant does: ok | invalid-then-ok | none | one (default ok). */
+	/**
+	 * Per draft turn, what the discussant does: ok | invalid-then-ok | none | one | ok-then-hang (default ok).
+	 * ok-then-hang submits along with a bash call (so the loop goes on), then sets `discussantHang` and hangs on the
+	 * next step (crash tests).
+	 */
 	draftPlan: string[];
 }
 
@@ -188,6 +192,15 @@ export function scripts(control: Control): Record<string, Script> {
 				draftMode = control.draftPlan.shift() ?? "ok";
 			}
 			const tried = ctx.results.some((r) => r.name === "submit_tickets");
+			// the step after a recorded submission that did not end the loop (ok-then-hang, or its resumption after a crash)
+			if (ctx.results.some((r) => r.name === "submit_tickets" && !r.isError)) {
+				if (draftMode === "ok-then-hang") {
+					control.discussantHang = true;
+					while (control.discussantHang) await new Promise((r) => setTimeout(r, 50));
+				}
+				return say("submitted");
+			}
+			if (draftMode === "ok-then-hang") return calls(["submit_tickets", TICKETS], ["bash", { command: "true" }]);
 			if (draftMode === "none") return say("thinking");
 			if (draftMode === "one") return call("submit_tickets", { summary: TICKETS.summary, tickets: [{ title: "Only", body: "B" }] });
 			if (draftMode === "invalid-then-ok" && !tried) return call("submit_tickets", { ...TICKETS, summary: "" });
