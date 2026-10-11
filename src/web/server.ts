@@ -1,7 +1,7 @@
 // The factory's web interface: a ticket board and full-screen run view in the browser, over the core's operations
 // and events (spec §3.6); the core knows nothing about it.
 //   POST /api/op/<op>   { args: [...] } → { ok, result } | { ok: false, error, code }   (the CORE_OPS allowlist)
-//   GET  /api/events?run=&project=      server-sent events from core.subscribe
+//   GET  /api/events?run=&project=&discussion=   server-sent events from core.subscribe (the same filter)
 //   GET  /api/runs/<run>/screenshots/<id> a QA screenshot (core.getScreenshot), as image/png
 //   GET  /, /app.js, /app.css            the UI (static files, no build step)
 // Access needs a token: `factory serve` prints a link carrying it, and the first visit swaps it for an HttpOnly,
@@ -143,11 +143,11 @@ export async function startWebServer(core: FactoryCore, opts: WebOptions): Promi
 	});
 
 	function events(req: IncomingMessage, res: ServerResponse, url: URL) {
-		const filter: { run?: string; project?: string } = {};
-		const run = url.searchParams.get("run");
-		const project = url.searchParams.get("project");
-		if (run) filter.run = run;
-		if (project) filter.project = project;
+		const filter: { run?: string; project?: string; discussion?: string } = {};
+		for (const k of ["run", "project", "discussion"] as const) {
+			const v = url.searchParams.get(k);
+			if (v) filter[k] = v;
+		}
 		res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store", connection: "keep-alive", "x-content-type-options": "nosniff" });
 		res.write("retry: 2000\n\n");
 		streams.add(res);
