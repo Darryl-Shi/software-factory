@@ -380,6 +380,11 @@ export interface FactoryCore {
 	say(id: DiscussionId, text: string): Promise<void>;
 	/** Abort the turn that is running. */
 	stopTurn(id: DiscussionId): Promise<void>;
+	/** Ask the discussant for draft tickets and a summary (a `draft` turn), with the human's optional instructions. */
+	requestDrafts(id: DiscussionId, instructions?: string): Promise<void>;
+	/** Edit a draft that has not become a run; marks it `edited`. */
+	updateDraft(id: DiscussionId, draft: string, change: { title?: string; body?: string }): Promise<void>;
+	deleteDraft(id: DiscussionId, draft: string): Promise<void>;
 	closeDiscussion(id: DiscussionId): Promise<void>;
 	reopenDiscussion(id: DiscussionId): Promise<void>;
 	retryDiscussion(id: DiscussionId): Promise<void>;
@@ -415,6 +420,9 @@ export const CORE_OPS = [
 	"getDiscussionConversation",
 	"say",
 	"stopTurn",
+	"requestDrafts",
+	"updateDraft",
+	"deleteDraft",
 	"closeDiscussion",
 	"reopenDiscussion",
 	"retryDiscussion",
