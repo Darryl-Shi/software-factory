@@ -536,4 +536,20 @@ describe("handoff", () => {
 		expect(t!.control.architectInputs.at(-1)).not.toContain("# Prior discussion");
 		expect(t!.control.architectInputs.at(-1)).toMatch(/\n\nDiscuss the architecture with the human/);
 	});
+
+	test("startRun through as(name) with an empty source records the interface; createTicket through as(name) keeps source discussion", async () => {
+		const web = t!.factory.as("web");
+		const run = await web.startRun("p", { source: "", title: "x", body: "x" });
+		expect((await t!.factory.getRun(run)).request.source).toBe("web");
+		const ticket = await web.createTicket(id, "D1");
+		expect((await t!.factory.getRun(ticket)).request.source).toBe("discussion");
+	});
+
+	test("a partial meta.discussion from an interface does not break the architect input", async () => {
+		const run = await t!.factory.startRun("p", { source: "t", title: "x", body: "x", meta: { discussion: { title: "half" } } });
+		await until(t!.factory, run, (v) => v.conversations.architect !== undefined && t!.control.architectInputs.length > 0);
+		expect(t!.control.architectInputs.at(-1)).toMatch(/# Prior discussion\nThe human discussed this with a model before writing the ticket \("half"\)\. Its summary:\n\nTreat points/);
+		expect(t!.control.architectInputs.at(-1)).not.toContain("Other tickets drafted");
+		expect((await t!.factory.getRun(run)).state).not.toBe("FAILED");
+	});
 });

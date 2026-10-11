@@ -433,16 +433,20 @@ export class Factory implements FactoryCore {
 
 	// ------------------------------------------------------------------ runs
 	async startRun(project: string, request: Omit<Request, "id" | "project">): Promise<RunId> {
+		const by = this.by; // before any await: `as(name)` sets `by` only for the synchronous part of the call
 		let runId!: RunId;
 		await this.root.commit(async (tx) => {
-			runId = await this.createRunIn(tx, project, request);
+			runId = await this.createRunIn(tx, project, request, by);
 		}, this.ctx);
 		this.harness.resume();
 		return runId;
 	}
 
-	/** Create a run in `tx`: its `RunIndex` entry, its `RunDoc` seed and its Task (startRun, createTicket). Call `harness.resume()` after the commit. */
-	private async createRunIn(tx: Tx, project: string, request: Omit<Request, "id" | "project">): Promise<RunId> {
+	/**
+	 * Create a run in `tx`: its `RunIndex` entry, its `RunDoc` seed and its Task (startRun, createTicket). Call
+	 * `harness.resume()` after the commit. `by`: the calling interface, captured before the caller's first await.
+	 */
+	private async createRunIn(tx: Tx, project: string, request: Omit<Request, "id" | "project">, by: string): Promise<RunId> {
 		const p = this.config.project(project);
 		const eff = this.config.effective({ project });
 		const runId = `run-${this.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
@@ -451,7 +455,7 @@ export class Factory implements FactoryCore {
 			id: runId,
 			project,
 			repo: p.repo,
-			request: { ...request, id: runId, project, source: request.source || this.by },
+			request: { ...request, id: runId, project, source: request.source || by },
 			state: "RECEIVED",
 			createdAt: now,
 			updatedAt: now,
@@ -912,6 +916,7 @@ export class Factory implements FactoryCore {
 	}
 
 	async createTicket(id: DiscussionId, draft: string): Promise<RunId> {
+		const by = this.by; // before any await (see startRun)
 		// One commit: the run (index entry, seed, Task) and the draft's runId, checked inside it, so a second call is refused.
 		const runId = await this.changeDiscussion(id, async (d, tx) => {
 			if (d.state !== "OPEN" && d.state !== "CLOSED")
@@ -924,7 +929,7 @@ export class Factory implements FactoryCore {
 				summary: d.summary ?? "",
 				siblings: d.drafts.filter((y) => y !== x && y.batch === x.batch).map((y) => y.title),
 			};
-			const run = await this.createRunIn(tx, d.project, { source: "discussion", title: x.title, body: x.body, meta: { discussion } });
+			const run = await this.createRunIn(tx, d.project, { source: "discussion", title: x.title, body: x.body, meta: { discussion } }, by);
 			x.runId = run;
 			return run;
 		});

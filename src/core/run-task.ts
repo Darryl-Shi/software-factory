@@ -343,14 +343,15 @@ export function createRunTask(svc: CoreServices) {
 	// ------------------------------------------------------------------ prompts the core hands to roles (data, not guidance)
 	function architectFirstInput(d: RunDocState): string {
 		const ws = d.workspace!;
-		const disc = d.request.meta?.discussion as DiscussionLink | undefined;
+		// Interfaces may pass any meta to startRun: read it defensively.
+		const disc = d.request.meta?.discussion as Partial<DiscussionLink> | undefined;
 		// The discussion the ticket was drafted in (discussions spec §2.3); without one, the input is unchanged.
 		const prior = disc
 			? [
 					`# Prior discussion`,
-					`The human discussed this with a model before writing the ticket ("${disc.title}"). Its summary:`,
-					disc.summary,
-					...(disc.siblings.length > 0
+					`The human discussed this with a model before writing the ticket ("${disc.title ?? ""}"). Its summary:`,
+					String(disc.summary ?? ""),
+					...(Array.isArray(disc.siblings) && disc.siblings.length > 0
 						? [`Other tickets drafted from the same discussion (out of scope here unless this ticket depends on them):`, ...disc.siblings.map((s) => `- ${s}`)]
 						: []),
 					`Treat points the summary marks as settled as settled; ask only about what is still open.`,
