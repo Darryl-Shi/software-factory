@@ -1031,6 +1031,8 @@ function sheetLabels(discussion) {
   $("#rv-close").setAttribute("aria-label", close); $("#rv-close").title = `${discussion ? "Back to the board" : "Close"} (Esc)`;
   $("#rv-details-btn").setAttribute("aria-label", details); $("#rv-details-btn").title = details;
   $("#rv-details").setAttribute("aria-label", details);
+  $("#rv-threads-btn").setAttribute("aria-label", discussion ? "Show or hide the chat history" : "Show conversations");
+  $("#rv-threads").setAttribute("aria-label", discussion ? "Chat history" : "Conversations");
 }
 function wire() {
   document.querySelectorAll(".nav button").forEach((b) => b.addEventListener("click", () => showView(b.dataset.view)));
