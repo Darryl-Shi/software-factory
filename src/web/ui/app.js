@@ -174,6 +174,7 @@ const pending = (r) => (r.pendingAsk && !r.pendingAsk.response ? r.pendingAsk : 
 function visibleRuns() {
   const f = ui.filter, q = f.q.trim().toLowerCase();
   return [...ui.runs.values()].filter((r) => {
+    if (r.cleared) return false; // cleared runs stay in ui.runs (for stable ticket keys) but never show on the board
     if (f.project && r.project !== f.project) return false;
     if (f.turn && !pending(r)) return false;
     if (f.active && TERMINAL.includes(r.state)) return false;
@@ -212,11 +213,15 @@ function renderBoard() {
   const byCol = Object.fromEntries(COLUMNS.map((c) => [c.key, []]));
   runs.forEach((r) => byCol[columnOf(r)].push(r));
   for (const k in byCol) byCol[k].sort((a, b) => (pending(b) ? 1 : 0) - (pending(a) ? 1 : 0) || (k === "done" ? b.updatedAt - a.updatedAt : a.createdAt - b.createdAt));
+  // "Clear all" acts on exactly the Done cards shown; a pending confirmation resets when that set changes.
+  const doneSig = byCol.done.map((r) => r.id).sort().join(",");
+  if (ui.confirmClearAll && ui.confirmClearAll !== doneSig) ui.confirmClearAll = null;
+  ui.doneIds = byCol.done.map((r) => r.id);
   const first = ui.runs.size === 0;
   board.innerHTML = COLUMNS.map((c) => {
     const states = esc(c.key === "done" && ui.filter.closed ? "DELIVERED · FAILED · CANCELLED" : c.states);
     return `<section class="col${c.key === "done" ? " done-col" : ""}" data-col="${c.key}" aria-label="${c.name}">
-      <div class="col-head"><span class="col-name">${c.name}</span><span class="col-count">${byCol[c.key].length}</span></div>
+      <div class="col-head"><span class="col-name">${c.name}</span><span class="col-count">${byCol[c.key].length}</span>${c.key === "done" && byCol.done.length ? `<button type="button" class="btn small ghost col-clear${ui.confirmClearAll ? " confirm" : ""}" id="clear-all" data-clear-all title="Clear the Done cards shown from the board (nothing is deleted)">${ui.confirmClearAll ? `Click again to clear ${byCol.done.length}` : "Clear all"}</button>` : ""}</div>
       <div class="col-states" title="${states}">${states}</div>
       <div class="col-body">${byCol[c.key].map(cardHtml).join("") || `<div class="col-empty">${first && c.key === "intake" ? "Press <b>Create</b> to submit your first ticket" : "No tickets"}</div>`}</div>
     </section>`;
@@ -233,14 +238,34 @@ function renderBoard() {
   ui.rendered = true;
   ui.liveSig = liveSignature();
 
-  const all = [...ui.runs.values()].filter((r) => !ui.filter.project || r.project === ui.filter.project);
+  const all = [...ui.runs.values()].filter((r) => !r.cleared && (!ui.filter.project || r.project === ui.filter.project));
   $("#n-turn").textContent = all.filter((r) => pending(r)).length;
   $("#n-active").textContent = all.filter((r) => !TERMINAL.includes(r.state)).length;
   $("#n-closed").textContent = all.filter((r) => r.state === "FAILED" || r.state === "CANCELLED").length;
   const p = ui.projects.find((x) => x.name === ui.filter.project);
   $("#board-title").textContent = p ? `${p.name} pipeline` : "Pipeline";
-  const turns = [...ui.runs.values()].filter((r) => pending(r)).length;
+  const turns = [...ui.runs.values()].filter((r) => !r.cleared && pending(r)).length;
   document.title = turns ? `(${turns}) Factory Board` : "Factory Board";
+}
+// Cards leaving the board (cleared): the card animation in reverse, unless reduced motion is on.
+function animateOut(ids) {
+  if (reduceMotion()) return Promise.resolve();
+  const els = ids.map(cardEl).filter((el) => el && !el.dataset.leaving);
+  return Promise.all(els.map((el) => { el.dataset.leaving = "1"; return el.animate([{ opacity: 1, transform: "none" }, { opacity: 0, transform: "translateY(-6px) scale(.98)" }], { duration: 260, fill: "forwards" }).finished.catch(() => {}); }));
+}
+async function clearAll(btn) {
+  const ids = [...(ui.doneIds ?? [])];
+  if (!ids.length) return;
+  const sig = [...ids].sort().join(",");
+  if (ui.confirmClearAll !== sig) { ui.confirmClearAll = sig; renderBoard(); $("#clear-all")?.focus({ preventScroll: true }); return; }
+  ui.confirmClearAll = null;
+  btn.disabled = true;
+  let out;
+  const ok = await act(async () => { out = await core.clearRuns(ids); });
+  if (!ok) { renderBoard(); return; }
+  toast(`Cleared ${plural(ids.length, "run")} from the board`);
+  await animateOut(ids);
+  ids.forEach(refreshRun);
 }
 const liveSignature = () => [...ui.runs.values()].filter(runLive).map((r) => r.id).join(",");
 function renderProjectFilter() {
@@ -299,6 +324,7 @@ function onEvent(e) {
     return;
   }
   if (e.type === "settings.changed") { if (!$("#view-settings").hidden) renderSettings(); return; }
+  if (e.type === "run.cleared") { animateOut([e.run]).then(() => refreshRun(e.run)); return; }
   refreshRun(e.run);
   const key = keyOf(e.run);
   if (e.type === "run.ask" && ui.open !== e.run) toast(`${key}: ${e.question.kind === "discussion" ? "the architect has a question" : e.question.kind === "approval" ? `${e.question.gate} needs your approval` : "escalated to you"}`);
@@ -309,7 +335,7 @@ let boardTimer = 0;
 function scheduleBoard() { if (!boardTimer) boardTimer = setTimeout(() => { boardTimer = 0; if (!$("#view-board").hidden) renderBoard(); }, 120); }
 async function resync() {
   try {
-    const [projects, runs, discs] = await Promise.all([core.listProjects(), core.listRuns(), core.listDiscussions()]);
+    const [projects, runs, discs] = await Promise.all([core.listProjects(), core.listRuns({ includeCleared: true }), core.listDiscussions()]);
     ui.projects = projects; ui.runs = new Map(runs.map((r) => [r.id, r])); ui.discs = new Map(discs.map((d) => [d.id, d]));
     renderProjectFilter(); renderBoard();
     if (ui.mode === "discussion") withDiscussions(resyncDiscussion);
@@ -417,7 +443,7 @@ function insetOf(el) {
 }
 async function openRun(id, fromEl) {
   const r = ui.runs.get(id); if (!r || ui.open) return;
-  Object.assign(ui, { open: id, composerKey: null, rejecting: false, structured: false, escN: 2, confirmCancel: false, stick: true, txConv: null, lastActive: r.conversations.active, dockKey: null, dockAsk: null, dockMin: false, lastGateMsg: "" });
+  Object.assign(ui, { open: id, composerKey: null, rejecting: false, structured: false, escN: 2, confirmCancel: false, confirmClear: false, stick: true, txConv: null, lastActive: r.conversations.active, dockKey: null, dockAsk: null, dockMin: false, lastGateMsg: "" });
   try { history.replaceState(null, "", `#run=${encodeURIComponent(id)}`); } catch {}
   $("#dock").hidden = true; $("#dock").innerHTML = ""; $("#composer").innerHTML = "";
   ui.tx.clear();
@@ -474,7 +500,7 @@ function renderRunView() {
   const r = openRunData(); if (!r) return;
   $("#rv-key").textContent = keyOf(r.id);
   $("#rv-title").textContent = r.request.title;
-  $("#rv-state").innerHTML = stateLabel(r);
+  $("#rv-state").innerHTML = stateLabel(r) + (r.cleared ? ` <span class="lozenge cleared" title="${esc(clearedText(r))}">Cleared</span>` : "");
   $("#rv-cost").textContent = money(totalUsd(r));
   const { idx, name, cls } = stageInfo(r), done = r.state === "DELIVERED";
   const label = done ? "Delivered" : r.state === "FAILED" ? `Failed in ${name}` : r.state === "CANCELLED" ? "Cancelled" : `${name}${r.round > 1 ? ` · round ${r.round}` : ""}`;
@@ -486,6 +512,7 @@ function renderRunView() {
   if (ui.thread === "timeline") renderTimeline(r, false);
   else { const t = ui.tx.get(String(ui.thread)); if (t) renderTranscript(r, t, false); }
 }
+const clearedText = (r) => `Cleared from the board ${new Date(r.cleared.at).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })} by ${r.cleared.by === "web" ? "the web UI" : r.cleared.by}`;
 function modelOf(r, cid, role) {
   const c = r.cost.find((x) => same(x.conversationId, cid)) ?? [...r.cost].reverse().find((x) => x.role === role);
   return c ? `${c.model} · ${c.thinking}` : "";
@@ -664,6 +691,7 @@ function renderTimeline(r, first) {
   const ev = [
     ...r.history.map((h, i) => ({ k: `h${i}`, at: h.at, dot: h.to === "FAILED" || h.to === "ESCALATED" ? "bad" : h.to === "DELIVERED" ? "ok" : "", html: `<span class="st">${esc(h.from ?? "start")} → ${esc(h.to)}</span> <span class="meta">round ${h.round}</span>` })),
     ...r.notices.map((n, i) => ({ k: `n${i}`, at: n.at, dot: n.level === "error" ? "bad" : "notice", html: `${linkify(esc(n.text))}${n.advisory?.length ? ` <span class="meta">· ${plural(n.advisory.length, "advisory note")}</span>` : ""}` })),
+    ...(r.cleared ? [{ k: "cleared", at: r.cleared.at, dot: "", html: `<b>${esc(clearedText(r))}.</b> <span class="meta">Read-only; nothing was deleted.</span>` }] : []),
     ...(r.messages ?? []).map((m) => ({ k: `m:${m.id}`, at: m.at, dot: "", html: `<b>${viaText(m.by)} → ${esc(m.to)}:</b> ${esc(m.text.length > 200 ? `${m.text.slice(0, 200)}…` : m.text)}` })),
   ].sort((a, b) => a.at - b.at);
   const pa = pending(r);
@@ -704,14 +732,15 @@ function updateComposerLive(r) {
 }
 function endComposer(r) {
   const d = r.artifacts.delivery;
-  if (r.state === "DELIVERED") return `<div class="cbox ok"><div class="c-status"><span class="c-ico ok">${ICON.check}</span><div class="c-main"><span class="c-line">Delivered</span><span class="c-sub">${d?.kind === "pr" ? `PR #${d.pr?.number ?? ""}` : "Pushed to main"} · ${plural(r.advisory.length, "advisory note")}${r.acceptedBlocking.length ? ` · ${plural(r.acceptedBlocking.length, "accepted finding")}` : ""} · start a new ticket for follow-up work</span></div>${d?.url ? `<a class="btn lg" href="${esc(d.url)}" target="_blank" rel="noopener noreferrer">${d.kind === "pr" ? "Open PR" : "Open repo"} ${ICON.ext}</a>` : ""}</div></div>`;
+  if (r.state === "DELIVERED") return `<div class="cbox ok"><div class="c-status"><span class="c-ico ok">${ICON.check}</span><div class="c-main"><span class="c-line">Delivered</span><span class="c-sub">${d?.kind === "pr" ? `PR #${d.pr?.number ?? ""}` : "Pushed to main"} · ${plural(r.advisory.length, "advisory note")}${r.acceptedBlocking.length ? ` · ${plural(r.acceptedBlocking.length, "accepted finding")}` : ""} · ${r.cleared ? esc(clearedText(r)) : "start a new ticket for follow-up work"}</span></div>${d?.url ? `<a class="btn lg" href="${esc(d.url)}" target="_blank" rel="noopener noreferrer">${d.kind === "pr" ? "Open PR" : "Open repo"} ${ICON.ext}</a>` : ""}</div></div>`;
   const failed = r.state === "FAILED";
+  if (r.cleared) return `<div class="cbox${failed ? " bad" : ""}"><div class="c-status"><span class="c-ico ${failed ? "bad" : "muted"}">${failed ? ICON.warn : ICON.stop}</span><div class="c-main"><span class="c-line">${failed ? `Failed in ${esc(r.failure?.state ?? "a stage")}` : "Cancelled"} · cleared</span><span class="c-sub">${esc(r.failure?.reason ?? "")}${r.failure?.reason ? " · " : ""}${esc(clearedText(r))}; read-only</span></div></div></div>`;
   return `<div class="cbox${failed ? " bad" : ""}"><div class="c-status"><span class="c-ico ${failed ? "bad" : "muted"}">${failed ? ICON.warn : ICON.stop}</span><div class="c-main"><span class="c-line">${failed ? `Failed in ${esc(r.failure?.state ?? "a stage")}` : "Cancelled"}</span><span class="c-sub">${esc(r.failure?.reason ?? "")}</span></div><button type="button" class="btn primary lg" id="c-retry">${ICON.retry} Retry</button></div></div>`;
 }
 function autosize(ta, send) { ta.style.height = "auto"; ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`; if (send) send.disabled = !ta.value.trim(); }
 function renderComposer(r) {
   const pa = pending(r), disc = pa?.question.kind === "discussion", tg = chatTarget(r);
-  const key = TERMINAL.includes(r.state) ? `end:${r.state}` : disc ? `ask:${pa.id}` : `chat:${tg.role}`;
+  const key = TERMINAL.includes(r.state) ? `end:${r.state}:${r.cleared ? "cleared" : ""}` : disc ? `ask:${pa.id}` : `chat:${tg.role}`;
   if (key === ui.composerKey) return updateComposerLive(r);
   const draft = $("#cmp-chat")?.value ?? "";
   ui.composerKey = key;
@@ -924,11 +953,17 @@ function renderDetails(r) {
       <dt>Created</dt><dd>${new Date(r.createdAt).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })}</dd>
       <dt>Pinned</dt><dd class="mono">${esc(r.configHash)} · ${esc(r.piVersion)}</dd></dl></section>
     <section class="d-sec"><h4>Actions</h4><div class="actions" style="display:flex;gap:8px;flex-wrap:wrap">
-      ${terminal ? (r.state !== "DELIVERED" ? `<button type="button" class="btn primary" id="d-retry">${ICON.retry} Retry run</button>` : `<span class="meta">Delivered runs are final.</span>`) : `<button type="button" class="btn danger" id="d-cancel">${ui.confirmCancel ? "Click again to cancel" : "Cancel run"}</button>`}
+      ${r.cleared ? `<span class="meta cleared-note">${esc(clearedText(r))}. This run is read-only; nothing was deleted.</span>`
+        : terminal ? `${r.state !== "DELIVERED" ? `<button type="button" class="btn primary" id="d-retry">${ICON.retry} Retry run</button>` : `<span class="meta">Delivered runs are final.</span>`}<button type="button" class="btn${ui.confirmClear ? " danger" : ""}" id="d-clear">${ui.confirmClear ? "Click again to clear" : "Clear from board"}</button>`
+        : `<button type="button" class="btn danger" id="d-cancel">${ui.confirmCancel ? "Click again to cancel" : "Cancel run"}</button>`}
     </div></section>`;
   $("#d-spec")?.addEventListener("click", () => openSpec(r));
   $("#d-disc")?.addEventListener("click", () => withDiscussions(() => openDiscussion(from.id)));
   $("#d-retry")?.addEventListener("click", () => act(() => core.retryRun(r.id), "Retrying").then(() => refreshRun(r.id)));
+  $("#d-clear")?.addEventListener("click", () => {
+    if (!ui.confirmClear) { ui.confirmClear = true; renderDetails(r); $("#d-clear")?.focus({ preventScroll: true }); setTimeout(() => { ui.confirmClear = false; if (ui.open === r.id && openRunData()) renderDetails(openRunData()); }, 4000); return; }
+    ui.confirmClear = false; act(() => core.clearRuns([r.id]), "Cleared from the board").then(() => refreshRun(r.id));
+  });
   $("#d-cancel")?.addEventListener("click", () => {
     if (!ui.confirmCancel) { ui.confirmCancel = true; renderDetails(r); setTimeout(() => { ui.confirmCancel = false; if (ui.open === r.id) renderDetails(openRunData()); }, 4000); return; }
     ui.confirmCancel = false; act(() => core.cancelRun(r.id, "cancelled from the web UI"), "Run cancelled").then(() => refreshRun(r.id));
@@ -1029,7 +1064,12 @@ function sheetLabels(discussion) {
 function wire() {
   document.querySelectorAll(".nav button").forEach((b) => b.addEventListener("click", () => showView(b.dataset.view)));
   $("#create-btn").addEventListener("click", openCreate);
-  $("#board").addEventListener("click", (e) => { const c = e.target.closest(".card"); if (c) openRun(c.dataset.id, c); });
+  $("#board").addEventListener("click", (e) => {
+    const ca = e.target.closest("[data-clear-all]"); if (ca) return clearAll(ca);
+    const c = e.target.closest(".card"); if (c) openRun(c.dataset.id, c);
+  });
+  // A pending "Clear all" confirmation resets when the user clicks anywhere else.
+  document.addEventListener("click", (e) => { if (ui.confirmClearAll && !e.target.closest?.("[data-clear-all]")) { ui.confirmClearAll = null; if (!$("#view-board").hidden) renderBoard(); } });
   $("#proj-filter").addEventListener("change", (e) => { ui.filter.project = e.target.value; renderBoard(); });
   $("#q").addEventListener("input", (e) => { ui.filter.q = e.target.value; if ($("#view-board").hidden) showView("board"); else renderBoard(); });
   for (const [id, k] of [["#f-turn", "turn"], ["#f-active", "active"], ["#f-closed", "closed"]]) $(id).addEventListener("click", (e) => {
@@ -1093,7 +1133,7 @@ async function boot() {
   wire();
   core.subscribe({}, onEvent); // empty filter: settings.changed only reaches unfiltered subscribers
   try {
-    const [projects, runs, discs] = await Promise.all([core.listProjects(), core.listRuns(), core.listDiscussions()]);
+    const [projects, runs, discs] = await Promise.all([core.listProjects(), core.listRuns({ includeCleared: true }), core.listDiscussions()]);
     ui.projects = projects;
     for (const r of runs) ui.runs.set(r.id, r);
     for (const d of discs) ui.discs.set(d.id, d);
