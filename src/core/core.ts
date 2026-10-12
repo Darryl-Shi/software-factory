@@ -662,6 +662,47 @@ export class Factory implements FactoryCore {
 		await this.harness.abortTask(d.taskId as never, this.ctx);
 	}
 
+	async cancelRuns(runs: RunId[], reason?: string): Promise<{ cancelled: RunId[] }> {
+		const by = this.by; // before any await (see cancelRun)
+		if (!Array.isArray(runs) || runs.length === 0) throw new FactoryError("invalid", "cancelRuns needs a non-empty array of run ids");
+		if (!runs.every((r) => typeof r === "string" && r.length > 0)) throw new FactoryError("invalid", "run ids must be non-empty strings");
+		if (reason !== undefined && reason !== null && typeof reason !== "string") throw new FactoryError("invalid", "reason must be a string");
+		const ids = [...new Set(runs)];
+		// Check the whole call first, then set every cancelReason in one commit, then abort the tasks.
+		const refuse = (d: RunDocState): FactoryError | undefined => {
+			if (TERMINAL_STATES.includes(d.state)) return new FactoryError("conflict", `run ${d.id} is already ${d.state}`);
+			const held = this.activeBundleOf(d);
+			if (held) return new FactoryError("conflict", `run ${d.id} is in ${held}; drop it from the bundle or cancel the bundle first`);
+			return undefined;
+		};
+		for (const id of ids) {
+			const d = await this.doc(id); // not_found
+			const e = refuse(d);
+			if (e) throw e;
+		}
+		const taskIds: { id: RunId; taskId: string }[] = [];
+		await this.root.commit(async (tx) => {
+			const docs: RunDocState[] = [];
+			for (const id of ids) {
+				const d = (await tx.doc(RunDoc, id, null as never)) as unknown as RunDocState | undefined;
+				if (!d?.id) throw new FactoryError("not_found", `run ${id} does not exist`);
+				const e = refuse(d);
+				if (e) throw e;
+				docs.push(d);
+			}
+			for (const d of docs) {
+				d.cancelReason = reason ?? `cancelled by ${by}`;
+				taskIds.push({ id: d.id, taskId: d.taskId as string });
+			}
+		}, this.ctx);
+		const cancelled: RunId[] = [];
+		for (const { id, taskId } of taskIds) {
+			await this.harness.abortTask(taskId as never, this.ctx);
+			cancelled.push(id);
+		}
+		return { cancelled };
+	}
+
 	async retryRun(run: RunId): Promise<void> {
 		const by = this.by;
 		const d = await this.doc(run);

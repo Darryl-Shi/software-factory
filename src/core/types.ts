@@ -483,6 +483,8 @@ export interface FactoryCore {
 	listRuns(filter?: { project?: string; states?: RunState[]; includeCleared?: boolean }): Promise<RunView[]>;
 	getConversation(run: RunId, conversationId: string): Promise<TranscriptView>;
 	cancelRun(run: RunId, reason?: string): Promise<void>;
+	/** Cancel several live runs at once (all or nothing); same effect per run as cancelRun. */
+	cancelRuns(runs: RunId[], reason?: string): Promise<{ cancelled: RunId[] }>;
 	retryRun(run: RunId): Promise<void>;
 	/** Archive terminal runs: they leave the board and default listings; nothing is deleted. */
 	clearRuns(runs: RunId[]): Promise<{ cleared: RunId[] }>;
@@ -552,6 +554,7 @@ export const CORE_OPS = [
 	"listRuns",
 	"getConversation",
 	"cancelRun",
+	"cancelRuns",
 	"retryRun",
 	"clearRuns",
 	"answer",
