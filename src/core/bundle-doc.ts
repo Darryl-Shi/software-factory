@@ -145,9 +145,10 @@ export function toBundleView(d: BundleDocState): BundleView {
 		caps: d.caps,
 		conversations: {
 			...(d.conversations.integrator !== undefined ? { integrator: String(d.conversations.integrator) } : {}),
-			reviewers: d.conversations.reviewers,
-			qa: d.conversations.qa ?? [],
-			...(d.conversations.active !== undefined ? { active: d.conversations.active } : {}),
+			// Conversation ids are numbers in the harness; the view's are strings, as its type says.
+			reviewers: d.conversations.reviewers.map((r) => ({ id: String(r.id), seq: r.seq })),
+			qa: (d.conversations.qa ?? []).map((r) => ({ id: String(r.id), seq: r.seq })),
+			...(d.conversations.active !== undefined ? { active: String(d.conversations.active) } : {}),
 		},
 		reviews: Object.values(d.reviews ?? {})
 			.sort((a, b) => a.seq - b.seq)

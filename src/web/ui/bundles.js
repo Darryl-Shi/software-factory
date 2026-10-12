@@ -447,7 +447,7 @@ function renderBundleDetails(b) {
       ${b.mergeRequested ? `<div class="notice">Merge was clicked: it merges by itself when the update is clean and green.</div>` : ""}</div></section>
     ${integ ? `<section class="d-sec"><h4>Integration ${integ.n ? `<span>#${esc(integ.n)}</span>` : ""}</h4><div style="display:grid;gap:4px;font-size:13px">
       <div class="meta">Base <span class="mono">${esc(String(integ.base ?? "").slice(0, 12))}</span> · ${integ.changed ? "the integrator changed the combined result" : "merged cleanly"}</div>
-      ${integ.conflict ? `<div class="notice warn">Resolving a conflict with ${esc(keyOf(integ.conflict.run))}: <span class="mono">${esc(integ.conflict.files.join(", "))}</span></div>` : ""}
+      ${integ.conflict ? `<div class="notice warn">${b.state === "INTEGRATING" ? "Resolving a conflict with" : "Unresolved conflict with"} ${esc(keyOf(integ.conflict.run))}: <span class="mono">${esc(integ.conflict.files.join(", "))}</span></div>` : ""}
       ${resolved ? `<div class="meta">Conflicts resolved:</div>${resolved}` : ""}</div></section>` : ""}
     ${findings ? `<section class="d-sec"><h4>Findings <span>${b.findingsLog.reduce((a, e) => a + e.findings.length, 0)}</span></h4>${findings}</section>` : ""}
     ${costRows ? `<section class="d-sec"><h4>Cost by role</h4><div class="scroll-x"><table class="cost"><thead><tr><th>Role</th><th class="n">Round</th><th class="n">USD</th></tr></thead><tbody>${costRows}<tr class="total"><td>Total</td><td></td><td class="n">${money(totalUsd(b))}</td></tr></tbody></table></div></section>` : ""}
