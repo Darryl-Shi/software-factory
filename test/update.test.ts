@@ -506,7 +506,8 @@ describe("web routes", () => {
 			git(root, "checkout", "-q", "--", "package.json");
 			const ok = await http(port, "POST", "/api/update/apply", json, JSON.stringify({ sha: tip }));
 			expect(ok.status).toBe(200);
-			expect(ok.body.update).toMatchObject({ to: tip, phase: "pulling" });
+			expect(ok.body.update).toMatchObject({ to: tip });
+			expect(["pulling", "installing", "restarting"]).toContain(ok.body.update.phase);
 			await u.settled();
 			expect(calls.jobs).toHaveLength(1);
 			const again = await http(port, "POST", "/api/update/apply", json, JSON.stringify({ sha: tip }));

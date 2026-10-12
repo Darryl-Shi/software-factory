@@ -274,7 +274,7 @@ export class Updater {
 			this.pipeline = this.pull(record).finally(() => {
 				this.applying = false;
 			});
-			return record;
+			return { ...record };
 		} catch (e) {
 			this.applying = false;
 			throw e;
