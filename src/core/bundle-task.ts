@@ -303,6 +303,17 @@ export function createBundleTask(svc: CoreServices) {
 		};
 	}
 
+	/**
+	 * Messages to the integrator held while the bundle was integrating (no task of its own ran): hand them over now, so a
+	 * clean integration never strands one. Any change they lead to goes through review before delivery or Merge.
+	 */
+	async function flushHeld(rt: RT, c: Context, d: BundleDocState) {
+		const conv = d.conversations.integrator;
+		if (conv === undefined || !(d.messages ?? []).some((m) => m.to === "integrator" && m.conversationId === undefined)) return;
+		const handle = await rt.conversation(conv as never, c);
+		if (handle) await kit.deliverHeld(rt, c, d.id, "integrator", conv, handle);
+	}
+
 	// ------------------------------------------------------------------ phases
 	/** Resolve the conflicted merge in the worktree with the integrator; concludes it, or retries, or fails. */
 	async function resolveConflict(rt: RT, c: Context, d: BundleDocState) {
@@ -482,6 +493,7 @@ export function createBundleTask(svc: CoreServices) {
 		},
 
 		DELIVERING: async (rt, c, d) => {
+			await flushHeld(rt, c, d);
 			const ws = d.workspace!;
 			const now = await svc.github.diff(ws, d.integration!.base);
 			if (d.lastFingerprint !== undefined && now.fingerprint !== d.lastFingerprint) {
@@ -557,6 +569,7 @@ export function createBundleTask(svc: CoreServices) {
 		},
 
 		AWAITING_MERGE: async (rt, c, d) => {
+			await flushHeld(rt, c, d);
 			const pr = d.delivery!.pr!;
 			if (d.mergeRequested && !d.pendingAsk) return merge(rt, c, d, "auto");
 			const ask = d.pendingAsk!;
@@ -584,6 +597,7 @@ export function createBundleTask(svc: CoreServices) {
 		},
 
 		ESCALATED: async (rt, c, d) => {
+			await flushHeld(rt, c, d);
 			const got = await awaitResponseOr(rt, c, d.id, d.pendingAsk!.id);
 			const resp = got.response!;
 			const choice = resp.type === "drop" ? { drop: resp.runs } : resp.type === "escalation" ? resp.choice : undefined;

@@ -480,3 +480,13 @@ describe("more transitions", () => {
 		expect(rv.bundle).toBe(one);
 	});
 });
+
+test("a message to the integrator while the bundle integrates cleanly is held, then handed over once it is delivering", async () => {
+	const { a } = await twoReady();
+	const id = await t!.factory.createBundle("p", [a]);
+	const r = await t!.factory.messageBundle(id, "how is it going?");
+	expect(r.to).toBe("integrator");
+	await waitMerge(id);
+	const v = await untilBundle(t!.factory, id, (x) => x.messages.every((m) => m.conversationId !== undefined));
+	expect(v.messages[0]!.conversationId).toBe(v.conversations.integrator);
+});
