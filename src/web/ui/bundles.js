@@ -31,7 +31,15 @@ function bundleStage(b) {
 }
 const BUNDLE_LIVE = { INTEGRATING: "Combining the tickets on the latest default branch", DELIVERING: "Pushing and opening the PR", AWAITING_CI: "Waiting for CI checks" };
 const ciText = (b) => (b.noCi ? "no CI" : !b.ci ? "CI not run yet" : { green: "CI green", red: "CI red", pending: "CI running", none: "no CI checks" }[b.ci.state] ?? `CI ${b.ci.state}`);
-const qaText = (b) => (!b.reviews?.length ? "Not reviewed: clean merge" : b.qaStatus ? QA_LABEL[b.qaStatus] ?? `QA ${b.qaStatus}` : "QA not run");
+// "Not reviewed: clean merge" only for a clean one-ticket integration (or one from before the rule that a clean merge of
+// 2+ tickets is reviewed); before its first review, any other bundle shows that the review is still to come.
+function qaText(b) {
+  if (b.reviews?.length) return b.qaStatus ? QA_LABEL[b.qaStatus] ?? `QA ${b.qaStatus}` : "QA not run";
+  const it = b.integration;
+  const integrated = it && !it.conflict && b.state !== "INTEGRATING";
+  if (integrated && !it.changed && (b.members.length < 2 || !it.reviewCombination)) return "Not reviewed: clean merge";
+  return b.members.length >= 2 ? "Not reviewed yet: the combination is reviewed before the PR" : "Not reviewed yet";
+}
 const prText = (d) => (d?.kind === "pr" ? `PR #${d.pr?.number ?? ""}` : d ? "Pushed to main" : "No PR yet");
 
 // ===================================================================== open, resync
@@ -135,7 +143,7 @@ function renderBundleThreads(b) {
   if (c.integrator != null) row(c.integrator, "integrator", "Integrator");
   const qaBySeq = new Map((c.qa ?? []).map((x) => [x.seq, x.id]));
   (c.reviewers ?? []).forEach((x) => { row(x.id, "reviewer", `Reviewer · review ${x.seq}`); if (qaBySeq.has(x.seq)) row(qaBySeq.get(x.seq), "qa", `QA · review ${x.seq}`, true); });
-  if (c.integrator == null && !(c.reviewers ?? []).length) rows.push(`<p class="hint" style="padding:4px 10px;margin:0">Conversations appear when the integrator or a reviewer starts. A clean merge needs neither.</p>`);
+  if (c.integrator == null && !(c.reviewers ?? []).length) rows.push(`<p class="hint" style="padding:4px 10px;margin:0">Conversations appear when the integrator or a reviewer starts. A clean one-ticket merge needs neither; a bundle of two or more tickets always gets a reviewer.</p>`);
   const a = ago(b.createdAt);
   rows.push(`<div class="rail-foot"><span><b>${esc(b.project)}</b> · ${esc(b.repo)}</span><span>Shipped ${a === "now" ? "just now" : `${a} ago`} · ${plural(b.members.length, "ticket")}</span></div>`);
   $("#rv-threads").innerHTML = rows.join("");
@@ -322,7 +330,7 @@ function dockMerge(dock, b, pa, info) {
   const facts = `<div class="loc b-facts"><span><b>CI</b> · ${esc(ciText(b))}${b.noCi ? ` <span class="meta">(the repo has no CI checks)</span>` : ""}</span>${checks ? `<span>${checks}</span>` : ""}<span><b>QA</b> · ${esc(qaText(b))}</span>${b.reviews?.length ? `<span class="meta">${plural(b.reviews.length, "bundle review")} · round ${b.reviewRound}/${b.caps.review}</span>` : ""}</div>`;
   const findings = (adv.length ? `<div class="b-sub">Advisory notes</div><div class="c-list">${adv.map((x) => findingHtml(b, x)).join("")}</div>` : "")
     + (fin.length ? `<div class="b-sub">Final review round</div><div class="c-list">${fin.map((x) => findingHtml(b, x)).join("")}</div>` : "");
-  const requested = b.mergeRequested ? `<div class="notice b-note">Merge was clicked: it merges by itself when the update is clean and green.</div>` : "";
+  const requested = b.mergeRequested ? `<div class="notice b-note">Merge was clicked: it merges by itself when the update is green and needed no fix.</div>` : "";
   const link = d?.url ? `<a class="btn ghost" href="${esc(d.url)}" target="_blank" rel="noopener noreferrer">${d.kind === "pr" ? "Open PR" : "Open repo"} ${ICON.ext}</a>` : "";
   const one = b.members.length < 2;
   let body;
@@ -444,7 +452,7 @@ function renderBundleDetails(b) {
     <section class="d-sec"><h4>Delivery</h4><div style="display:grid;gap:6px;font-size:13px">
       ${d ? `<div>${esc(prText(d))} · <a href="${esc(d.url)}" target="_blank" rel="noopener noreferrer">${esc(String(d.url).replace(/^https?:\/\//, ""))}</a><div class="meta mono">${esc(String(d.sha ?? "").slice(0, 12))}</div></div>` : `<span class="meta">No PR yet.</span>`}
       <div class="meta">${esc(ciText(b))} · ${esc(qaText(b))} · merge method ${esc(b.mergeMethod)}</div>
-      ${b.mergeRequested ? `<div class="notice">Merge was clicked: it merges by itself when the update is clean and green.</div>` : ""}</div></section>
+      ${b.mergeRequested ? `<div class="notice">Merge was clicked: it merges by itself when the update is green and needed no fix.</div>` : ""}</div></section>
     ${integ ? `<section class="d-sec"><h4>Integration ${integ.n ? `<span>#${esc(integ.n)}</span>` : ""}</h4><div style="display:grid;gap:4px;font-size:13px">
       <div class="meta">Base <span class="mono">${esc(String(integ.base ?? "").slice(0, 12))}</span> · ${integ.changed ? "the integrator changed the combined result" : "merged cleanly"}</div>
       ${integ.conflict ? `<div class="notice warn">${b.state === "INTEGRATING" ? "Resolving a conflict with" : "Unresolved conflict with"} ${esc(keyOf(integ.conflict.run))}: <span class="mono">${esc(integ.conflict.files.join(", "))}</span></div>` : ""}

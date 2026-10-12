@@ -244,7 +244,7 @@ function bundleCardHtml(b) {
   const cls = ["card", "bundle-card", pa ? "turn" : "", b.state === "ESCALATED" || b.state === "FAILED" ? "esc" : ""].join(" ");
   return `<button type="button" class="${cls}" data-id="${esc(b.id)}" data-bundle="${esc(b.id)}" title="${esc(bundleTitle(b))}">
     <div class="card-row"><span class="bchip" title="${esc(b.id)}">${esc(b.id)}</span><span class="meta">${plural(b.members.length, "ticket")}</span></div>
-    <div class="card-row card-state">${bundleStateLabel(b)}${pa ? `<span class="turn-badge">${esc(bundleTurnText(pa.question))}</span>` : ""}${b.mergeRequested && !pa ? `<span class="meta" title="Merge was clicked: it merges by itself when the update is clean and green">merging when green</span>` : ""}</div>
+    <div class="card-row card-state">${bundleStateLabel(b)}${pa ? `<span class="turn-badge">${esc(bundleTurnText(pa.question))}</span>` : ""}${b.mergeRequested && !pa ? `<span class="meta" title="Merge was clicked: it merges by itself when the update is green and needed no fix">merging when green</span>` : ""}</div>
     <div class="bmembers">${b.members.map((m) => `<div class="bmember"><span class="key" title="${esc(memberKey(m))}">${esc(memberKey(m))}</span><span class="bm-title" title="${esc(m.title)}">${esc(m.title)}</span></div>`).join("")}</div>
     <div class="card-foot">
       <div class="card-row foot-l">${ui.filter.project ? "" : `<span class="pchip" title="${esc(b.project)}">${esc(b.project)}</span>`}${chips.length ? `<span class="rounds">${chips.join("")}</span>` : ""}</div>

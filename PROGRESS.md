@@ -113,3 +113,25 @@ Decisions
 - [x] test/web-board.test.ts (jsdom: loads index.html + scripts with a stubbed core).
 - No browser available here (playwright download blocked), so layout was checked by reasoning, not screenshots.
 - [x] docs/spec.md §9 + acceptance 3, README, architecture, AGENTS.
+
+## Combined review of clean 2+ bundles (run run-mv4vd9xu-g2si; spec docs/specs/run-mv4vd9xu-g2si.md)
+
+- [x] core: `integration.reviewCombination` mark set on every new integration record; INTEGRATING exit: changed →
+      REVIEWING (mergeRequested cleared); clean + mark + 2+ members → REVIEWING (mergeRequested kept, enterReview in
+      the same transition); else → DELIVERING. Reviewer input for a clean 2+ combination says merged without
+      conflicts / each reviewed on its own / look at how the tickets interact.
+- [x] UI: qaText (clean merge only for one ticket or a pre-rule record; "Not reviewed yet: the combination is reviewed
+      before the PR" for 2+), conversations hint, "merges by itself when green and no fix" notes.
+- [x] tests: bundle.test.ts (updated clean-two path, new describe for fail/cap, drop to 2, moved default with/without
+      fix, pre-upgrade record), durability (kill -9 in the clean-combination review), web-board (qaText).
+      Test hooks: `patchBundleForTests`, `control.reviewerHang`.
+- [x] dry run: "document …" tickets write their own page (no README/PROGRESS append) so they merge cleanly; new step
+      ships two of them (104/104). docs/dry-run-report.md refreshed.
+- [x] docs: spec.md, architecture.md, DEVIATIONS 66, README, AGENTS.md (helper wrote; reviewed).
+
+Decisions:
+- A 2+ bundle whose integration record predates the rule (no mark) and was clean shows "Not reviewed: clean merge"
+  (it really wasn't reviewed); the spec's "never clean merge" applies to bundles under the new rule.
+- The clean-combination reviewer wording is chosen from the facts (no conflict resolved, 2+ members), so it also
+  appears in later rounds of that review (after FIXING) — the merge itself is still conflict-free.
+- Full suite: only the 8 bubblewrap sandbox tests fail (no user namespaces on this host), as on the base.

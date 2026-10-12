@@ -525,7 +525,7 @@ async function main() {
 	const ship2 = await ship("todo", [run2]);
 	const pr2 = prOf(ship2.b);
 	check(
-		'one PR for the bundle of one: the ticket\'s title, a "## Ticket" section citing docs/specs/<run-id>.md, "## Integration" (clean merge, no bundle review)',
+		'one PR for the bundle of one: the ticket\'s title, a "## Ticket" section citing docs/specs/<run-id>.md, "## Integration" (clean merge, no bundle review: one ticket)',
 		ship2.b.state === "AWAITING_MERGE" && !!pr2 && pr2.head === `factory/${ship2.id}` && pr2.title === v2.request.title && pr2.body.includes(`## Ticket: ${v2.request.title}`) && pr2.body.includes(`docs/specs/${run2}.md`) && /## Integration[\s\S]*merged cleanly/.test(pr2.body) && ship2.b.reviews.length === 0,
 		JSON.stringify({ path: bundlePath(ship2.b), pr: pr2 && { head: pr2.head, title: pr2.title, body: pr2.body.slice(0, 900) } }),
 	);
@@ -808,6 +808,51 @@ async function main() {
 	const vmsAB = await boatBackend.list();
 	check("the bundle's QA VM was deleted", vmsAB.filter((x) => x.name?.includes(idAB)).length === 0, JSON.stringify(vmsAB));
 
+	// ---------------------------------------------------------------- bundles: two tickets that merge cleanly, reviewed together
+	section("Bundles: two todo2 tickets that merge cleanly, shipped as one bundle: the combination is reviewed before the PR");
+	const titleC = "document the list command";
+	const titleD = "document the done command";
+	const runC = await startRun("todo2", titleC, `${titleC}: a page of its own under docs/`);
+	const runD = await startRun("todo2", titleD, `${titleD}: a page of its own under docs/`);
+	say(`  runs ${runC} and ${runD}, both started at once`);
+	await Promise.all([drive(runC, []), drive(runD, [])]);
+	const { id: idCD, b: bCD } = await ship("todo2", [runC, runD]);
+	check(
+		"the tickets merged cleanly (no conflict resolved) and the combination was still reviewed: INTEGRATING → REVIEWING → DELIVERING → AWAITING_CI → AWAITING_MERGE",
+		bundlePath(bCD) === "INTEGRATING → REVIEWING → DELIVERING → AWAITING_CI → AWAITING_MERGE" && bCD.integration?.changed === false && (bCD.integration?.resolved ?? []).length === 0 && bCD.reviews.length === 1,
+		JSON.stringify({ path: bundlePath(bCD), integration: bCD.integration, reviews: bCD.reviews.length }),
+	);
+	check(
+		'the notice says the combination is being reviewed ("All 2 tickets merged cleanly; reviewing the combination …")',
+		bCD.notices.some((n) => n.text === "All 2 tickets merged cleanly; reviewing the combination (each ticket was reviewed on its own branch)") && !bCD.notices.some((n) => /no review of the combination needed/.test(n.text)),
+		JSON.stringify(bCD.notices.map((n) => n.text)),
+	);
+	const trRCD = await bundleTranscript(idCD, "reviewer");
+	const revCD = userInputs(trRCD)[0] ?? "";
+	check(
+		"a fresh reviewer got both specs and the combined diff, was told the tickets merged without conflicts and each passed its own review, and to look at how they interact",
+		bCD.conversations.reviewers.length === 1 &&
+			revCD.startsWith(`# Review of ${idCD}`) &&
+			revCD.includes(`docs/specs/${runC}.md`) &&
+			revCD.includes(`docs/specs/${runD}.md`) &&
+			/Combined diff against the integration base/.test(revCD) &&
+			/The tickets merged without conflicts/.test(revCD) &&
+			/each ticket already passed its own review/.test(revCD) &&
+			/especially how the tickets interact/.test(revCD) &&
+			!/conflict resolutions/.test(revCD) &&
+			ranTestsGreen(trRCD),
+		revCD.slice(0, 900),
+	);
+	check("a QA agent tested the clean combination in a VM beside the bundle review", bCD.reviews[0]?.qaStatus === "ran" && bCD.conversations.qa.length === 1, JSON.stringify(bCD.reviews.map((r) => r.qaStatus)));
+	const prCD = prOf(bCD);
+	check(
+		'the PR\'s "## Integration" says the merge was clean and the combination was reviewed in 1 review round, with its QA status',
+		!!prCD && /## Integration[\s\S]*merged cleanly[\s\S]*reviewed in 1 review round[\s\S]*AQ testing of the combined result/.test(prCD.body) && !/had no review of its own/.test(prCD.body),
+		prCD ? prCD.body.slice(prCD.body.indexOf("## Integration"), prCD.body.indexOf("## Integration") + 700) : "no PR",
+	);
+	const mCD = await merge(idCD);
+	check("Merge: the clean, reviewed bundle MERGED and both runs are DELIVERED", mCD.state === "MERGED" && (await Promise.all([status(runC), status(runD)])).every((x) => x.state === "DELIVERED" && x.bundle === idCD), mCD.state);
+
 	// ---------------------------------------------------------------- the web UI and its API
 	section("Web UI and its API");
 	const urlFile = daemonFiles(CONFIG).url;
@@ -817,10 +862,10 @@ async function main() {
 	const noToken = await fetch(new URL("/api/op/listRuns", link), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ args: [] }) });
 	check("the API refuses requests without the token", noToken.status === 401);
 	const runs = await api<RunView[]>("listRuns");
-	const started = [run1, run2, run3, run4, run5, run6, run7, run8, runA, runB];
+	const started = [run1, run2, run3, run4, run5, run6, run7, run8, runA, runB, runC, runD];
 	check("with the token it lists every run of the trial", runs.map((r) => r.id).sort().join() === [...started].sort().join(), runs.map((r) => r.id).join());
 	const bundles = await api<BundleView[]>("listBundles");
-	const shipped = [ship1.id, ship2.id, ship3.id, ship4.id, ship5.id, ship6.id, ship7.id, ship8.id, idAB];
+	const shipped = [ship1.id, ship2.id, ship3.id, ship4.id, ship5.id, ship6.id, ship7.id, ship8.id, idAB, idCD];
 	check("listBundles lists every bundle of the trial", bundles.map((b) => b.id).sort().join() === [...shipped].sort().join(), bundles.map((b) => `${b.id}:${b.state}`).join(", "));
 	const page = await fetch(new URL(`/?token=${token()}`, link), { redirect: "manual" });
 	check("the link sets an HttpOnly, SameSite=Strict session cookie", page.status === 303 && /HttpOnly; SameSite=Strict/.test(page.headers.get("set-cookie") ?? ""));

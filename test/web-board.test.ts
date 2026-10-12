@@ -48,7 +48,7 @@ async function load(runs: unknown[], bundles: unknown[] = []): Promise<Win> {
 	w.matchMedia = (() => ({ matches: true })) as unknown as typeof w.matchMedia; // reduced motion: no Web Animations needed
 	w.eval(MARKED); w.eval(PURIFY);
 	// the classic scripts share one global scope: evaluated together, with the functions under test exposed
-	w.eval([read("markdown.js"), read("app.js"), read("discussions.js"), read("bundles.js"), "globalThis.__t = { PIPELINE, stageOf, stageInfo, boardColumn, ui };"].join("\n;"));
+	w.eval([read("markdown.js"), read("app.js"), read("discussions.js"), read("bundles.js"), "globalThis.__t = { PIPELINE, stageOf, stageInfo, boardColumn, ui, qaText };"].join("\n;"));
 	await new Promise((r) => setTimeout(r, 30));
 	return w;
 }
@@ -172,5 +172,24 @@ describe("stylesheet: sizing rules", () => {
 		expect(css).toMatch(/\.dock-card \{[^}]*min-height: 0; overflow-y: auto/);
 		expect(css).toMatch(/\.dock \.c-actions \{[^}]*position: sticky; bottom: 0/);
 		expect(css).toMatch(/\.modal-foot \{[^}]*position: sticky; bottom: 0/);
+	});
+});
+
+describe("bundle QA/review text (qaText)", () => {
+	test("'Not reviewed: clean merge' only for a clean one-ticket integration; a 2+ bundle shows the review to come, then its QA status", async () => {
+		const w = await load([]);
+		const qaText = (w.eval("__t") as { qaText: (b: unknown) => string }).qaText;
+		const one = [{ run: "run-a", title: "a" }];
+		const two = [...one, { run: "run-b", title: "b" }];
+		const clean = { n: 1, base: "abc", resolved: [], changed: false, reviewCombination: true };
+		expect(qaText(bundle("bundle-1", one, { integration: clean }))).toBe("Not reviewed: clean merge");
+		expect(qaText(bundle("bundle-2", two, { integration: clean }))).toBe("Not reviewed yet: the combination is reviewed before the PR");
+		expect(qaText(bundle("bundle-3", two, { state: "INTEGRATING" }))).toBe("Not reviewed yet: the combination is reviewed before the PR");
+		expect(qaText(bundle("bundle-4", one, { state: "INTEGRATING" }))).toBe("Not reviewed yet");
+		// reviewed: QA status (or "QA not run"), as a conflicted bundle shows
+		expect(qaText(bundle("bundle-5", two, { integration: clean, reviews: [{ seq: 1, round: 1 }] }))).toBe("QA not run");
+		expect(qaText(bundle("bundle-6", two, { integration: clean, reviews: [{ seq: 1, round: 1 }], qaStatus: "ran" }))).not.toMatch(/clean merge|not run/);
+		// an integration from before the combined-review rule (no mark) was clean and is not reviewed
+		expect(qaText(bundle("bundle-7", two, { integration: { ...clean, reviewCombination: undefined } }))).toBe("Not reviewed: clean merge");
 	});
 });

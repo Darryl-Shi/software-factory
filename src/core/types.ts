@@ -93,8 +93,11 @@ export interface BundleView {
 	escalation?: EscalationInfo;
 	/** Merge was clicked and the bundle is being updated onto the latest default branch: it merges by itself when clean and green. */
 	mergeRequested?: boolean;
-	/** The latest integration: its base commit, the conflicts the integrator resolved, and whether it changed anything. */
-	integration?: { n: number; base: string; resolved: { run: RunId; files: string[] }[]; conflict?: { run: RunId; files: string[] }; changed: boolean };
+	/**
+	 * The latest integration: its base commit, the conflicts the integrator resolved, whether it changed anything, and
+	 * whether it follows the rule that a clean merge of 2+ tickets is reviewed (absent on integrations from before it).
+	 */
+	integration?: { n: number; base: string; resolved: { run: RunId; files: string[] }[]; conflict?: { run: RunId; files: string[] }; changed: boolean; reviewCombination?: boolean };
 	round: number;
 	reviewRound: number;
 	ciFixes: number;

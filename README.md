@@ -4,8 +4,8 @@ A software factory built on **Pi Durable** (`@earendil-works/pi-durable@1.1.0`).
 You give it a software request for a project. It runs an architecture discussion with you, writes a spec, builds the
 product unattended and reviews the whole product against the spec. The reviewed ticket then waits in **Ready**. You
 ship one or more Ready tickets of a project together as a **bundle**: the factory combines their branches on the
-latest default branch, has an integrator agent resolve any conflict (and the combination reviewed again if it did),
-and delivers it to GitHub as one pull request (or, for a new repo, a push to `main`). It waits for CI and merges when
+latest default branch, has an integrator agent resolve any conflict, has the combination reviewed again if it did or
+if the bundle holds two or more tickets, and delivers it to GitHub as one pull request (or, for a new repo, a push to `main`). It waits for CI and merges when
 you click **Merge**. You are needed only in the discussion, at the approval gates you turn on and when you ship and
 merge, but you can message the agent working on a run or bundle at any time. When a problem is too unclear to write
 as a ticket, you can first talk it through with a model in a discussion, which ends in draft tickets that you edit
@@ -21,7 +21,9 @@ and turn into runs.
   at `docs/specs/<run-id>.md`, so parallel tickets never collide on it. A bundle (`bundle-<n>`) merges its tickets'
   branches in order, opens one PR with a section per ticket, takes red CI back to the integrator, and merges with
   `bundle.mergeMethod` (squash by default). If the default branch moved meanwhile, Merge updates the bundle first and
-  merges by itself when the update is clean and green. Shipping one ticket gives the familiar one-ticket PR.
+  merges by itself when CI is green and the update needed no fix. A clean merge of two or more tickets is reviewed
+  (and QA-tested) as a whole before the PR, since each ticket was reviewed only on its own branch. Shipping one ticket
+  gives the familiar one-ticket PR.
 - **GitHub, a local sandbox and boat.dev are the backend.** The core calls them directly: `GitHub` (`src/github/`) opens
   repos, combines bundles, delivers, waits for CI and merges; `Sandbox` (`src/sandbox/`) gives each role a sandboxed environment in the run's
   worktree; `Boat` (`src/boat/`) gives each review round's QA agent a fresh boat.dev VM running the product.
@@ -257,7 +259,7 @@ npm run typecheck   # tsc (noEmit)
 | File | Covers |
 |---|---|
 | `test/machine.test.ts` | Run state transitions up to `READY`, gates, rejections, escalations, round caps, the spec at `docs/specs/<run-id>.md`, cancel/retry, events, pinning; legacy runs' CI modes, CI fix rounds and merge gate |
-| `test/bundle.test.ts` | Bundles: every state transition, a clean merge and a conflict the integrator resolves (then a review against every spec), CI red → fix → review and its cap, Ship this ticket, a moved default branch at Merge, Request changes, an external merge and close, drop and cancel releasing runs, membership refusals, messages to a Ready run and to a bundle, a new repo, failure and Retry |
+| `test/bundle.test.ts` | Bundles: every state transition, a clean merge (reviewed as a combination for two tickets, not for one) and a conflict the integrator resolves (then a review against every spec), CI red → fix → review and its cap, Ship this ticket, a moved default branch at Merge, Request changes, an external merge and close, drop and cancel releasing runs, membership refusals, messages to a Ready run and to a bundle, a new repo, failure and Retry |
 | `test/legacy.test.ts` | `isLegacyDelivery` and the upgrade migration: runs that had begun delivering finish with their own PR |
 | `test/settings.test.ts` | Layering and source attribution, unset, validate-on-save, the fixed schema and role tool sets, refusing a legacy `stages`/`workers` config or `roles.<role>.extensions` key, projects, `discussion.model` and its fallback to the architect |
 | `test/findings.test.ts` | Review and QA findings validation, builder responses, bridge enforcement, helpers that write |

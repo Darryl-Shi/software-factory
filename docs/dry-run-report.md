@@ -1,4 +1,4 @@
-# Dry run of spec §8 — 2026-10-12T01:37:31.529Z
+# Dry run of spec §8 — 2026-10-12T06:53:02.583Z
 
 Directory: .dryrun (DRYRUN_DIR). Scripted agents (no model credentials), sandbox OFF (DRYRUN_SANDBOX=0), fake GitHub with local CI runner, SQLite storage, a daemonized `factory serve` driven through the web HTTP API (`POST /api/op/<op>`, `GET /api/events`).
 
@@ -6,7 +6,7 @@ Dropped CLI-only checks: none. The terminal attach view check is replaced by the
 
 Bundles: runs stop at Ready after review (branch `factory/<run-id>` pushed, no PR); every step ships its Ready run(s) as a bundle (`createBundle`) and merges it (`mergeBundle`) where the run used to deliver by itself. The PR description and delivery notes are written by the bundle (`## Ticket: <title>` sections and `## Integration`).
 
-**98/98 checks passed.**
+**104/104 checks passed.**
 
 ## §8.1 zero-to-MVP: createProject todo → me/todo, a discussion, then a ticket from its draft (repo does not exist)
 - ✅ discussion reached OPEN and answered both messages (after an ls, then a web search)
@@ -60,7 +60,7 @@ Bundles: runs stop at Ready after review (branch `factory/<run-id>` pushed, no P
 - ✅ the architect grounded the discussion in the repo (read the earlier ticket's spec in docs/specs/ first)
 - ✅ human input only for the discussion and the spec approval
 - ✅ the reviewer's own test run passed
-- ✅ one PR for the bundle of one: the ticket's title, a "## Ticket" section citing docs/specs/<run-id>.md, "## Integration" (clean merge, no bundle review)
+- ✅ one PR for the bundle of one: the ticket's title, a "## Ticket" section citing docs/specs/<run-id>.md, "## Integration" (clean merge, no bundle review: one ticket)
 - ✅ the bundle of one went INTEGRATING → DELIVERING → AWAITING_CI → AWAITING_MERGE (the Merge card)
 - ✅ incremental delivered after Merge: the PR merged with bundle.mergeMethod (squash)
 - ✅ main has the due-date feature after the merge
@@ -122,6 +122,14 @@ Bundles: runs stop at Ready after review (branch `factory/<run-id>` pushed, no P
 - ✅ main has both tickets (README lists both changes, no conflict markers, both specs) and npm test passes
 - ✅ the project's event stream reported the bundle's states (bundle.state) and both runs' run.state → DELIVERED
 - ✅ the bundle's QA VM was deleted
+
+## Bundles: two todo2 tickets that merge cleanly, shipped as one bundle: the combination is reviewed before the PR
+- ✅ the tickets merged cleanly (no conflict resolved) and the combination was still reviewed: INTEGRATING → REVIEWING → DELIVERING → AWAITING_CI → AWAITING_MERGE
+- ✅ the notice says the combination is being reviewed ("All 2 tickets merged cleanly; reviewing the combination …")
+- ✅ a fresh reviewer got both specs and the combined diff, was told the tickets merged without conflicts and each passed its own review, and to look at how they interact
+- ✅ a QA agent tested the clean combination in a VM beside the bundle review
+- ✅ the PR's "## Integration" says the merge was clean and the combination was reviewed in 1 review round, with its QA status
+- ✅ Merge: the clean, reviewed bundle MERGED and both runs are DELIVERED
 
 ## Web UI and its API
 - ✅ the link factory serve printed is the one in web-url (mode 0600)

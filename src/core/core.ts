@@ -1482,6 +1482,14 @@ export class Factory implements FactoryCore {
 		}, this.ctx);
 	}
 
+	/** Test hook: change a bundle's Document in one commit (e.g. drop an integration's rule mark to simulate a record from before an upgrade). */
+	async patchBundleForTests(id: BundleId, change: (d: BundleDocState) => void): Promise<void> {
+		await this.bundleDoc(id);
+		await this.root.commit(async (tx) => {
+			change((await tx.doc(BundleDoc, id, null as never)) as unknown as BundleDocState);
+		}, this.ctx);
+	}
+
 	async waitForState(run: RunId, pred: (v: RunView) => boolean, timeoutMs = 30_000): Promise<RunView> {
 		const deadline = Date.now() + timeoutMs;
 		for (;;) {

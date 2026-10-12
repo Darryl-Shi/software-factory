@@ -74,6 +74,9 @@ export interface Control {
 	integratorPlan: string[];
 	/** Hang the integrator on its next conflict task (crash tests). */
 	integratorHang?: boolean;
+	/** Hang the reviewer after its first step (crash tests); `reviewerHanging` is set while it hangs. */
+	reviewerHang?: boolean;
+	reviewerHanging?: boolean;
 }
 
 export function newControl(): Control {
@@ -109,11 +112,16 @@ let sharedSeq = 0;
 const SPEC = (v: number) => `# Spec v${v}\n\nA tiny product.\n\n## Acceptance behaviours\n\n- running it prints hello\n`;
 
 export function scripts(control: Control): Record<string, Script> {
-	const reviewer = (model: string): Script => (ctx) => {
+	const reviewer = (model: string): Script => async (ctx) => {
 		if (ctx.turn === 0) {
 			control.reviewerInputs.push(ctx.input);
 			control.reviewerModels.push(model);
 			return call("bash", { command: "ls -1 && echo TESTS-OK" });
+		}
+		if (control.reviewerHang) {
+			control.reviewerHanging = true;
+			while (control.reviewerHang) await new Promise((r) => setTimeout(r, 50));
+			control.reviewerHanging = false;
 		}
 		const plan = control.reviews.shift() ?? "pass";
 		const evidence = `$ ls -1 && echo TESTS-OK\n${ctx.results.find((r) => r.name === "bash")?.text ?? ""}`;

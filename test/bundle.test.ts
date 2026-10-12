@@ -1,9 +1,10 @@
 // Bundles (bundles spec §2, §3): Ready runs shipped as one PR. Every bundle state transition, conflicts resolved by the
 // integrator then reviewed, CI red → fix → review, a moved default branch at Merge, external merge and close, drop and
 // cancel releasing runs, and a new repo pushed to main.
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import type { BundleView, FactoryEvent, RunView } from "../src/core/types.ts";
 import { git } from "../src/github/git.ts";
+import { GitHub } from "../src/github/github.ts";
 import { bundleIn, inState, makeFactory, type TestEnv, until, untilBundle } from "./helpers.ts";
 
 let t: TestEnv | undefined;
@@ -58,8 +59,9 @@ describe("runs stop at Ready", () => {
 });
 
 describe("bundle of two, clean merge", () => {
-	test("INTEGRATING → DELIVERING → AWAITING_CI → AWAITING_MERGE → MERGED: one PR, a section per ticket, no bundle review; both runs DELIVERED with the PR", async () => {
+	test("INTEGRATING → REVIEWING → DELIVERING → AWAITING_CI → AWAITING_MERGE → MERGED: one bundle review of the combination, one PR, a section per ticket; both runs DELIVERED with the PR", async () => {
 		const { a, b } = await twoReady([["bundle.mergeMethod", "merge"]]);
+		const before = t!.control.reviewerInputs.length;
 		const events: FactoryEvent[] = [];
 		t!.factory.subscribe({ project: "p" }, (e) => events.push(e));
 		const id = await t!.factory.createBundle("p", [a, b]);
@@ -67,8 +69,25 @@ describe("bundle of two, clean merge", () => {
 		expect((await t!.factory.getRun(a)).bundle).toBe(id);
 		let v = await waitMerge(id);
 		expect(v.state).toBe("AWAITING_MERGE");
-		expect(states(v)).toEqual(["INTEGRATING", "DELIVERING", "AWAITING_CI", "AWAITING_MERGE"]);
-		expect(v.reviews).toEqual([]);
+		expect(states(v)).toEqual(["INTEGRATING", "REVIEWING", "DELIVERING", "AWAITING_CI", "AWAITING_MERGE"]);
+		// a fresh reviewer reviewed the combination against both specs (the integrator changed nothing)
+		expect(v.reviews.length).toBe(1);
+		expect(v.conversations.reviewers.length).toBe(1);
+		expect(v.integration).toMatchObject({ changed: false, resolved: [], reviewCombination: true });
+		expect(v.conversations.integrator).toBeDefined();
+		expect(t!.control.integratorInputs).toEqual([]);
+		expect(v.notices.some((n) => n.text === "All 2 tickets merged cleanly; reviewing the combination (each ticket was reviewed on its own branch)")).toBe(true);
+		expect(v.notices.some((n) => /no review of the combination needed/.test(n.text))).toBe(false);
+		expect(t!.control.reviewerInputs.length).toBe(before + 1);
+		const review = t!.control.reviewerInputs[before]!;
+		expect(review).toContain(`# Review of ${id}`);
+		expect(review).toContain(`docs/specs/${a}.md`);
+		expect(review).toContain(`docs/specs/${b}.md`);
+		expect(review).toContain("Combined diff against the integration base");
+		expect(review).toContain("The tickets merged without conflicts");
+		expect(review).toContain("each ticket already passed its own review");
+		expect(review).toContain("especially how the tickets interact: shared code, files, data, config, APIs, UI and tests");
+		expect(review).not.toContain("conflict resolutions");
 		expect(v.members.map((m) => m.run)).toEqual([a, b]);
 		expect(v.noCi).toBe(true);
 		const prs = t!.host.state().prs;
@@ -78,6 +97,9 @@ describe("bundle of two, clean merge", () => {
 		expect(prs[0]!.body).toContain("## Ticket: beta");
 		expect(prs[0]!.body).toContain(`docs/specs/${a}.md`);
 		expect(prs[0]!.body).toContain("## Integration");
+		expect(prs[0]!.body).toContain("merged cleanly");
+		expect(prs[0]!.body).toContain("The combined result was reviewed in 1 review round");
+		expect(prs[0]!.body).not.toContain("had no review of its own");
 		await t!.factory.mergeBundle(id);
 		v = await untilBundle(t!.factory, id, bundleIn("MERGED", "FAILED"));
 		expect(v.state).toBe("MERGED");
@@ -123,6 +145,8 @@ describe("conflicts and reviews", () => {
 		expect(review).toContain(`docs/specs/${b}.md`);
 		expect(review).toContain("Combined diff against the integration base");
 		expect(review).toContain("resolved by the integrator");
+		expect(review).toContain("especially where the tickets meet (conflict resolutions)");
+		expect(review).not.toContain("The tickets merged without conflicts");
 		const tr = await t.factory.getBundleConversation(id, v.conversations.integrator!);
 		expect(tr.role).toBe("integrator");
 		expect(tr.items.some((i) => i.toolCalls?.some((c) => c.name === "report_done"))).toBe(true);
@@ -167,7 +191,7 @@ describe("CI", () => {
 		const id = await t!.factory.createBundle("p", [a, b]);
 		const v = await untilBundle(t!.factory, id, bundleIn("ESCALATED", "AWAITING_MERGE", "FAILED"));
 		expect(v.state).toBe("ESCALATED");
-		expect(states(v)).toEqual(["INTEGRATING", "DELIVERING", "AWAITING_CI", "FIXING", "REVIEWING", "DELIVERING", "AWAITING_CI", "ESCALATED"]);
+		expect(states(v)).toEqual(["INTEGRATING", "REVIEWING", "DELIVERING", "AWAITING_CI", "FIXING", "REVIEWING", "DELIVERING", "AWAITING_CI", "ESCALATED"]);
 		expect(v.findingsLog.filter((e) => e.kind === "ci").length).toBe(2);
 		expect(t!.control.integratorInputs[0]).toContain("(ci, BLOCKING");
 		expect(t!.control.integratorInputs[0]).toContain("boom");
@@ -208,8 +232,13 @@ describe("merging", () => {
 	test("Ship this ticket (a bundle of one) gives today's one-ticket PR: the ticket's title, squash by default", async () => {
 		const { a } = await twoReady();
 		const id = await t!.factory.createBundle("p", [a]);
-		await waitMerge(id);
+		const w = await waitMerge(id);
+		// a clean one-ticket merge is not reviewed again
+		expect(states(w)).toEqual(["INTEGRATING", "DELIVERING", "AWAITING_CI", "AWAITING_MERGE"]);
+		expect(w.reviews).toEqual([]);
+		expect(w.notices.some((n) => n.text === "All 1 ticket(s) merged cleanly; no review of the combination needed")).toBe(true);
 		expect(t!.host.state().prs[0]!.title).toBe("alpha");
+		expect(t!.host.state().prs[0]!.body).toContain("had no review of its own");
 		await t!.factory.mergeBundle(id);
 		expect((await untilBundle(t!.factory, id, bundleIn("MERGED"))).mergeMethod).toBe("squash");
 		expect(t!.host.state().calls.find((c) => c.op === "mergePr")?.detail).toMatchObject({ how: "squash" });
@@ -319,6 +348,9 @@ describe("membership", () => {
 		await expect(t!.factory.dropFromBundle(id, ["run-x"])).rejects.toMatchObject({ code: "invalid" });
 		await t!.factory.dropFromBundle(id, [b]);
 		v = await untilBundle(t!.factory, id, (x) => x.state === "AWAITING_MERGE" && !!x.pendingAsk && x.integration!.n === 2);
+		// one member left: the clean re-integration is not reviewed (the first, two-ticket integration was)
+		expect(states(v)).toEqual(["INTEGRATING", "REVIEWING", "DELIVERING", "AWAITING_CI", "AWAITING_MERGE", "INTEGRATING", "DELIVERING", "AWAITING_CI", "AWAITING_MERGE"]);
+		expect(v.reviews.length).toBe(1);
 		expect(v.members.map((m) => m.run)).toEqual([a]);
 		expect(v.dropped).toEqual([b]);
 		const rb = await t!.factory.getRun(b);
@@ -388,7 +420,8 @@ describe("new repo", () => {
 		const id = await t!.factory.createBundle("p", [a, b]);
 		const v = await untilBundle(t!.factory, id, bundleIn("MERGED", "FAILED", "ESCALATED"));
 		expect(v.state).toBe("MERGED");
-		expect(states(v)).toEqual(["INTEGRATING", "DELIVERING", "AWAITING_CI", "MERGED"]);
+		expect(states(v)).toEqual(["INTEGRATING", "REVIEWING", "DELIVERING", "AWAITING_CI", "MERGED"]);
+		expect(v.reviews.length).toBe(1);
 		expect(v.delivery?.kind).toBe("repo");
 		expect(t!.host.state().created).toContain("me/p");
 		expect(t!.host.state().prs).toEqual([]);
@@ -434,7 +467,9 @@ describe("more transitions", () => {
 		await t!.factory.resolveBundleEscalation(id, v.pendingAsk!.id, { drop: [b] });
 		v = await untilBundle(t!.factory, id, (x) => (x.state === "AWAITING_MERGE" && !!x.pendingAsk) || x.state === "FAILED");
 		expect(v.state).toBe("AWAITING_MERGE");
-		expect(states(v)).toEqual(["INTEGRATING", "DELIVERING", "AWAITING_CI", "ESCALATED", "INTEGRATING", "DELIVERING", "AWAITING_CI", "AWAITING_MERGE"]);
+		// two tickets: the combination is reviewed; one left after the drop: a clean re-integration is not
+		expect(states(v)).toEqual(["INTEGRATING", "REVIEWING", "DELIVERING", "AWAITING_CI", "ESCALATED", "INTEGRATING", "DELIVERING", "AWAITING_CI", "AWAITING_MERGE"]);
+		expect(v.reviews.length).toBe(1);
 		expect(v.members.map((m) => m.run)).toEqual([a]);
 		expect((await t!.factory.getRun(b)).bundle).toBeUndefined();
 		expect(t!.control.integratorInputs).toEqual([]);
@@ -489,4 +524,151 @@ test("a message to the integrator while the bundle integrates cleanly is held, t
 	await waitMerge(id);
 	const v = await untilBundle(t!.factory, id, (x) => x.messages.every((m) => m.conversationId !== undefined));
 	expect(v.messages[0]!.conversationId).toBe(v.conversations.integrator);
+});
+
+describe("reviewing a clean combination of 2+ tickets", () => {
+	async function threeReady(settings: [string, unknown][] = []) {
+		await setup(settings);
+		const ids = [await start("alpha"), await start("beta"), await start("gamma")];
+		for (const r of await Promise.all(ids.map(ready))) expect(r.state).toBe("READY");
+		return ids as [string, string, string];
+	}
+
+	test("a failing review of the clean combination → FIXING by the integrator → reviewed again; at reviewRoundCap → ESCALATED (more rounds / drop / abort)", async () => {
+		const { a, b } = await twoReady([["policy.reviewRoundCap", 2]]);
+		t!.control.reviews = ["fail", "fail"];
+		const before = t!.control.reviewerInputs.length;
+		const id = await t!.factory.createBundle("p", [a, b]);
+		let v = await untilBundle(t!.factory, id, bundleIn("ESCALATED", "AWAITING_MERGE", "FAILED"));
+		expect(v.state).toBe("ESCALATED");
+		expect(states(v)).toEqual(["INTEGRATING", "REVIEWING", "FIXING", "REVIEWING", "ESCALATED"]);
+		expect(v.integration).toMatchObject({ changed: false, resolved: [] });
+		expect(v.reviews.length).toBe(2);
+		expect(v.conversations.reviewers.length).toBe(2);
+		expect(v.escalation).toMatchObject({ cap: "review", from: "REVIEWING" });
+		expect(v.pendingAsk!.question).toMatchObject({ kind: "escalation", options: ["more-rounds", "drop", "abort"] });
+		expect(t!.control.integratorInputs.length).toBe(1);
+		expect(t!.control.integratorInputs[0]).toContain("# Findings to address");
+		expect(t!.control.integratorInputs[0]).toContain("it does not print hello");
+		expect(t!.control.reviewerInputs.length).toBe(before + 2);
+		expect(t!.control.reviewerInputs[before + 1]).toContain("integrator: fixed");
+		expect(t!.control.reviewerInputs[before + 1]).toContain("especially how the tickets interact");
+		expect(t!.host.state().prs).toEqual([]);
+		await t!.factory.resolveBundleEscalation(id, v.pendingAsk!.id, { moreRounds: 1 });
+		v = await untilBundle(t!.factory, id, (x) => (x.state === "AWAITING_MERGE" && !!x.pendingAsk) || x.state === "FAILED");
+		expect(v.state).toBe("AWAITING_MERGE");
+		expect(states(v)).toEqual(["INTEGRATING", "REVIEWING", "FIXING", "REVIEWING", "ESCALATED", "FIXING", "REVIEWING", "DELIVERING", "AWAITING_CI", "AWAITING_MERGE"]);
+		expect(v.reviewRound).toBe(3);
+		expect(t!.host.state().prs.length).toBe(1);
+	});
+
+	test("dropping a ticket so that two remain: the clean re-integration is reviewed again before the PR is updated", async () => {
+		const [a, b, c] = await threeReady();
+		const id = await t!.factory.createBundle("p", [a, b, c]);
+		let v = await waitMerge(id);
+		expect(states(v)).toEqual(["INTEGRATING", "REVIEWING", "DELIVERING", "AWAITING_CI", "AWAITING_MERGE"]);
+		const pr = v.delivery!.pr!.number;
+		const reviewed = t!.control.reviewerInputs.length;
+		await t!.factory.dropFromBundle(id, [c]);
+		v = await untilBundle(t!.factory, id, (x) => x.state === "AWAITING_MERGE" && !!x.pendingAsk && x.integration!.n === 2);
+		expect(states(v).slice(5)).toEqual(["INTEGRATING", "REVIEWING", "DELIVERING", "AWAITING_CI", "AWAITING_MERGE"]);
+		expect(v.members.map((m) => m.run)).toEqual([a, b]);
+		expect(v.reviews.length).toBe(2);
+		expect(v.reviewRound).toBe(1);
+		expect(v.notices.some((n) => n.text === "All 2 tickets merged cleanly; reviewing the combination (each ticket was reviewed on its own branch)")).toBe(true);
+		expect(t!.control.reviewerInputs.length).toBe(reviewed + 1);
+		const review = t!.control.reviewerInputs.at(-1)!;
+		expect(review).toContain(`docs/specs/${a}.md`);
+		expect(review).toContain(`docs/specs/${b}.md`);
+		const tickets = review.slice(review.indexOf("## Tickets"), review.indexOf("## Specs"));
+		expect(tickets).toContain(a);
+		expect(tickets).toContain(b);
+		expect(tickets).not.toContain(c);
+		expect(review).toContain("The tickets merged without conflicts");
+		const prs = t!.host.state().prs;
+		expect(prs.length).toBe(1);
+		expect(prs[0]!.number).toBe(pr);
+		expect(prs[0]!.body).not.toContain("## Ticket: gamma");
+		expect(prs[0]!.body).toContain("The combined result was reviewed in 2 review rounds");
+	});
+
+	test("another bundle merges first: Merge on a two-ticket bundle re-integrates cleanly, reviews the combination and, with no fix needed, merges after green CI without a second click", async () => {
+		const [a, b, c] = await threeReady();
+		const one = await t!.factory.createBundle("p", [a]);
+		const two = await t!.factory.createBundle("p", [b, c]);
+		await Promise.all([waitMerge(one), waitMerge(two)]);
+		await t!.factory.mergeBundle(one);
+		await untilBundle(t!.factory, one, bundleIn("MERGED"));
+		const before = await t!.factory.getBundle(two);
+		expect(before.reviews.length).toBe(1);
+		await t!.factory.mergeBundle(two);
+		const mid = await untilBundle(t!.factory, two, (x) => x.integration!.n === 2 && x.state === "REVIEWING", 60_000);
+		expect(mid.mergeRequested).toBe(true);
+		const v = await untilBundle(t!.factory, two, bundleIn("MERGED", "FAILED", "ESCALATED"), 60_000);
+		expect(v.state).toBe("MERGED");
+		expect(states(v).slice(states(before).length)).toEqual(["INTEGRATING", "REVIEWING", "DELIVERING", "AWAITING_CI", "AWAITING_MERGE", "MERGED"]);
+		expect(v.reviews.length).toBe(2);
+		expect(v.integration!.base).not.toBe(before.integration!.base);
+		expect(v.notices.some((n) => /Merged by the factory after a clean update/.test(n.text))).toBe(true);
+		for (const r of [b, c]) expect((await until(t!.factory, r, inState("DELIVERED"))).state).toBe("DELIVERED");
+	});
+
+	test("the same, but the review of the updated combination needs a fix: back at the merge card for a fresh click", async () => {
+		const [a, b, c] = await threeReady();
+		const one = await t!.factory.createBundle("p", [a]);
+		const two = await t!.factory.createBundle("p", [b, c]);
+		await Promise.all([waitMerge(one), waitMerge(two)]);
+		await t!.factory.mergeBundle(one);
+		await untilBundle(t!.factory, one, bundleIn("MERGED"));
+		const before = await t!.factory.getBundle(two);
+		t!.control.reviews = ["fail"];
+		await t!.factory.mergeBundle(two);
+		let v = await untilBundle(t!.factory, two, (x) => (x.state === "AWAITING_MERGE" && !!x.pendingAsk && x.integration!.n === 2) || ["MERGED", "FAILED", "ESCALATED"].includes(x.state), 60_000);
+		expect(v.state).toBe("AWAITING_MERGE");
+		expect(states(v).slice(states(before).length)).toEqual(["INTEGRATING", "REVIEWING", "FIXING", "REVIEWING", "DELIVERING", "AWAITING_CI", "AWAITING_MERGE"]);
+		expect(v.mergeRequested).toBeUndefined();
+		expect(v.pendingAsk!.question).toMatchObject({ kind: "merge" });
+		expect(v.reviews.length).toBe(3);
+		expect(t!.host.state().calls.filter((x) => x.op === "mergePr").length).toBe(1);
+		await t!.factory.mergeBundle(two);
+		v = await untilBundle(t!.factory, two, bundleIn("MERGED", "FAILED"), 60_000);
+		expect(v.state).toBe("MERGED");
+	});
+
+	test("an integration record from before the upgrade (no rule mark) finishes the old way: clean → DELIVERING, no review", async () => {
+		const { a, b } = await twoReady();
+		const orig = GitHub.prototype.mergeMember;
+		let release!: () => void;
+		const gate = new Promise<void>((r) => (release = r));
+		let held = false;
+		const spy = vi.spyOn(GitHub.prototype, "mergeMember").mockImplementation(async function (this: GitHub, ...args: Parameters<GitHub["mergeMember"]>) {
+			if (!held) {
+				held = true;
+				await gate;
+			}
+			return orig.apply(this, args);
+		});
+		try {
+			const id = await t!.factory.createBundle("p", [a, b]);
+			const deadline = Date.now() + 20_000;
+			while (!held && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+			expect(held).toBe(true);
+			const mid = await t!.factory.getBundle(id);
+			expect(mid.state).toBe("INTEGRATING");
+			expect(mid.integration?.reviewCombination).toBe(true);
+			await t!.factory.patchBundleForTests(id, (d) => {
+				delete d.integration!.reviewCombination;
+			});
+			release();
+			const v = await waitMerge(id);
+			expect(states(v)).toEqual(["INTEGRATING", "DELIVERING", "AWAITING_CI", "AWAITING_MERGE"]);
+			expect(v.reviews).toEqual([]);
+			expect(v.notices.some((n) => /no review of the combination needed/.test(n.text))).toBe(true);
+			expect(v.integration?.reviewCombination).toBeUndefined();
+			expect(v.integration?.changed).toBe(false);
+		} finally {
+			release();
+			spy.mockRestore();
+		}
+	});
 });
