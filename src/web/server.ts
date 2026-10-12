@@ -4,6 +4,7 @@
 //   GET  /api/events?run=&project=&discussion=&bundle=   server-sent events from core.subscribe (the same filter)
 //   GET  /api/runs/<run>/screenshots/<id> a QA screenshot (core.getScreenshot), as image/png
 //   GET  /api/bundles/<id>/screenshots/<sid> a bundle review's QA screenshot (core.getBundleScreenshot)
+//   GET  /api/version, POST /api/update/{check,apply,dismiss}   the updater (src/update/), same auth and checks
 //   GET  /, /markdown.js, /app.js, /discussions.js, /bundles.js, /app.css   the UI (static files, no build step)
 //   GET  /vendor/marked.js, /vendor/purify.js   the markdown libraries, from node_modules (exact routes)
 // Access needs a token: `factory serve` prints a link carrying it, and the first visit swaps it for an HttpOnly,
@@ -31,6 +32,7 @@ const STATIC: Record<string, [string, string]> = {
 	"/app.js": ["app.js", "text/javascript; charset=utf-8"],
 	"/discussions.js": ["discussions.js", "text/javascript; charset=utf-8"],
 	"/bundles.js": ["bundles.js", "text/javascript; charset=utf-8"],
+	"/update.js": ["update.js", "text/javascript; charset=utf-8"],
 	"/app.css": ["app.css", "text/css; charset=utf-8"],
 };
 const CSP = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
@@ -43,6 +45,16 @@ export interface WebOptions {
 	host: string;
 	port: number;
 	log?: (msg: string) => void;
+	/** The updater (src/update/), exposed at /api/version and /api/update/*; not a core operation. */
+	updater?: UpdaterApi;
+}
+
+/** What the web server needs of the updater. */
+export interface UpdaterApi {
+	version(): Promise<unknown>;
+	check(): Promise<unknown>;
+	apply(sha: unknown): Promise<unknown>;
+	dismiss(): void;
 }
 
 export function loadToken(file?: string): string {
@@ -125,6 +137,7 @@ export async function startWebServer(core: FactoryCore, opts: WebOptions): Promi
 					return json(res, (code && STATUS[code]) ?? 500, { ok: false, error: e?.message ?? String(e), ...(code ? { code } : {}) });
 				}
 			}
+			if (url.pathname === "/api/version" || url.pathname.startsWith("/api/update/")) return await update(req, res, url.pathname);
 			const op = /^\/api\/op\/([A-Za-z]+)$/.exec(url.pathname)?.[1];
 			if (op !== undefined) {
 				if (req.method !== "POST") return json(res, 405, { ok: false, error: "use POST" });
@@ -155,6 +168,39 @@ export async function startWebServer(core: FactoryCore, opts: WebOptions): Promi
 			else res.end();
 		}
 	});
+
+	// The updater's routes: the same auth (above), Host and Origin checks as /api/op.
+	async function update(req: IncomingMessage, res: ServerResponse, path: string) {
+		const updater = opts.updater;
+		if (!originOk(req)) return json(res, 403, { ok: false, error: "cross-origin request refused" });
+		if (!updater) return json(res, 404, { ok: false, error: "not found" });
+		const fail = (e: any) => {
+			const code = e?.code as FactoryError["code"] | undefined;
+			return json(res, (code && STATUS[code]) ?? 500, { ok: false, error: e?.message ?? String(e), ...(code ? { code } : {}) });
+		};
+		if (path === "/api/version") {
+			if (req.method !== "GET") return json(res, 405, { ok: false, error: "use GET" });
+			return json(res, 200, await updater.version());
+		}
+		const action = /^\/api\/update\/(check|apply|dismiss)$/.exec(path)?.[1];
+		if (!action) return json(res, 404, { ok: false, error: "not found" });
+		if (req.method !== "POST") return json(res, 405, { ok: false, error: "use POST" });
+		if (!/^application\/json\b/.test(req.headers["content-type"] ?? "")) return json(res, 415, { ok: false, error: "send application/json" });
+		let body: { sha?: unknown };
+		try {
+			body = JSON.parse((await readBody(req)) || "{}") ?? {};
+		} catch (e) {
+			return json(res, 400, { ok: false, error: e instanceof Error ? e.message : "invalid JSON" });
+		}
+		try {
+			if (action === "check") await updater.check();
+			else if (action === "apply") await updater.apply(body.sha);
+			else updater.dismiss();
+		} catch (e) {
+			return fail(e);
+		}
+		return json(res, 200, await updater.version());
+	}
 
 	function events(req: IncomingMessage, res: ServerResponse, url: URL) {
 		const filter: { run?: string; project?: string; discussion?: string; bundle?: string } = {};

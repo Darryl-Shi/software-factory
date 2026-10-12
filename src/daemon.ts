@@ -3,6 +3,7 @@
 import { spawn } from "node:child_process";
 import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { DAEMON_ENV } from "./update/restart.ts";
 
 export function daemonFiles(configPath: string): { pid: string; log: string; url: string } {
 	const home = dirname(configPath);
@@ -70,7 +71,12 @@ export async function startDaemon(configPath: string, serveArgs: string[], timeo
 	const logStart = fstatSync(out).size;
 	let child;
 	try {
-		child = spawn(cmd, [...pre, "serve", "--foreground", "--config", configPath, ...serveArgs], { detached: true, stdio: ["ignore", out, out] });
+		// The marker tells the child it runs as the daemon, and with which serve arguments (an update restarts it so).
+		child = spawn(cmd, [...pre, "serve", "--foreground", "--config", configPath, ...serveArgs], {
+			detached: true,
+			stdio: ["ignore", out, out],
+			env: { ...process.env, [DAEMON_ENV]: JSON.stringify(serveArgs) },
+		});
 	} finally {
 		closeSync(out);
 	}

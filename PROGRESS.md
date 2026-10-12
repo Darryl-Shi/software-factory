@@ -113,3 +113,28 @@ Decisions
 - [x] test/web-board.test.ts (jsdom: loads index.html + scripts with a stubbed core).
 - No browser available here (playwright download blocked), so layout was checked by reasoning, not screenshots.
 - [x] docs/spec.md §9 + acceptance 3, README, architecture, AGENTS.
+
+## Self-update from the web UI (run run-mv4rp25k-mqna; spec docs/specs/run-mv4rp25k-mqna.md)
+
+- [x] src/update/: restart.ts (shared restart, moved from setup/context.ts; detectStartedBy, detectService), record.ts
+      (update.json), helper.ts (detached restart helper + rollback), updater.ts (check/apply), cli.ts (factory update)
+- [x] wiring: main.ts (Updater, activeWork, startChecks), cli.ts (serve detects startedBy; update; status SHA),
+      daemon.ts (FACTORY_DAEMON_ARGS marker), web/server.ts routes
+- [x] UI: ui/update.js (chip, dialog, confirm, progress/reload, banner) — helper-built, reviewed
+- [x] tests: test/update.test.ts (unit, routes), test/update-daemon.test.ts (real daemon update + rollback)
+- [x] docs: spec §9/§10/§12, README, architecture.md, AGENTS.md
+
+Decisions:
+- The helper runs from a copy of the running version's helper.ts/restart.ts/record.ts (read at startup, written to
+  <home>/update-helper/), run with the install root's tsx: a broken new version can't break its own rollback.
+- Under systemd the helper is started with `systemd-run --user` (a unit restart kills its whole cgroup).
+- Daemon restart = SIGTERM the pid file's process, then `bin/factory serve --config <c> <same args>` (setup's restart
+  uses the same path with no extra args, as before).
+- apply returns after the record is written (phase pulling); pull/install/restart continue in the background.
+- apply accepts a short or full SHA; it re-fetches, and an upstream that moved since the check is `conflict`.
+- A failed fetch keeps the comparison against the last fetched upstream (check.error set); it does not block apply.
+- Dismiss deletes update.json; refused (conflict) while an update runs.
+- update.json left `pulling`/`installing` at startup → failed; `restarting` older than 5 min → settled.
+- `factory status` prints a second line `version <sha> (...)`; first line unchanged.
+- `factory update` with a running factory goes through its HTTP API (same restart path); without one, pull+install.
+- Acceptance 4 (runs survive) rests on the existing durability (SIGTERM path, covered by test/durability.test.ts).
