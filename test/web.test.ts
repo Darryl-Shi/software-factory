@@ -117,7 +117,7 @@ describe("screenshots", () => {
 		await t.factory.createProject("p", "me/p");
 		await t.factory.setSetting({ project: "p" }, "qa.enabled", true);
 		const run = await t.factory.startRun("p", { source: "t", title: "x", body: "x" });
-		await until(t.factory, run, inState("DELIVERED"));
+		await until(t.factory, run, inState("READY"));
 		const { port, token } = await serve();
 		const ok = await http(port, "GET", `/api/runs/${run}/screenshots/r1-s1`, { headers: { authorization: `Bearer ${token}` } });
 		expect(ok.status).toBe(200);
@@ -182,13 +182,21 @@ describe("operations and events", () => {
 			}
 		});
 		await t!.factory.setSetting({ project: "p" }, "policy.approvals", ["spec"]);
+		await t!.host.seedRepo("me/p", { "README.md": "# p\n" }); // an existing repo: the bundle opens a PR and waits for Merge
 		const run = JSON.parse((await op(port, token, "startRun", ["p", { source: "web", title: "hello", body: "make hello" }])).body).result as string;
 		const v = await until(t!.factory, run, inState("AWAITING_APPROVAL"));
 		expect((await op(port, token, "approve", [run, "spec"])).status).toBe(200);
+		await until(t!.factory, run, inState("READY"));
+		// ship it over HTTP and merge it: bundle events reach a project-filtered stream
+		const bundle = JSON.parse((await op(port, token, "createBundle", ["p", [run]])).body).result as string;
+		await t!.factory.waitForBundle(bundle, (b) => b.state === "AWAITING_MERGE" && !!b.pendingAsk);
+		expect((await op(port, token, "mergeBundle", [bundle])).status).toBe(200);
 		await until(t!.factory, run, inState("DELIVERED"));
 		await new Promise((r) => setTimeout(r, 200));
 		stream.destroy();
-		expect(events.filter((e) => e.type === "run.state").map((e: any) => e.to)).toContain("DELIVERED");
+		expect(events.filter((e) => e.type === "run.state").map((e: any) => e.to)).toEqual(expect.arrayContaining(["READY", "DELIVERED"]));
+		expect(events.filter((e) => e.type === "bundle.state").map((e: any) => e.to)).toEqual(expect.arrayContaining(["DELIVERING", "AWAITING_MERGE", "MERGED"]));
+		expect(events).toContainEqual(expect.objectContaining({ type: "bundle.askResolved", bundle, by: "web" }));
 		expect(events).toContainEqual(expect.objectContaining({ type: "run.ask", run, ask: v.pendingAsk!.id }));
 		expect(events).toContainEqual(expect.objectContaining({ type: "run.askResolved", run, by: "web" }));
 	});

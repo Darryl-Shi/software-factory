@@ -422,3 +422,61 @@ describe("failure and retry", () => {
 		expect(v.state).toBe("AWAITING_MERGE");
 	});
 });
+
+describe("more transitions", () => {
+	test("ESCALATED → drop tickets → INTEGRATING with the rest; the dropped run is back in Ready", async () => {
+		const { a, b } = await twoReady([["ci.fixRounds", 0]]);
+		t!.host.forceChecks("me/p", [{ name: "test", status: "completed", conclusion: "failure", summary: "red" }]);
+		const id = await t!.factory.createBundle("p", [a, b]);
+		let v = await untilBundle(t!.factory, id, bundleIn("ESCALATED", "AWAITING_MERGE", "FAILED"));
+		expect(v.state).toBe("ESCALATED");
+		await expect(t!.factory.dropFromBundle(id, [])).rejects.toMatchObject({ code: "invalid" });
+		await t!.factory.resolveBundleEscalation(id, v.pendingAsk!.id, { drop: [b] });
+		v = await untilBundle(t!.factory, id, (x) => (x.state === "AWAITING_MERGE" && !!x.pendingAsk) || x.state === "FAILED");
+		expect(v.state).toBe("AWAITING_MERGE");
+		expect(states(v)).toEqual(["INTEGRATING", "DELIVERING", "AWAITING_CI", "ESCALATED", "INTEGRATING", "DELIVERING", "AWAITING_CI", "AWAITING_MERGE"]);
+		expect(v.members.map((m) => m.run)).toEqual([a]);
+		expect((await t!.factory.getRun(b)).bundle).toBeUndefined();
+		expect(t!.control.integratorInputs).toEqual([]);
+	});
+
+	test("Cancel bundle on a FAILED bundle releases its members; Retry is refused on other states", async () => {
+		t = await makeFactory();
+		t.control.sharedFile = true;
+		await t.host.seedRepo("me/p", SEED);
+		await t.factory.createProject("p", "me/p");
+		const a = await start("alpha");
+		const b = await start("beta");
+		await Promise.all([ready(a), ready(b)]);
+		t.control.integratorPlan = ["leave", "leave", "leave"];
+		const id = await t.factory.createBundle("p", [a, b]);
+		await expect(t.factory.retryBundle(id)).rejects.toMatchObject({ code: "conflict" });
+		expect((await untilBundle(t.factory, id, bundleIn("FAILED"))).state).toBe("FAILED");
+		await expect(t.factory.messageBundle(id, "hi")).rejects.toMatchObject({ code: "conflict" });
+		await t.factory.cancelBundle(id, "not now");
+		const v = await t.factory.getBundle(id);
+		expect(v.state).toBe("CANCELLED");
+		expect(states(v).slice(-2)).toEqual(["FAILED", "CANCELLED"]);
+		for (const r of [a, b]) expect((await until(t.factory, r, (x) => x.bundle === undefined)).state).toBe("READY");
+	});
+
+	test("listBundles filters by project and state; getBundle of an unknown id is not_found; a bundle event filter only matches that bundle", async () => {
+		const { a, b } = await twoReady();
+		const seen: BundleView["id"][] = [];
+		t!.factory.subscribe({ bundle: "bundle-2" }, (e) => seen.push((e as any).bundle ?? (e as any).run));
+		const one = await t!.factory.createBundle("p", [a]);
+		const two = await t!.factory.createBundle("p", [b]);
+		await Promise.all([waitMerge(one), waitMerge(two)]);
+		expect((await t!.factory.listBundles({ project: "p" })).map((x) => x.id)).toEqual([one, two]);
+		expect(await t!.factory.listBundles({ project: "q" })).toEqual([]);
+		expect((await t!.factory.listBundles({ states: ["AWAITING_MERGE"] })).length).toBe(2);
+		await expect(t!.factory.listBundles({ states: ["NOPE" as any] })).rejects.toMatchObject({ code: "invalid" });
+		await expect(t!.factory.getBundle("bundle-9")).rejects.toMatchObject({ code: "not_found" });
+		expect(seen.length).toBeGreaterThan(0);
+		expect(new Set(seen)).toEqual(new Set([two]));
+		const v = await t!.factory.getBundle(one);
+		expect(v.members[0]).toMatchObject({ run: a, title: "alpha", key: "P-1", specPath: `docs/specs/${a}.md`, branch: `factory/${a}` });
+		const rv: RunView = await t!.factory.getRun(a);
+		expect(rv.bundle).toBe(one);
+	});
+});

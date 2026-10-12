@@ -84,8 +84,29 @@ describe("settings layering", () => {
 		expect(await t.host.repoExists("me/todo2")).toBe(false);
 		await f.setSetting({ project: "todo2" }, "ci.mode", "off");
 		const run = await f.startRun("todo2", { source: "t", title: "x", body: "x" });
-		const v = await f.waitForState(run, (x) => x.state === "DELIVERED");
-		expect(v.history.map((h) => h.to)).not.toContain("AWAITING_CI");
+		const v = await f.waitForState(run, (x) => x.state === "READY");
+		const bundle = await f.createBundle("todo2", [run]);
+		const b = await f.waitForBundle(bundle, (x) => ["MERGED", "FAILED"].includes(x.state));
+		expect(b.state).toBe("MERGED");
+		expect(b.history.map((h) => h.to)).not.toContain("AWAITING_CI");
+		expect((await f.getRun(v.id)).state).not.toBe("FAILED");
+	});
+
+	test("bundle.mergeMethod: merge | squash | rebase, globally or per project, validated on save; a bundle pins it", async () => {
+		t = await makeFactory();
+		const f = t.factory;
+		await f.createProject("p", "me/p");
+		const before = readFileSync(t.configPath, "utf8");
+		await expect(f.setSetting(G, "bundle.mergeMethod", "fast-forward")).rejects.toThrow(/expected one of merge, squash, rebase/);
+		await expect(f.setSetting({ project: "p" }, "bundle.mergeMethod", "octopus")).rejects.toMatchObject({ code: "invalid" });
+		expect(readFileSync(t.configPath, "utf8")).toBe(before);
+		expect((await f.getSettings({ project: "p" }))["bundle.mergeMethod"]).toEqual({ value: "squash", source: "default" });
+		await f.setSetting(G, "bundle.mergeMethod", "merge");
+		await f.setSetting({ project: "p" }, "bundle.mergeMethod", "rebase");
+		expect((await f.getSettings({ project: "p" }))["bundle.mergeMethod"]).toEqual({ value: "rebase", source: "project" });
+		expect((await f.getSettings(G))["bundle.mergeMethod"]).toEqual({ value: "merge", source: "global" });
+		// the legacy merge gate still validates
+		await f.setSetting({ project: "p" }, "policy.approvals", ["spec", "merge"]);
 	});
 
 	test("validate on save: invalid values are rejected and the config file is unchanged", async () => {
@@ -151,8 +172,9 @@ describe("settings layering", () => {
 	test("settingsSchema is the fixed core schema", async () => {
 		t = await makeFactory();
 		const schema = t.factory.settingsSchema();
-		expect(Object.keys(schema)).toEqual(["version", "workdir", "roles", "discussion", "policy", "github", "ci", "sandbox", "qa", "boat", "web", "webSearch", "storage"]);
-		expect(Object.keys((schema.roles as any).fields)).toEqual(["architect", "builder", "helper", "reviewer", "qa"]);
+		expect(Object.keys(schema)).toEqual(["version", "workdir", "roles", "bundle", "discussion", "policy", "github", "ci", "sandbox", "qa", "boat", "web", "webSearch", "storage"]);
+		expect(Object.keys((schema.roles as any).fields)).toEqual(["architect", "builder", "helper", "reviewer", "qa", "integrator"]);
+		expect((schema.bundle as any).fields.mergeMethod).toMatchObject({ type: "enum", values: ["merge", "squash", "rebase"], default: "squash" });
 		expect(Object.keys((schema.boat as any).fields)).toEqual(["apiKey", "size", "ttl", "runScripts"]);
 		expect(Object.keys((schema.ci as any).fields)).toEqual(["mode", "fixRounds", "checks", "noChecksTimeout"]);
 		expect(Object.keys((schema.sandbox as any).fields)).toEqual(["enabled", "allowedDomains", "deniedDomains", "denyRead", "extraWrite", "unixSockets", "setupScripts"]);

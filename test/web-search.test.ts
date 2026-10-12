@@ -98,8 +98,8 @@ describe("in a run", () => {
 		await t.factory.createProject("p", "me/p");
 		t.control.searchFirst = true;
 		const run = await t.factory.startRun("p", { source: "test", title: "hello", body: "make hello" });
-		const v = await until(t.factory, run, inState("DELIVERED", "FAILED"));
-		expect(v.state).toBe("DELIVERED");
+		const v = await until(t.factory, run, inState("READY", "FAILED"));
+		expect(v.state).toBe("READY");
 		expect(seen).toHaveLength(1);
 		expect(seen[0]!.body).toMatchObject({ mode: "fast", session_id: run, advanced_settings: { max_results: 4 }, search_queries: ["print hello cli", "hello world node"] });
 		expect(t.control.searchResults[0]).toContain("1. Hello world in Node.js");

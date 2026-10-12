@@ -171,7 +171,11 @@ export function scripts(control: Control): Record<string, Script> {
 		if (ctx.turn === 0) {
 			const noProgress = control.builderNoProgress || (control.noProgressFromInput !== undefined && ctx.inputs.length >= control.noProgressFromInput);
 			if (!noProgress && control.runScript && ctx.inputs.length === 1)
-				return calls(["write", { path: `round-${ctx.inputs.length}.txt`, content: `round ${ctx.inputs.length}\n` }], ["write", { path: "scripts/run.sh", content: "echo product up\nsleep 60\n" }]);
+				return calls(
+					["write", { path: `round-${ctx.inputs.length}.txt`, content: `round ${ctx.inputs.length}\n` }],
+					["write", { path: "scripts/run.sh", content: "echo product up\nsleep 60\n" }],
+					...(control.sharedFile ? [["write", { path: "shared.txt", content: `builder ${++sharedSeq}\n` }] as [string, Record<string, unknown>]] : []),
+				);
 			if (!noProgress && control.sharedFile && ctx.inputs.length === 1)
 				return calls(["write", { path: `round-${ctx.inputs.length}.txt`, content: `round ${ctx.inputs.length}\n` }], ["write", { path: "shared.txt", content: `builder ${++sharedSeq}\n` }]);
 			if (!noProgress) return call("write", { path: `round-${ctx.inputs.length}.txt`, content: `round ${ctx.inputs.length}\n` });
