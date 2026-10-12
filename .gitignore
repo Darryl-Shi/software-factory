@@ -36,3 +36,4 @@ npm-debug.log*
 # agent workspaces
 .worktrees/
 .superpowers/
+.tmp/

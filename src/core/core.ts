@@ -833,12 +833,12 @@ export class Factory implements FactoryCore {
 		const eff = this.config.effective({ project });
 		// The integrator's model and thinking default to the builder's (pinned resolved, so its cost records name them).
 		const config = { ...eff, roles: { ...(eff.roles ?? {}), integrator: bundleRoleConfig(eff, "integrator") } };
+		for (const run of runs) if (!(await this.harness.snapshot(RunDoc, run, this.ctx))) throw new FactoryError("invalid", `run ${run} does not exist`);
 		let id!: BundleId;
 		await this.root.commit(async (tx) => {
 			const members: BundleMember[] = [];
 			for (const run of runs) {
 				const d = (await tx.doc(RunDoc, run, null as never)) as unknown as RunDocState;
-				if (!d?.id) throw new FactoryError("invalid", `run ${run} does not exist`);
 				if (d.project !== project) throw new FactoryError("invalid", `run ${run} belongs to project ${d.project}, not ${project}; a bundle holds tickets of one project`);
 				if (d.bundle && !d.bundleMerged) {
 					const b = (await tx.doc(BundleDoc, d.bundle, null as never)) as unknown as BundleDocState;
