@@ -103,6 +103,11 @@ everything. At every start (and on `factory gc`) a sweep finishes failed cleanup
 entries (`run-*`, `bundle-*`, `disc-*`, `<id>-<role>`) that no record owns; other names are never touched. QA
 screenshots, conversations and the storage are never deleted.
 
+**Never share a `workdir` between two factories** (two configs or storages, e.g. both on the default
+`~/factory/work`): each factory's sweep treats the other's runs, bundles and discussions as orphans and deletes their
+worktrees, scratch dirs and local branches (bundle and discussion ids are small counters, so they also collide). Give
+each factory its own `workdir`.
+
 Each role has two fields:
 - `model`: `provider/modelId`, as known to the model host: a pi-ai built-in provider, a compatible endpoint in
   `models.json` or a provider package (see [Model providers](#model-providers)). `factory setup roles` offers the

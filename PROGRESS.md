@@ -185,3 +185,6 @@ Decisions:
   local/remote branches.
 - `factory gc` exits 1 when the sweep reported failures too (scriptable); "no factory is running" when web-url is
   missing or the connection is refused.
+- Round 2: F1 fixed — `LocalGitHubHost.save` is atomic (temp + rename) and `deleteBranch` no longer logs to the state
+  file (the dry-run driver read a half-written github-state.json); dry run 104/104 three times in a row. F4: docs warn
+  not to share a workdir between factories. F5 left as is (indexing the cache outside onChange would skew event diffs).

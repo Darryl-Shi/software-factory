@@ -3,7 +3,7 @@
 // - LocalGitHubHost: a fake GitHub for tests and dry runs: bare git remotes on disk, PRs and check runs in a JSON
 //   file, and a CI runner that executes the `run:` steps of .github/workflows/*.yml at the pushed commit.
 import { createSign } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
@@ -255,7 +255,10 @@ export class LocalGitHubHost implements GitHubHost {
 		return JSON.parse(readFileSync(this.statePath, "utf8"));
 	}
 	private save(s: LocalState) {
-		writeFileSync(this.statePath, JSON.stringify(s, null, 2));
+		// Atomic (temp file + rename): another process (the dry run's driver) may read the state at any moment.
+		const tmp = `${this.statePath}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+		writeFileSync(tmp, JSON.stringify(s, null, 2));
+		renameSync(tmp, this.statePath);
 	}
 	private mutate<T>(f: (s: LocalState) => T): T {
 		const s = this.state();
@@ -316,7 +319,6 @@ export class LocalGitHubHost implements GitHubHost {
 		const ref = `refs/heads/${branch}`;
 		if ((await git(this.bare(repo), ["rev-parse", "--verify", "-q", ref], { allowFail: true })).code !== 0) return false;
 		await git(this.bare(repo), ["update-ref", "-d", ref]);
-		this.log("deleteBranch", repo, { branch });
 		return true;
 	}
 	remoteUrl(repo: string) {
