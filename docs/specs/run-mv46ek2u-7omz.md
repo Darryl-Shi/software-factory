@@ -1,5 +1,10 @@
 # Spec: clearing Done runs from the board
 
+> **Superseded in part:** [`docs/specs/run-mv58bn4q-q2zs.md`](run-mv58bn4q-q2zs.md) reverses the "destroys nothing"
+> decision below. Clearing still archives the run (record, conversations, screenshots and delivery stay), but it now
+> also starts a full disk cleanup in the background: the worktree, manifest, local and remote branch, scratch dirs and
+> environment records are deleted.
+
 ## Context
 
 The software factory (`swf`, repo `Darryl-Shi/software-factory`) shows every run on a board in the web UI. Runs that end as `DELIVERED`, `FAILED` or `CANCELLED` (the `TERMINAL_STATES`) go to the **Done** column and stay there forever. `FAILED` and `CANCELLED` runs are shown only when the "closed" filter is on. As runs pile up, the Done column gets cluttered.

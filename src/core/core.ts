@@ -23,6 +23,7 @@ import { AGENT_EXTENSIONS, ROLE_TOOLS } from "../agents/tools.ts";
 import { type Boat, boatProblems } from "../boat/boat.ts";
 import { type GitHub, githubProblems } from "../github/github.ts";
 import { type Sandbox, sandboxProblems } from "../sandbox/sandbox.ts";
+import { bundleOwner, type CleanedUp, Cleaner, discussionOwner, type Owner, runOwner, type SweepSource } from "./cleanup.ts";
 import { Bridge, BridgeDoc, bridgeToolsNotFor, EnvDoc } from "./bridge.ts";
 import { DiscussionDoc, type DiscussionDocState, DiscussionIndex, deriveTitle, toDiscussionView } from "./discussion-doc.ts";
 import { createDiscussionTask, draftInstructions, takeCheckoutNote } from "./discussion-task.ts";
@@ -55,6 +56,7 @@ import {
 	type FactoryCore,
 	FactoryError,
 	type FactoryEvent,
+	type GcResult,
 	type Gate,
 	type HumanFinding,
 	type HumanMessage,
@@ -132,10 +134,13 @@ export class Factory implements FactoryCore {
 	private now: () => number;
 	private log: (msg: string) => void;
 	private by = "core";
+	/** Disk cleanup of finished runs, bundles and discussions (src/core/cleanup.ts). */
+	private cleaner: Cleaner;
 
 	constructor(private opts: CoreOptions) {
 		this.now = opts.now ?? Date.now;
 		this.log = opts.log ?? (() => {});
+		this.cleaner = new Cleaner({ github: opts.github, sandbox: opts.sandbox, log: (m) => this.log(m), now: () => this.now() });
 		this.registry = createRegistry();
 		this.config = new ConfigStore(opts.configPath, () => this.settingsSchema(), (eff, scope) => this.coreRules(eff, scope));
 	}
@@ -148,6 +153,7 @@ export class Factory implements FactoryCore {
 		this.runTask = createRunTask({
 			github: this.opts.github,
 			sandbox: this.opts.sandbox,
+			cleanup: this.cleaner,
 			boat: this.opts.boat,
 			artifactsDir: this.artifactsDir,
 			acceptsImages: (ref) => this.acceptsImages(ref),
@@ -160,6 +166,7 @@ export class Factory implements FactoryCore {
 		this.discussionTask = createDiscussionTask({
 			github: this.opts.github,
 			sandbox: this.opts.sandbox,
+			cleanup: this.cleaner,
 			bridge: Bridge,
 			changed: (id, ms) => this.changed(id, ms),
 			now: this.now,
@@ -168,6 +175,7 @@ export class Factory implements FactoryCore {
 		this.bundleTask = createBundleTask({
 			github: this.opts.github,
 			sandbox: this.opts.sandbox,
+			cleanup: this.cleaner,
 			boat: this.opts.boat,
 			artifactsDir: this.artifactsDir,
 			acceptsImages: (ref) => this.acceptsImages(ref),
@@ -252,6 +260,7 @@ export class Factory implements FactoryCore {
 		});
 		this.harness.resume();
 		void this.sweepQaVms();
+		void this.sweepDisk().catch((e) => this.log(`disk sweep failed: ${e instanceof Error ? e.message : e}`));
 		for (const run of this.cache.values())
 			if (!TERMINAL_STATES.includes(run.state) && run.pinned.piVersion !== PI_DURABLE_VERSION)
 				this.log(`run ${run.id} was pinned to pi-durable ${run.pinned.piVersion}; this process runs ${PI_DURABLE_VERSION}`);
@@ -288,6 +297,93 @@ export class Factory implements FactoryCore {
 			this.log(`QA VM sweep failed: ${e instanceof Error ? e.message : e}`);
 			return [];
 		}
+	}
+
+	// ------------------------------------------------------------------ disk cleanup (docs/specs/run-mv58bn4q-q2zs.md)
+
+	private ownerOf(kind: Owner["kind"], id: string): Owner | undefined {
+		if (kind === "run") {
+			const d = this.cache.get(id);
+			return d && runOwner(d);
+		}
+		if (kind === "bundle") {
+			const d = this.bundles.get(id);
+			return d && bundleOwner(d);
+		}
+		const d = this.discussions.get(id);
+		return d && discussionOwner(d);
+	}
+
+	/** The owner as committed now (from storage, not the cache). */
+	private async rereadOwner(kind: Owner["kind"], id: string): Promise<Owner | undefined> {
+		if (kind === "run") {
+			const d = (await this.harness.snapshot(RunDoc, id, this.ctx)) as RunDocState | undefined;
+			return d?.id ? runOwner(d) : undefined;
+		}
+		if (kind === "bundle") {
+			const d = (await this.harness.snapshot(BundleDoc, id, this.ctx)) as BundleDocState | undefined;
+			return d?.id ? bundleOwner(d) : undefined;
+		}
+		const d = (await this.harness.snapshot(DiscussionDoc, id, this.ctx)) as DiscussionDocState | undefined;
+		return d?.id ? discussionOwner(d) : undefined;
+	}
+
+	/** Record a cleanup in the owner's Document (never downgraded; `full` is final). */
+	private async commitCleanedUp(kind: Owner["kind"], id: string, m: CleanedUp): Promise<void> {
+		const Doc = kind === "run" ? RunDoc : kind === "bundle" ? BundleDoc : DiscussionDoc;
+		await this.root.commit(async (tx) => {
+			const d = (await tx.doc(Doc as typeof RunDoc, id, null as never)) as unknown as { id?: string; cleanedUp?: CleanedUp };
+			if (!d?.id || d.cleanedUp?.scope === "full") return;
+			d.cleanedUp = m;
+		}, this.ctx);
+		// The caches follow commits on the next tick; the sweep's clone pass reads them.
+		await new Promise((r) => setImmediate(r));
+	}
+
+	/** Start a cleanup of an owner in the background; the scope comes from its state when the cleanup starts. */
+	private cleanInBackground(kind: Owner["kind"], id: string): void {
+		// The owner (and so the scope) is read again from storage inside the owner's lock, just before acting.
+		const o: Owner = this.ownerOf(kind, id) ?? { kind, id, repo: "", state: "", config: {} };
+		this.cleaner.background(
+			this.cleaner.cleanup(o, "full", {
+				recheck: () => this.rereadOwner(kind, id),
+				commit: (m) => this.commitCleanedUp(kind, id, m),
+			}),
+		);
+	}
+
+	private sweepSource(): SweepSource {
+		const all = () => [
+			...[...this.cache.values()].map((d) => runOwner(d)),
+			...[...this.bundles.values()].map((d) => bundleOwner(d)),
+			...[...this.discussions.values()].map((d) => discussionOwner(d)),
+		];
+		return {
+			owners: all,
+			reread: (o) => this.rereadOwner(o.kind, o.id),
+			taskLive: async (o) => {
+				if (o.taskId === undefined) return false;
+				const t = await this.harness.getTask(o.taskId as never, this.ctx);
+				return !!t && t.state.status !== "terminal";
+			},
+			commit: (o, m) => this.commitCleanedUp(o.kind, o.id, m),
+			known: (id) => this.ownerOf("run", id) ?? this.ownerOf("bundle", id) ?? this.ownerOf("discussion", id),
+			globalWorkdir: () => expandHome(this.config.effective({ global: true }).workdir ?? "~/factory/work"),
+		};
+	}
+
+	/** The startup sweep (spec "Startup sweep"): records, then orphans, then one summary line. Single flight. */
+	private sweepDisk(): Promise<GcResult> {
+		return this.cleaner.sweep(this.sweepSource()).then((r) => ({ removed: r.removed, failures: r.failures, summary: r.summary }));
+	}
+
+	async gc(): Promise<GcResult> {
+		return this.sweepDisk();
+	}
+
+	/** Test hook: every background cleanup (clearRuns, cancelBundle) and any running sweep has finished. */
+	cleanupsSettledForTests(): Promise<void> {
+		return this.cleaner.settled();
 	}
 
 	/** Test hook: run the startup sweep again. */
@@ -710,9 +806,12 @@ export class Factory implements FactoryCore {
 		if (d.state !== "FAILED" && d.state !== "CANCELLED") throw new FactoryError("conflict", `run ${run} is ${d.state}; only FAILED or CANCELLED runs can be retried`);
 		const old = await this.harness.getTask(d.taskId as never, this.ctx);
 		if (old && old.state.status !== "terminal") throw new FactoryError("conflict", `run ${run} is still finishing; retry in a moment`);
-		await this.root.commit(async (tx) => {
+		// After any in-flight cleanup of the run (a retry never races a scratch deletion), and none starts until committed.
+		await this.cleaner.exclusive(run, () => this.root.commit(async (tx) => {
 			const doc = (await tx.doc(RunDoc, run, null as never)) as unknown as RunDocState;
 			if (doc.cleared) throw new FactoryError("conflict", `run ${run} was cleared; it cannot be retried`);
+			if (doc.state !== "FAILED" && doc.state !== "CANCELLED") throw new FactoryError("conflict", `run ${run} is ${doc.state}; only FAILED or CANCELLED runs can be retried`);
+			delete doc.cleanedUp;
 			const f = doc.failure!;
 			const to: RunState = f.state === "DELIVERED" || f.state === "FAILED" || f.state === "CANCELLED" ? "RECEIVED" : f.state;
 			doc.history.push({ from: doc.state, to, at: this.now(), round: doc.counters.reviewRound });
@@ -726,7 +825,7 @@ export class Factory implements FactoryCore {
 			doc.notices.push({ at: this.now(), level: "info", text: `Retried by ${by}; resuming at ${to}` });
 			const taskId = await tx.createTask(this.runTask, { runId: run, start: to }, { ownership: { kind: "conversation" }, background: true });
 			doc.taskId = taskId as unknown as string;
-		}, this.ctx);
+		}, this.ctx));
 		this.harness.resume();
 	}
 
@@ -757,6 +856,9 @@ export class Factory implements FactoryCore {
 				cleared.push(d.id);
 			}
 		}, this.ctx);
+		// A cleared run's files and branches go now, in the background (the call does not wait for the deletion). Each
+		// cleanup re-reads the run: one already fully cleaned is skipped.
+		for (const id of ids) this.cleanInBackground("run", id);
 		return { cleared };
 	}
 
@@ -1100,6 +1202,8 @@ export class Factory implements FactoryCore {
 			doc.state = "CANCELLED";
 			doc.updatedAt = now;
 		}, this.ctx);
+		// No Task cleans it: delete the bundle's own things in the background (members' branches are theirs).
+		this.cleanInBackground("bundle", id);
 	}
 
 	async retryBundle(id: BundleId): Promise<void> {
@@ -1108,8 +1212,10 @@ export class Factory implements FactoryCore {
 		if (d.state !== "FAILED") throw new FactoryError("conflict", `bundle ${id} is ${d.state}; only a FAILED bundle can be retried`);
 		const old = d.taskId !== undefined ? await this.harness.getTask(d.taskId as never, this.ctx) : undefined;
 		if (old && old.state.status !== "terminal") throw new FactoryError("conflict", `bundle ${id} is still finishing; retry in a moment`);
-		await this.root.commit(async (tx) => {
+		await this.cleaner.exclusive(id, () => this.root.commit(async (tx) => {
 			const doc = (await tx.doc(BundleDoc, id, null as never)) as unknown as BundleDocState;
+			if (doc.state !== "FAILED") throw new FactoryError("conflict", `bundle ${id} is ${doc.state}; only a FAILED bundle can be retried`);
+			delete doc.cleanedUp;
 			const f = doc.failure!;
 			const to: BundleState = BUNDLE_TERMINAL_STATES.includes(f.state) ? "INTEGRATING" : f.state;
 			doc.history.push({ from: doc.state, to, at: this.now(), round: doc.counters.reviewRound });
@@ -1120,7 +1226,7 @@ export class Factory implements FactoryCore {
 			doc.counters.attempt = (doc.counters.attempt ?? 0) + 1;
 			doc.notices.push({ at: this.now(), level: "info", text: `Retried by ${by}; resuming at ${to}` });
 			doc.taskId = (await tx.createTask(this.bundleTask, { bundleId: id, start: to }, { ownership: { kind: "conversation" }, background: true })) as unknown as string;
-		}, this.ctx);
+		}, this.ctx));
 		this.harness.resume();
 	}
 
@@ -1445,14 +1551,16 @@ export class Factory implements FactoryCore {
 		if (d.state !== from) throw new FactoryError("conflict", `discussion ${id} is ${d.state}; only a ${from} discussion can be ${verb}`);
 		const old = d.taskId !== undefined ? await this.harness.getTask(d.taskId as never, this.ctx) : undefined;
 		if (old && old.state.status !== "terminal") throw new FactoryError("conflict", `discussion ${id} is still finishing; try again in a moment`);
-		await this.root.commit(async (tx) => {
+		// After any in-flight cleanup of the discussion: PREPARING re-creates the checkout and the environment.
+		await this.cleaner.exclusive(id, () => this.root.commit(async (tx) => {
 			const doc = (await tx.doc(DiscussionDoc, id, null as never)) as unknown as DiscussionDocState;
 			if (doc.state !== from) throw new FactoryError("conflict", `discussion ${id} is ${doc.state}; only a ${from} discussion can be ${verb}`);
 			doc.state = "PREPARING";
 			delete doc.error;
+			delete doc.cleanedUp;
 			doc.updatedAt = this.now();
 			doc.taskId = await this.newDiscussionTask(tx, id);
-		}, this.ctx);
+		}, this.ctx));
 		this.harness.resume();
 	}
 

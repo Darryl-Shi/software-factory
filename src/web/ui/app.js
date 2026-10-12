@@ -298,7 +298,7 @@ function renderSelBar() {
   bar.hidden = false;
   bar.innerHTML = `<span class="sel-n">${ui.sel.size} selected</span>` +
     (live.length ? `<button type="button" class="btn small danger" data-bulk="cancel" title="Cancel the selected tickets that are still running">${confirm("cancel") ? `Click again to cancel ${live.length}` : `Cancel ${live.length}`}</button>` : "") +
-    (done.length ? `<button type="button" class="btn small${confirm("clear") ? " danger" : ""}" data-bulk="clear" title="Clear the selected finished tickets from the board (nothing is deleted)">${confirm("clear") ? `Click again to clear ${done.length}` : `Clear ${done.length}`}</button>` : "") +
+    (done.length ? `<button type="button" class="btn small${confirm("clear") ? " danger" : ""}" data-bulk="clear" title="Clear the selected finished tickets from the board (their files and branches are deleted; records and conversations stay)">${confirm("clear") ? `Click again to clear ${done.length}` : `Clear ${done.length}`}</button>` : "") +
     `<button type="button" class="btn small ghost sel-none" data-bulk="none">Clear selection</button>`;
 }
 let bulkTimer = 0;
@@ -384,7 +384,7 @@ function cardHtml(r) {
 }
 function colHead(c, n, byCol, sub) {
   let extra = "";
-  if (c.key === "done" && byCol.done.length) extra = `<button type="button" class="btn small ghost col-clear${ui.confirmClearAll ? " confirm" : ""}" id="clear-all" data-clear-all title="Clear the Done cards shown from the board (nothing is deleted)">${ui.confirmClearAll ? `Click again to clear ${byCol.done.length}` : "Clear all"}</button>`;
+  if (c.key === "done" && byCol.done.length) extra = `<button type="button" class="btn small ghost col-clear${ui.confirmClearAll ? " confirm" : ""}" id="clear-all" data-clear-all title="Clear the Done cards shown from the board (their files and branches are deleted; records and conversations stay)">${ui.confirmClearAll ? `Click again to clear ${byCol.done.length}` : "Clear all"}</button>`;
   if (c.key === "ready" && ui.ship.length && !ui.selecting) extra = `<button type="button" class="btn primary small ship-go" data-ship-go>Ship ${plural(ui.ship.length, "ticket")}</button>`;
   const closed = c.key === "done" && ui.filter.closed, hint = closed ? COLUMN_CLOSED.hint : c.hint, states = closed ? COLUMN_CLOSED.states : c.states;
   const selIds = ui.selecting ? ui.selCols[c.key] ?? [] : [];

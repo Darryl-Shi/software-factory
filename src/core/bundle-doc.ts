@@ -1,6 +1,7 @@
 // The `factory.bundle` Document (bundles spec §2.1): a bundle's members, state, integration, review rounds, delivery,
 // CI, pending ask, findings, cost and pinned settings. The fields it shares with the run Document have the same names,
 // so the run and bundle Tasks share their review, agent and CI code (task-kit.ts).
+import type { CleanedUp } from "./cleanup.ts";
 import { defineDoc, defineDocFamily } from "@earendil-works/pi-durable";
 import { lastQaStatus, type ReviewRoundState } from "./run-doc.ts";
 import type {
@@ -97,6 +98,8 @@ export type BundleDocState = {
 	messages?: HumanMessage[];
 	history: { from: BundleState | null; to: BundleState; at: number; round: number }[];
 	cancelReason?: string;
+	/** Disk cleanup done (src/core/cleanup.ts): set when every step of that scope succeeded; deleted by a retry. */
+	cleanedUp?: CleanedUp;
 	failure?: { state: BundleState; reason: string; pendingAsk?: BundlePendingAsk };
 };
 

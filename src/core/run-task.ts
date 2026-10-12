@@ -9,6 +9,7 @@ import type { Boat } from "../boat/boat.ts";
 import type { GitHub } from "../github/github.ts";
 import type { Sandbox } from "../sandbox/sandbox.ts";
 import { BridgeDoc, type BridgeTool } from "./bridge.ts";
+import { type Cleaner, cleanAtEnd, nextMarker, runOwner } from "./cleanup.ts";
 import { formatFinding } from "./findings.ts";
 import { messageContent } from "./messages.ts";
 import { lastQaStatus, type ReviewRoundState, RunDoc, type RunDocState, specPathOf } from "./run-doc.ts";
@@ -22,6 +23,8 @@ type RunInput = { runId: string; start: RunState };
 export interface CoreServices {
 	github: GitHub;
 	sandbox: Sandbox;
+	/** Disk cleanup of finished owners (src/core/cleanup.ts). */
+	cleanup: Cleaner;
 	/** boat.dev VMs for AQ testing (§3.7). */
 	boat: Boat;
 	/** Where run artifacts (QA screenshots) live: <artifactsDir>/<runId>/screenshots/<id>.png. */
@@ -658,7 +661,18 @@ export function createRunTask(svc: CoreServices) {
 		await settleUsage(rt, c, d.id);
 		await sideEffectsAtEnd(d);
 		await markVmsDisposed(rt, c, d.id);
-		await rt.commit(() => ({ status: "terminal", outcome: { status: "completed", result: d.state } }), c);
+		const cleaned = await cleanAtEnd(svc.cleanup, runOwner(await read(rt, d.id, c)));
+		await rt.commit(async (tx) => {
+			await recordCleanup(tx, d.id, cleaned);
+			return { status: "terminal", outcome: { status: "completed", result: d.state } };
+		}, c);
+	}
+
+	/** The cleanedUp marker, in the Task's terminal commit (never downgraded). */
+	async function recordCleanup(tx: Tx, runId: string, scope: "scratch" | "full" | undefined) {
+		if (!scope) return;
+		const doc = (await tx.doc(RunDoc, runId, null as never)) as unknown as RunDocState;
+		doc.cleanedUp = nextMarker(doc.cleanedUp, scope, svc.now());
 	}
 
 	return defineTask<RunInput, Checkpoint, string>({
@@ -698,7 +712,11 @@ export function createRunTask(svc: CoreServices) {
 			await settleUsage(rt, c, runId).catch((e) => svc.log(`usage settle failed: ${e}`));
 			await sideEffectsAtEnd(d);
 			await markVmsDisposed(rt, c, runId).catch(() => undefined);
-			await rt.commit(() => ({ status: "terminal", outcome: { status: "aborted", reason: "cancelled" } }), c);
+			const cleaned = await cleanAtEnd(svc.cleanup, runOwner(await read(rt, runId, c))).catch(() => undefined);
+			await rt.commit(async (tx) => {
+				await recordCleanup(tx, runId, cleaned);
+				return { status: "terminal", outcome: { status: "aborted", reason: "cancelled" } };
+			}, c);
 		},
 	});
 }

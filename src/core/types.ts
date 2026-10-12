@@ -4,6 +4,8 @@ export type RunId = string;
 export type AskId = string;
 export type RepoRef = string; // "owner/name"
 export type Role = "architect" | "builder" | "helper" | "reviewer" | "qa" | "discussant" | "integrator";
+/** Every role name (scratch dirs and environment records are named `<owner id>-<role>`). */
+export const ROLES: readonly Role[] = ["architect", "builder", "helper", "reviewer", "qa", "discussant", "integrator"];
 /** Whether AQ testing ran in a review round (§2 "QA status"). */
 export type QaStatus = "ran" | "off" | "skipped" | "unavailable";
 export type Gate = "spec" | "delivery" | "merge";
@@ -486,8 +488,16 @@ export interface FactoryCore {
 	/** Cancel several live runs at once (all or nothing); same effect per run as cancelRun. */
 	cancelRuns(runs: RunId[], reason?: string): Promise<{ cancelled: RunId[] }>;
 	retryRun(run: RunId): Promise<void>;
-	/** Archive terminal runs: they leave the board and default listings; nothing is deleted. */
+	/**
+	 * Archive terminal runs: they leave the board and default listings. Then starts, in the background, a full disk
+	 * cleanup of each (worktree, manifest, local and remote branch, scratch, environment records); the record stays.
+	 */
 	clearRuns(runs: RunId[]): Promise<{ cleared: RunId[] }>;
+	/**
+	 * The disk sweep (the one that runs at startup): cleans finished owners not cleaned yet and removes orphans under the
+	 * workdirs. Waits for a sweep already running and returns its result.
+	 */
+	gc(): Promise<GcResult>;
 	answer(run: RunId, ask: AskId, text: string): Promise<void>;
 	approve(run: RunId, gate: Gate): Promise<void>;
 	reject(run: RunId, gate: Gate, feedback: string): Promise<void>;
@@ -557,6 +567,7 @@ export const CORE_OPS = [
 	"cancelRuns",
 	"retryRun",
 	"clearRuns",
+	"gc",
 	"answer",
 	"approve",
 	"reject",
@@ -594,6 +605,14 @@ export const CORE_OPS = [
 	"messageBundle",
 	"getBundleScreenshot",
 ] as const satisfies readonly (keyof FactoryCore)[];
+
+/** What a disk sweep (`gc`) removed and what it could not remove. */
+export interface GcResult {
+	removed: string[];
+	failures: string[];
+	/** The sweep's one-line summary (as logged). */
+	summary: string;
+}
 
 export class FactoryError extends Error {
 	constructor(

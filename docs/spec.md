@@ -54,8 +54,10 @@ projects, automatic shipping, stacked PRs.
   `discussion.model`, which defaults to the architect's; it is pinned for the discussion's life. A missing or blank
   title is derived from the first message (first non-empty line, markdown markers stripped, cut to 60 characters on a
   word boundary with `…`); an empty message is `invalid`.
-- States: `PREPARING` → `OPEN` → `CLOSED` (reopen resyncs the checkout to the latest default branch); an error leads
-  to `FAILED` (Retry). Setup scripts do not run for discussions.
+- States: `PREPARING` → `OPEN` → `CLOSED`; an error leads to `FAILED` (Retry). Setup scripts do not run for
+  discussions. Leaving `OPEN` (`CLOSED` or `FAILED`) deletes the checkout, its local branch, scratch and environment
+  record (§8.1); reopen or retry re-creates the checkout from the latest default branch and provisions a new
+  environment.
 - Turns, one at a time: `say` (the human's text; the reply is the model's last message) and `requestDrafts` (the model
   must call `submit_tickets` with a summary and draft tickets; reminded up to twice). `stopTurn` aborts a turn.
 - Drafts can be edited or deleted until they become runs; `createTicket` turns a draft into a run in any state except
@@ -78,7 +80,7 @@ projects, automatic shipping, stacked PRs.
 | `ESCALATED` | Pending ask: accept as is / N more rounds / abort | accept → `DELIVERING` · more rounds → `BUILDING` · abort → `CANCELLED` |
 | `DELIVERING` | If the diff differs from the last reviewed fingerprint → `REVIEWING` (no round added). Else commit what the builder left uncommitted and, for an existing repo, push `factory/<run-id>` to `origin`. No PR, no repo creation, no CI | → `READY` · error → `FAILED` |
 | `READY` | Waits for a bundle. Not terminal | bundle merged → `DELIVERED` · builder changed the diff after a message → `REVIEWING` → … → `READY` |
-| `DELIVERED` / `FAILED` / `CANCELLED` | Terminal. Environments disposed, worktrees kept. A final notice (`run.notice` with `final`) carries the URL, advisory and accepted findings, the QA status and any "no CI" note | `retryRun` resumes a `FAILED` or `CANCELLED` run from the state it failed in (not a cleared one) · `clearRuns` archives it off the board |
+| `DELIVERED` / `FAILED` / `CANCELLED` | Terminal. Environments disposed. `DELIVERED` deletes the worktree, manifest, local and remote branch, scratch and environment records; `FAILED` / `CANCELLED` delete only the scratch dirs until the run is cleared, then everything (§8.1). A final notice (`run.notice` with `final`) carries the URL, advisory and accepted findings, the QA status and any "no CI" note | `retryRun` resumes a `FAILED` or `CANCELLED` run from the state it failed in (not a cleared one) · `clearRuns` archives it off the board |
 
 - **The builder** is the only build role the core talks to. It may spawn helpers (`subagent`) that write code in the
   same worktree and environment; the core never sees, splits, locks or merges their work. Helpers finish within the
@@ -87,7 +89,9 @@ projects, automatic shipping, stacked PRs.
 - **Messages in `READY`:** to the builder when the run is in no active bundle; refused (`conflict`) with a pointer to
   the bundle when it is in one. A run in `READY` can be cancelled only when it is in no active bundle.
 - **When a bundle merges,** each member goes `READY` → `DELIVERED`: its delivery is the bundle's PR (or push to
-  `main`), its notice reads "Merged in bundle-N: <url>", and its environments are disposed.
+  `main`), its notice reads "Merged in bundle-N: <url>", its environments are disposed, and its own Task then deletes
+  its worktree, manifest, local and remote `factory/<run-id>`, scratch and environment records (§8.1). Until then a
+  `READY` run keeps everything, because the bundle merges its local branch.
 - **Intake write-back:** there is no intake in the code. Where the design says `intake.writeBack`, the product's
   equivalent is the run's final notice.
 
@@ -129,9 +133,9 @@ role models, `reviewRoundCap`, `bundle.mergeMethod`), works in `<workdir>/bundle
 | `AWAITING_CI` | `ci.mode`, `ci.checks`, `ci.noChecksTimeout` on the delivered SHA; also polls the PR | green, or no checks under `if-present` → PR: `AWAITING_MERGE`, new repo: `MERGED` · red under `ci.fixRounds` → `FIXING` · red at cap, or no checks under `required` → `ESCALATED` |
 | `AWAITING_MERGE` | Pending ask: Merge / Request changes / Drop tickets; polls the PR | see below |
 | `ESCALATED` | Pending ask: more rounds (N) / drop tickets / abort | more rounds → `FIXING` · drop → `INTEGRATING` · abort → `CANCELLED` (PR closed) |
-| `MERGED` | Terminal; members → `DELIVERED`; VMs and environments disposed | — |
-| `FAILED` | Terminal until `retryBundle`, which resumes from the failed state. Members stay in the bundle | — |
-| `CANCELLED` | Terminal; the PR is closed if open; members go back to plain `READY` with their branches untouched | — |
+| `MERGED` | Terminal; members → `DELIVERED`; VMs and environments disposed; the bundle's own worktree, manifest, local and remote `factory/<bundle-id>`, scratch and environment records are deleted (§8.1) | — |
+| `FAILED` | Terminal until `retryBundle`, which resumes from the failed state. Members stay in the bundle. Only the bundle's scratch dirs are deleted (worktree, branches and environment records stay for the retry) | — |
+| `CANCELLED` | Terminal; the PR is closed if open; members go back to plain `READY` with their branches and worktrees untouched; the bundle's own things are deleted as for `MERGED` (also when a `FAILED` bundle is cancelled) | — |
 
 - **Merge** (`mergeBundle`): if the default branch has not moved since the CI-checked integration, the PR is merged
   with `bundle.mergeMethod` → `MERGED`. If it moved, or GitHub refuses the merge, Merge means "merge when green on the
@@ -207,7 +211,8 @@ The core's whole outside surface is `FactoryCore` (`src/core/types.ts`). Every o
     own cancellation path (final notice, environments and QA VM disposed, `run.state`). Returns `{ cancelled }`, the
     runs whose tasks were aborted.
   - `clearRuns(runs)` soft-archives terminal runs (spec `docs/specs/run-mv46ek2u-7omz.md`): it sets
-    `cleared: { at, by }` on each run's Document in one commit and deletes nothing. All or nothing: an empty list is
+    `cleared: { at, by }` on each run's Document in one commit, then starts a full cleanup of each cleared run in the
+    background (§8.1; it returns without waiting for the deletion). All or nothing: an empty list is
     `invalid`, an unknown id `not_found`, a non-terminal run `conflict`; already-cleared runs are skipped (idempotent).
     `listRuns` leaves cleared runs out unless `includeCleared: true`; `getRun` still returns them; `retryRun` refuses
     them with `conflict`.
@@ -221,6 +226,8 @@ The core's whole outside surface is `FactoryCore` (`src/core/types.ts`). Every o
   already in an active bundle), `getBundle`, `listBundles`, `getBundleConversation`, `mergeBundle`,
   `requestBundleChanges`, `dropFromBundle`, `resolveBundleEscalation` (`{ moreRounds }` | `{ drop }` | `{ abort }`),
   `cancelBundle`, `retryBundle`, `messageBundle`, `getBundleScreenshot`.
+- **Maintenance:** `gc()` runs the disk sweep now (§8.1) and returns `{ removed, failures, summary }`; while a sweep
+  is running it waits for it and returns its result. No web UI button; `factory gc` calls it.
 - **Events** (`subscribe` over `GET /api/events`, server-sent): `run.state`, `run.cleared`, `run.ask`, `run.askResolved`,
   `run.notice`, `run.message`, `conversation.updated`, `settings.changed`, `discussion.state`, `discussion.updated`,
   `discussion.conversation.updated`, `bundle.state`, `bundle.ask`, `bundle.askResolved`, `bundle.notice`,
@@ -300,7 +307,66 @@ stops `serve` with an error naming the new paths.
   merge state of the bundle worktree inspected on resume).
 - Helpers keep no core state; an in-flight tool call returns `interrupted`, and the working tree is the record.
 - A run records its pinned config hash and the Pi Durable version (pinned in `package.json`).
-- Storage is SQLite by default (`jsonl` alternative). Worktrees are kept on disk in every terminal state.
+- Storage is SQLite by default (`jsonl` alternative). What a finished run, bundle or discussion leaves on disk is
+  deleted as soon as nothing uses it (§8.1).
+
+### 8.1 Disk cleanup, the startup sweep and `gc`
+
+Spec: `docs/specs/run-mv58bn4q-q2zs.md` (`src/core/cleanup.ts`). Each run, bundle and discussion is an **owner**; its
+things are found under its **pinned** workdir, never only the current global one:
+
+| Thing | Where |
+|---|---|
+| worktree / checkout | `<workdir>/runs/<id>`, `<workdir>/bundles/<id>`, `<workdir>/discussions/<id>` |
+| manifest | `<workdir>/<area>/<id>.json` |
+| local branch | `factory/<id>` in the shared clone `<workdir>/repos/<owner>__<repo>` |
+| remote branch | `factory/<id>` on the host (runs and bundles; discussion branches are never pushed) |
+| scratch | `<workdir>/scratch/<id>-<role>` for every role |
+| environment records | `<factory home>/environments/<id>-<role>.json` |
+
+**Scopes:** `full` removes all six (each only where it exists); `scratch` removes only the scratch dirs and **keeps
+the environment records**, so a retried owner resumes without provisioning again (`policy()` recreates the scratch
+dirs on next use). One pure function, `cleanupScope(owner)`, decides:
+
+| Owner | State | Scope |
+|---|---|---|
+| Run | `DELIVERED` | full |
+| Run | `FAILED` / `CANCELLED`, cleared | full |
+| Run | `FAILED` / `CANCELLED`, not cleared | scratch |
+| Run | `READY` and every non-terminal state | none |
+| Bundle | `MERGED` / `CANCELLED` | full, of the bundle's own things only (members' branches are never touched) |
+| Bundle | `FAILED` | scratch |
+| Discussion | `CLOSED` / `FAILED` | full |
+| Discussion | `PREPARING` / `OPEN` | none |
+
+- **Order of a full cleanup:** remote branch (`GitHubHost.deleteBranch`; only `factory/<owner-id>`, never the default
+  branch, skipped when the repo doesn't exist on the host), worktree (`git worktree remove --force`, then the
+  directory), `git worktree prune`, local branch (`git branch -D`), manifest, scratch dirs, environment records. Git
+  work runs under the per-clone lock. Every step is attempted even if an earlier one failed and is idempotent (missing
+  counts as success); failures are logged with the owner and step, and never block the owner's state transition.
+- **Where it runs:** run and bundle Tasks at their end (finalize and abort), the discussion Task when it leaves
+  `OPEN`, `clearRuns` and `cancelBundle` of a `FAILED` bundle (in the background), the startup sweep and `gc`. Two
+  cleanups of the same owner never run at once; `retryRun`, `retryBundle` and discussion reopen/retry wait for an
+  in-flight cleanup before they commit.
+- **Marker:** `cleanedUp: { at, scope }` on the RunDoc, BundleDoc or DiscussionDoc, set only when every step of that
+  scope succeeded (otherwise absent or left at the lower scope, so the sweep retries). `scratch` can be upgraded to
+  `full`; `full` is final. `retryRun`, `retryBundle` and discussion reopen/retry delete it in the commit that restarts
+  the owner.
+- **Startup sweep:** started from `Factory.start()` after resume, in the background (never delays the web server),
+  one owner at a time:
+  1. **Records:** every owner whose scope isn't `none`, isn't covered by its marker and has no live Task is re-read
+     and cleaned. This backfills older records and retries failed cleanups.
+  2. **Orphans:** in the global workdir and every pinned one, factory-named entries whose id matches no record
+     (`runs/run-*`, `bundles/bundle-*`, `discussions/disc-*` and their `.json`, `scratch/<id>-<role>`), and environment
+     records with no owner, are removed. No other names are touched.
+  3. **Clone sweep:** in each `repos/*` clone, `git worktree prune`, then every local `factory/*` branch that no
+     worktree has checked out and whose owner has no record, or is fully cleaned with scope `full`, is deleted.
+  4. One summary line: `disk sweep: removed N items (runs a, bundles b, discussions c, scratch d, env records e,
+     branches f local / g remote), K failures`, and one line per failure.
+
+  A second sweep over the same data removes nothing. `gc` runs the same sweep on demand.
+- **Never deleted:** QA screenshots (`<factory home>/artifacts`), conversations and the storage records; views load in
+  every state. A closed PR whose head branch was deleted can't be reopened.
 
 ## 9. The web UI
 
@@ -408,6 +474,9 @@ rejected.
 - `factory status`: running or not, the pid and the link, and a second line `version <short SHA> (<date>, v<package
   version>)` with the running SHA (from `/api/version`; the checkout's HEAD when the factory doesn't answer).
   `factory web`: prints the link again.
+- `factory gc`: runs the disk sweep (§8.1) on the running factory (`POST /api/op/gc` through its `web-url`) and prints
+  the summary line, the removed items (or "Nothing was removed.") and any failures. Exits 1 when no factory is running
+  or when there were failures.
 - `factory update [--yes]`: the web UI's check and apply from a terminal (§12). With a factory running it goes through
   that factory's `/api/update/*` (so it restarts the same way), prints the incoming commits and the active work, asks
   for confirmation (`--yes` skips it; without a terminal `--yes` is required) and waits for `done`, `failed` or

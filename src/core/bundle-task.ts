@@ -10,6 +10,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { BundleDeliveryContext } from "../github/github.ts";
 import { BundleDoc, type BundleDocState, mergeMethodOf } from "./bundle-doc.ts";
+import { bundleOwner, cleanAtEnd, nextMarker } from "./cleanup.ts";
 import { formatFinding } from "./findings.ts";
 import { bundleMessageContent } from "./messages.ts";
 import { lastQaStatus, type ReviewRoundState, RunDoc, type RunDocState, specPathOf } from "./run-doc.ts";
@@ -739,7 +740,19 @@ export function createBundleTask(svc: CoreServices) {
 		await settleUsage(rt, c, d.id);
 		await sideEffectsAtEnd(d);
 		await markVmsDisposed(rt, c, d.id);
-		await rt.commit(() => ({ status: "terminal", outcome: { status: "completed", result: d.state } }), c);
+		// Only the bundle's own things: member runs' branches and worktrees are the runs' (bundles merge them).
+		const cleaned = await cleanAtEnd(svc.cleanup, bundleOwner(await read(rt, d.id, c)));
+		await rt.commit(async (tx) => {
+			await recordCleanup(tx, d.id, cleaned);
+			return { status: "terminal", outcome: { status: "completed", result: d.state } };
+		}, c);
+	}
+
+	/** The cleanedUp marker, in the Task's terminal commit (never downgraded). */
+	async function recordCleanup(tx: Tx, id: string, scope: "scratch" | "full" | undefined) {
+		if (!scope) return;
+		const doc = await docIn(tx, id);
+		doc.cleanedUp = nextMarker(doc.cleanedUp, scope, svc.now());
 	}
 
 	return defineTask<BundleInput, Checkpoint, string>({
@@ -780,7 +793,11 @@ export function createBundleTask(svc: CoreServices) {
 			await settleUsage(rt, c, id).catch((e) => svc.log(`usage settle failed: ${e}`));
 			await sideEffectsAtEnd(d);
 			await markVmsDisposed(rt, c, id).catch(() => undefined);
-			await rt.commit(() => ({ status: "terminal", outcome: { status: "aborted", reason: "cancelled" } }), c);
+			const cleaned = await cleanAtEnd(svc.cleanup, bundleOwner(await read(rt, id, c))).catch(() => undefined);
+			await rt.commit(async (tx) => {
+				await recordCleanup(tx, id, cleaned);
+				return { status: "terminal", outcome: { status: "aborted", reason: "cancelled" } };
+			}, c);
 		},
 	});
 }
