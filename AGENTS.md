@@ -10,7 +10,8 @@ one project together as a **bundle**: one PR (or a push to `main` for a new repo
   [`docs/specs/run-mv46hn3a-f4fa.md`](docs/specs/run-mv46hn3a-f4fa.md); markdown rendering:
   [`docs/specs/run-mv46mros-6c1p.md`](docs/specs/run-mv46mros-6c1p.md); the five-column board and UI sizing:
   [`docs/specs/run-mv4rgjw0-ch4q.md`](docs/specs/run-mv4rgjw0-ch4q.md); self-update from the web UI:
-  [`docs/specs/run-mv4rp25k-mqna.md`](docs/specs/run-mv4rp25k-mqna.md), product spec §12).
+  [`docs/specs/run-mv4rp25k-mqna.md`](docs/specs/run-mv4rp25k-mqna.md), product spec §12; the combined review of
+  clean multi-ticket bundles: [`docs/specs/run-mv4vd9xu-g2si.md`](docs/specs/run-mv4vd9xu-g2si.md)).
 - **Design and deviations:** `docs/design-spec.md`, `docs/superpowers/specs/*`, `DEVIATIONS.md`.
 - **How it fits together:** `docs/architecture.md`; settings: `docs/configuration.md`.
 
@@ -49,6 +50,7 @@ src/core/
   run-task.ts            the run state machine (Pi Durable Task): ... REVIEWING → DELIVERING → READY (legacy: old delivery)
   run-doc.ts             factory.run Document, RunView, specPathOf, isLegacyDelivery
   bundle-task.ts         the bundle state machine: INTEGRATING/FIXING/REVIEWING/DELIVERING/AWAITING_CI/AWAITING_MERGE/...
+                         (reviews the combination when the integrator changed anything or 2+ tickets merged cleanly)
   bundle-doc.ts          factory.bundle Document, BundleView
   task-kit.ts            shared by run and bundle Tasks: role Conversations, runAgent, review rounds + QA, CI wait
   discussion-task.ts     discussions (pre-ticket chats), discussion-doc.ts its Document

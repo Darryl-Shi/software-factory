@@ -67,6 +67,11 @@ export type BundleDocState = {
 		conflict?: { run: RunId; files: string[]; attempts: number };
 		/** The integrator changed something (resolved a conflict), so the combined result goes through review. */
 		changed: boolean;
+		/**
+		 * Set on every integration started under the combined-review rule: a clean merge of 2+ members is reviewed. An
+		 * integration record from before that rule has no mark and ends with the old rule (clean → DELIVERING).
+		 */
+		reviewCombination?: boolean;
 	};
 	/** Input for the integrator's next task: findings (FIXING) and notes (dropped tickets, why it runs). */
 	pending: { findings?: Finding[]; note?: string; notes?: string[] };
@@ -136,6 +141,7 @@ export function toBundleView(d: BundleDocState): BundleView {
 						resolved: d.integration.resolved,
 						...(d.integration.conflict ? { conflict: { run: d.integration.conflict.run, files: d.integration.conflict.files } } : {}),
 						changed: d.integration.changed,
+						...(d.integration.reviewCombination ? { reviewCombination: true } : {}),
 					},
 				}
 			: {}),

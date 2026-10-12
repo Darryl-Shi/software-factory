@@ -1,7 +1,8 @@
 // The bundle state machine (bundles spec §2.2) as a Pi Durable Task, beside the run and discussion Tasks and sharing
 // their CoreServices. A bundle combines Ready runs' branches on the latest default branch (the integrator resolves
-// conflicts), reviews the combined result when the integrator changed anything, delivers one PR (or, for a new repo, a
-// push to `main`), waits for CI and merges when the human clicks Merge. Every transition commits the `factory.bundle`
+// conflicts), reviews the combined result when the integrator changed anything or the bundle has 2 or more members (a
+// clean one-ticket merge is not reviewed again), delivers one PR (or, for a new repo, a push to `main`), waits for CI and
+// merges when the human clicks Merge. Every transition commits the `factory.bundle`
 // Document with the task checkpoint; member runs' Documents change in the same commits (membership, merged).
 import type { Context } from "@earendil-works/chord";
 import { defineTask, type TaskRuntime, type Tx } from "@earendil-works/pi-durable";
@@ -82,6 +83,11 @@ export function createBundleTask(svc: CoreServices) {
 		// a fix changes the integration: it goes through review and CI and comes back for a fresh Merge click
 		delete d.mergeRequested;
 		return "FIXING";
+	}
+
+	/** A clean integration under the combined-review rule with 2 or more members is reviewed before delivery. */
+	function reviewsCleanCombination(d: BundleDocState): boolean {
+		return !d.integration!.changed && d.integration!.reviewCombination === true && d.members.length >= 2;
 	}
 
 	function toEscalated(d: BundleDocState, info: Omit<EscalationInfo, "from"> & { from: BundleState }): Phase {
@@ -232,12 +238,18 @@ export function createBundleTask(svc: CoreServices) {
 		const it = d.integration!;
 		const qaOn = d.pinned.config.qa?.enabled === true;
 		const runScripts = (d.pinned.config.boat?.runScripts ?? []) as string[];
+		const cleanMulti = !it.changed && it.resolved.length === 0 && d.members.length >= 2;
 		const parts = [
 			`# Review of ${d.id} (review #${d.counters.reviewSeq}, round ${d.counters.reviewRound}${d.loop === "ci" ? `, after CI fix ${d.counters.ciFixes}` : ""})`,
 			`${d.id} combines ${d.members.length} ticket(s), each built and reviewed on its own branch, on the latest default branch. ${it.resolved.length ? `The integrator resolved conflicts: ${it.resolved.map((r) => `${r.run} (${r.files.join(", ")})`).join("; ")}.` : ""}`,
 			`Workspace (read-only): ${ws.path}. Review the WHOLE combined product against EVERY member's spec below, not only the diff: each ticket's behaviour must survive the combination.`,
 			`Run the test suite yourself; do not trust anyone's report. Flag any test deleted or weakened in the diff. Run the product (bash; curl a running service) and check the acceptance behaviours of every spec.`,
-			`Review the diff and the code it touches for quality and security, especially where the tickets meet (conflict resolutions). Who wrote a line does not matter.`,
+			...(cleanMulti
+				? [
+						`The tickets merged without conflicts (the integrator resolved none), and each ticket already passed its own review (and AQ testing where it applied) on its own branch. What has not been checked is the combination.`,
+						`Review the diff and the code it touches for quality and security, especially how the tickets interact: shared code, files, data, config, APIs, UI and tests, and behaviour one ticket changes that another relies on. Who wrote a line does not matter.`,
+					]
+				: [`Review the diff and the code it touches for quality and security, especially where the tickets meet (conflict resolutions). Who wrote a line does not matter.`]),
 			...(qaOn ? [`AQ testing is on for this project: if the product is something a user launches (an app, a service, a CLI), a missing or broken run script (one of ${runScripts.join(", ")}) is a BLOCKING finding.`] : []),
 			"",
 			`## Tickets`,
@@ -393,7 +405,9 @@ export function createBundleTask(svc: CoreServices) {
 				await svc.github.integrateStart(ws, base);
 				await rt.commit(async (tx) => {
 					const doc = await docIn(tx, d.id);
-					doc.integration = { n: doc.counters.integration, base, next: 0, resolved: [], changed: false };
+					// reviewCombination: this integration follows the rule that a clean merge of 2+ tickets is reviewed (records
+					// created before that rule have no mark and keep the old exit: clean → DELIVERING)
+					doc.integration = { n: doc.counters.integration, base, next: 0, resolved: [], changed: false, reviewCombination: true };
 					doc.workspace = { ...doc.workspace!, baseRef: base, newRepo };
 					notice(doc, { level: "info", text: `Integrating ${doc.members.length} ticket(s) on ${newRepo ? "the new repo's main" : "the default branch"} at ${base.slice(0, 12)}` });
 					doc.updatedAt = svc.now();
@@ -439,6 +453,13 @@ export function createBundleTask(svc: CoreServices) {
 					// the integrator changed the combination: a fresh reviewer (and QA agent) review the whole result
 					delete doc.mergeRequested;
 					notice(doc, { level: "info", text: `Integrated with ${doc.integration!.resolved.length} conflict(s) resolved; reviewing the combined result` });
+					await enterReview(rt, tx, doc);
+					return "REVIEWING";
+				}
+				if (reviewsCleanCombination(doc)) {
+					// a clean merge of 2+ tickets: each was reviewed on its own branch, the combination is reviewed now.
+					// mergeRequested is kept: with no fix needed, a Merge-triggered update still merges by itself.
+					notice(doc, { level: "info", text: `All ${doc.members.length} tickets merged cleanly; reviewing the combination (each ticket was reviewed on its own branch)` });
 					await enterReview(rt, tx, doc);
 					return "REVIEWING";
 				}
@@ -659,7 +680,8 @@ export function createBundleTask(svc: CoreServices) {
 	/**
 	 * Merge (bundles spec §2.3). Unreviewed changes go through review first. When the default branch moved since the
 	 * CI-checked integration, or GitHub refuses the merge, the bundle is updated onto the latest default branch and
-	 * merges by itself once that update is clean and green.
+	 * merges by itself once that update is green and needed no fix (a clean update of 2+ tickets is reviewed first; any
+	 * FIXING clears mergeRequested and the bundle comes back for a fresh Merge click).
 	 */
 	async function merge(rt: RT, c: Context, d: BundleDocState, by: string) {
 		const ws = d.workspace!;
@@ -680,7 +702,7 @@ export function createBundleTask(svc: CoreServices) {
 		if (head !== d.deliveredBase) {
 			await transition(rt, c, d.id, (doc): Phase => {
 				doc.mergeRequested = true;
-				return toReintegrate(doc, `Merge (${by}): the default branch moved since the CI-checked integration; updating onto ${head.slice(0, 12)}. It merges by itself when the update is clean and CI is green.`);
+				return toReintegrate(doc, `Merge (${by}): the default branch moved since the CI-checked integration; updating onto ${head.slice(0, 12)}. It merges by itself when the update needs no fix and CI is green.`);
 			});
 			return;
 		}

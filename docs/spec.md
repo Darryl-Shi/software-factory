@@ -122,9 +122,9 @@ role models, `reviewRoundCap`, `bundle.mergeMethod`), works in `<workdir>/bundle
 
 | State | What happens | Exits |
 |---|---|---|
-| `INTEGRATING` | Fetch the default branch; create or reset `factory/<bundle-id>` at `origin/<default>` (a new repo: the clone's local `main`); `git merge --no-ff` each member branch in order. On a conflict the conflicted merge is left in the worktree and the integrator gets the ticket, the files and every member's spec; it commits the merge and calls `report_done` | clean, integrator changed nothing → `DELIVERING` · integrator resolved anything → `REVIEWING` · error, or a conflict not concluded after 3 attempts → `FAILED` |
+| `INTEGRATING` | Fetch the default branch; create or reset `factory/<bundle-id>` at `origin/<default>` (a new repo: the clone's local `main`); `git merge --no-ff` each member branch in order. On a conflict the conflicted merge is left in the worktree and the integrator gets the ticket, the files and every member's spec; it commits the merge and calls `report_done` | clean with 2 or more members → `REVIEWING` (the combination is reviewed; each ticket was reviewed on its own branch) · clean with one member → `DELIVERING` · integrator resolved anything → `REVIEWING` · error, or a conflict not concluded after 3 attempts → `FAILED` |
 | `FIXING` | The integrator gets blocking findings (review, QA, CI or human) | `report_done` → `REVIEWING` |
-| `REVIEWING` | As §3.3, on the **whole combined product** against **every member's spec** (and `docs/spec.md` when present), with the combined diff from the integration base | pass → `DELIVERING` · fail under cap → `FIXING` · fail at cap → `ESCALATED` |
+| `REVIEWING` | As §3.3, on the **whole combined product** against **every member's spec** (and `docs/spec.md` when present), with the combined diff from the integration base. After a clean merge of 2+ tickets the reviewer is told the tickets merged without conflicts, each passed its own review (and QA) on its own branch, and to look especially at how the tickets interact | pass → `DELIVERING` · fail under cap → `FIXING` · fail at cap → `ESCALATED` |
 | `DELIVERING` | Unreviewed changes go back to `REVIEWING` first. Existing repo: push `factory/<bundle-id>`, open or update one PR. New repo: create the repo, push the result to `main` with `docs/delivery-notes.md` | → `AWAITING_CI` (or straight on with `ci.mode: off`) · error → `FAILED` |
 | `AWAITING_CI` | `ci.mode`, `ci.checks`, `ci.noChecksTimeout` on the delivered SHA; also polls the PR | green, or no checks under `if-present` → PR: `AWAITING_MERGE`, new repo: `MERGED` · red under `ci.fixRounds` → `FIXING` · red at cap, or no checks under `required` → `ESCALATED` |
 | `AWAITING_MERGE` | Pending ask: Merge / Request changes / Drop tickets; polls the PR | see below |
@@ -136,8 +136,10 @@ role models, `reviewRoundCap`, `bundle.mergeMethod`), works in `<workdir>/bundle
 - **Merge** (`mergeBundle`): if the default branch has not moved since the CI-checked integration, the PR is merged
   with `bundle.mergeMethod` → `MERGED`. If it moved, or GitHub refuses the merge, Merge means "merge when green on the
   latest default": the bundle re-integrates from scratch, pushes, waits for CI, and merges by itself when the update
-  was clean and green; if the integrator had to change anything, the update is reviewed and comes back to
-  `AWAITING_MERGE` for a fresh click.
+  needed no fix and CI is green. A clean one-ticket update goes straight to CI; a clean update of 2+ tickets is
+  reviewed first and still merges by itself if that review passes and no fix follows. If the integrator had to
+  change anything, or any fix is needed (review, CI or Request changes), the update comes back to `AWAITING_MERGE`
+  for a fresh click.
 - **Request changes** (`requestBundleChanges`): one blocking `source: human` finding → `FIXING` → `REVIEWING`; adds no
   review or CI round.
 - **Drop tickets** (`dropFromBundle`, at `AWAITING_MERGE` or `ESCALATED`): dropped runs return to plain `READY`; the
@@ -146,7 +148,13 @@ role models, `reviewRoundCap`, `bundle.mergeMethod`), works in `<workdir>/bundle
 - **Outside GitHub:** a PR merged by a human is detected → `MERGED`; a PR closed without merging → `CANCELLED`.
 - **PR content:** title is the ticket's title for one member, else "<N> tickets: <title 1>, …"; one section per
   ticket (title, run id, spec path, advisory and accepted findings, QA status) and an integration section (conflicts
-  resolved, review rounds, advisory findings, QA status, the "no CI" note). Screenshots are never uploaded.
+  resolved or a clean merge, review rounds, advisory findings, QA status, the "no CI" note). A clean bundle of 2+
+  tickets reports its bundle review's rounds and QA status; a clean one-ticket bundle says the combined result had no
+  review of its own. Screenshots are never uploaded.
+- **Bundles in flight at upgrade** (the combined review of clean 2+ bundles,
+  `docs/specs/run-mv4vd9xu-g2si.md`): the rule is decided per integration. Each new integration record carries the
+  mark `reviewCombination: true`; a record from before the upgrade has none and ends with the old rule (clean →
+  `DELIVERING`). A re-integration after a drop or a moved default branch creates a new record and follows the new rule.
 - **Messages to a bundle** (`messageBundle`) go to the reviewer while `REVIEWING`, otherwise to the integrator; QA
   takes none; refused on a terminal bundle. A change after a passing review goes through `REVIEWING` before delivery
   or merge.
@@ -333,8 +341,12 @@ rejected.
   findings, screenshots and QA status; ticket details, findings by round and source, cost by role. A member run shows
   "In bundle-N" (a link) and, once merged, the PR.
 - **Bundle view:** the same layout: integrator, reviewers and QA conversations and a timeline, a chat box to
-  `messageBundle`, a header with the member tickets (each links to its run) and the PR link. Cards: the merge card
-  (CI status, findings with screenshots, QA status or "Not reviewed: clean merge", **Merge**, **Request changes**,
+  `messageBundle`, a header with the member tickets (each links to its run) and the PR link. Until a conversation
+  starts, the rail hints "A clean one-ticket merge needs neither; a bundle of two or more tickets always gets a
+  reviewer." After Merge on a moved default branch, a note says it merges by itself when the update is green and
+  needed no fix. Cards: the merge card (CI status, findings with screenshots, QA status or, for a clean one-ticket
+  bundle or a pre-upgrade clean integration, "Not reviewed: clean merge"; before its first review a 2+ ticket bundle
+  shows "Not reviewed yet: the combination is reviewed before the PR"; **Merge**, **Request changes**,
   **Drop tickets…**), the escalation card (reason, findings, **More rounds**, **Drop tickets…**, **Abort**), and a
   failed bundle's **Retry**. **Cancel bundle** is available on every bundle that is not merged or cancelled,
   including a failed one.
@@ -394,7 +406,8 @@ These are choices the bundles spec left open:
   it closes the PR and releases the members to plain `READY`.
 - **The integrator has the builder's write tools but no helpers** (no `subagent`).
 - **The note listing the remaining tickets after a drop** is given to the integrator with its next task (a conflict
-  to resolve or findings to fix); a clean re-integration needs no integrator task.
+  to resolve or findings to fix); a clean re-integration needs no integrator task unless the review of the remaining
+  combination (2+ tickets) has findings.
 - **A moved default branch or a refused merge re-integrates from scratch:** a fresh integration from the latest
   default branch; earlier integration commits are discarded.
 - **GitHub refusing a merge 3 times fails the bundle.** An integrator that leaves a conflict unconcluded after 3
@@ -452,7 +465,8 @@ downgrades from the UI, and no automatic updates.
 2. Each new run commits its spec at `docs/specs/<run-id>.md`; two Ready tickets never conflict on their spec files.
 3. Ticking two Ready cards of one project and clicking **Ship 2 tickets** creates one bundle card in **Shipping**
    holding both; cards of another project cannot be ticked meanwhile.
-4. When the branches merge cleanly, one PR opens with a section per ticket and no bundle review round; after CI,
+4. When the branches merge cleanly, a fresh reviewer (and QA agent, if QA is on) reviews the combination in one bundle
+   review round, then one PR opens with a section per ticket; after CI,
    **Merge** merges it with `bundle.mergeMethod`, and both runs show Done with the same PR URL and a bundle chip.
 5. When two tickets edit the same lines, the bundle view shows the integrator resolving the conflict, then a fresh
    reviewer (and QA agent, if QA is on) reviewing the whole combined diff against both specs before the PR opens.
@@ -462,8 +476,10 @@ downgrades from the UI, and no automatic updates.
    rest and the PR description lists only the remaining tickets.
 8. **Cancel bundle** (also on a failed bundle) closes its PR and returns its runs to Ready. A run inside an active or
    failed bundle cannot be cancelled, messaged or shipped in a second bundle; each attempt shows a clear error.
-9. If another bundle merges first, Merge on the second updates it onto the new default branch, reruns CI and merges
-   without a second click when the update was clean.
+9. If another bundle merges first, Merge on the second updates it onto the new default branch, reviews the combination
+   again (2+ tickets), reruns CI and merges
+   without a second click when the update needed no fix (its combined review passed at once); after a fix it asks
+   for a fresh click.
 10. Merging or closing the bundle PR directly on GitHub is picked up: the bundle becomes Merged, or Cancelled with its
     runs back in Ready.
 11. **Ship this ticket** on one Ready run gives one PR for that ticket.
