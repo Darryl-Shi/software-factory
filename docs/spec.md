@@ -352,6 +352,18 @@ rejected.
   header, transcript and composer in explicit rows, so hiding the header in chat mode cannot shift them.)
 - **Settings:** a form generated from `settingsSchema()`, global or per project, each field with its source and a
   Reset/Inherit button.
+- **Version and updates** (§12): a version chip in the header shows the running short SHA (tooltip: commit date and
+  package version), or **Update available (N)** when the upstream has N new commits. It opens the **Update dialog**:
+  running and upstream versions, the incoming commit subjects (`inline()`), **Check now** with the last check's time
+  or error, any precondition that blocks the update, the active work (runs and bundles in `PREPARING`, `DISCUSSING`,
+  `BUILDING`, `REVIEWING`, `DELIVERING`, `INTEGRATING`, `FIXING`, `AWAITING_CI`, discussions with a turn running) with
+  a note that they resume after the restart and only the step in progress is redone, and **Update** behind a
+  confirmation that lists the active work again. In foreground mode it says the factory needs a manual restart. While
+  updating it shows the phase; once the server goes away, "Restarting…", polling `/api/version` every 2 s, and the
+  page reloads when the running SHA changes. A stale SHA (the upstream moved) re-checks and shows the new commits.
+  After a restart the last update's report shows once as a dismissible banner. Not updatable: the chip shows the
+  version and the dialog "Updates unavailable: <reason>", with no Update button. `update.js`, a classic script; no
+  inline script, no CSP change.
 
 ## 10. The CLI
 
@@ -361,7 +373,13 @@ rejected.
   [--foreground]`: starts the factory detached (log at `~/.factory/factory.log`), waits until the web server listens
   and prints the link. One instance only (pid file); a busy port or a live pid file is a non-zero exit with the reason.
 - `factory stop`: SIGTERM to the running factory, waits, removes the pid file.
-- `factory status`: running or not, the pid and the link. `factory web`: prints the link again.
+- `factory status`: running or not, the pid and the link, and a second line `version <short SHA> (<date>, v<package
+  version>)` with the running SHA (from `/api/version`; the checkout's HEAD when the factory doesn't answer).
+  `factory web`: prints the link again.
+- `factory update [--yes]`: the web UI's check and apply from a terminal (§12). With a factory running it goes through
+  that factory's `/api/update/*` (so it restarts the same way), prints the incoming commits and the active work, asks
+  for confirmation (`--yes` skips it; without a terminal `--yes` is required) and waits for `done`, `failed` or
+  `rolled-back`. With no factory running it only pulls and installs.
 - `factory doctor`: checks the config, model credentials for every role, the sandbox, the GitHub identity and `gh`,
   the boat key wherever QA is on (`FAIL` if unresolved), and reports model-host diagnostics as warnings.
 - `factory setup [section]`: an interactive wizard with sections `prereqs`, `github`, `models`, `roles`, `qa`,
@@ -383,6 +401,49 @@ These are choices the bundles spec left open:
   attempts also fails it.
 - **There is no intake in the code,** so "`intake.writeBack`" is the run's final notice.
 - The legacy merge gate merges with `squash`.
+
+## 12. Updating the factory
+
+Spec: `docs/specs/run-mv4rp25k-mqna.md`. The factory updates itself to the tip of the **upstream branch of its own git
+checkout** (normally `origin/main` of `Darryl-Shi/software-factory`). There are no tags, releases or channels, no
+downgrades from the UI, and no automatic updates.
+
+- **Install root:** `src/`'s parent (what `bin/factory` and the service unit run). **Updatable** only on a branch with
+  an upstream (`@{u}`); otherwise "Updates unavailable: not a git checkout | detached HEAD | no upstream branch".
+  **Version:** HEAD's short SHA and commit date (read at startup: the running code) and `package.json`'s `version`.
+- **Check** (`src/update/updater.ts`): `git fetch` of the upstream remote (the user's own git config and credential
+  helpers, `GIT_TERMINAL_PROMPT=0`, not sandboxed), then HEAD vs `@{u}`: `behind`, `ahead`, the upstream SHA, up to 50
+  incoming subjects newest first, `dirty` (tracked files only), the time. Runs 30 s after startup, every 6 hours and on
+  demand. A failed fetch is the check's `error` and one log line; the comparison uses the last fetched upstream.
+- **Apply** (one at a time, else `conflict`): the SHA must be the latest check's upstream SHA (else `conflict`); a
+  fresh check re-verifies it (an upstream that moved is `conflict`) and the preconditions (`invalid`: "local changes
+  in tracked files", "local commits not on origin/main", "already up to date"). Then `<home>/update.json` (0600)
+  records `from`, `to`, `startedAt` and the phase `pulling` → `installing` → `restarting` → `done` | `failed` |
+  `rolled-back` (plus `error`, `message`, `restartRequired`, `lockChanged`). `git merge --ff-only <sha>`; `npm ci
+  --no-audit --no-fund` if `package.json`/`package-lock.json` changed — if it fails, `git reset --hard <from>`,
+  `npm ci` again, `failed` with npm's last lines, and no restart.
+- **Restart** by how the factory was started (`src/update/restart.ts`, shared with the setup wizard): systemd
+  (`INVOCATION_ID` and the unit active) → `systemctl --user restart software-factory`; launchd (`XPC_SERVICE_NAME` is
+  `dev.software-factory`) → `launchctl kickstart -k gui/<uid>/dev.software-factory`; daemon (`startDaemon` sets
+  `FACTORY_DAEMON_ARGS` to the JSON serve arguments on its child) → SIGTERM the pid, then `bin/factory serve` with the
+  same arguments; foreground → no restart, `done` with "Restart the factory to finish the update" until the running
+  SHA equals the target.
+- **The restart helper** (`src/update/helper.ts`) runs detached outside the factory (its own process group; under
+  systemd a transient `systemd-run --user` unit, since a unit restart kills its control group), from a copy of the
+  running version's helper sources in `<home>/update-helper/`, logging to `factory.log`. It triggers the restart and
+  waits up to 90 s for `GET /api/version` to report the target SHA → `done`; otherwise it resets the checkout,
+  reinstalls if the lockfile had changed, restarts again → `rolled-back` with the reason and `factory.log`'s last
+  lines.
+- **After the restart** the factory reads `update.json`: "Updated from `abc1234` to `def5678`", or "Update to
+  `def5678` failed to start; rolled back to `abc1234`: <reason>", until dismissed. A record left in `pulling` or
+  `installing` by a factory that died is `failed`; one left `restarting` for over 5 minutes is settled.
+- **Work in flight:** an update is allowed at any time and cancels nothing; shutdown is the normal SIGTERM path and
+  §8's durability resumes every run, bundle and discussion (the interrupted agent step is redone).
+- **Interface:** a service wired in `src/main.ts`, not a core operation. Same token/cookie auth and Host/Origin checks
+  as `/api/op` (POSTs need `application/json`): `GET /api/version` → `{ version, sha, fullSha, date, updatable,
+  reason?, check?, update?, startedBy, active[] }`; `POST /api/update/check`; `POST /api/update/apply { sha }`;
+  `POST /api/update/dismiss` (each returns the same body; refusals use `{ ok: false, error, code }`). Every apply,
+  check failure and rollback is logged to `factory.log` with both SHAs.
 
 ## Acceptance behaviours
 

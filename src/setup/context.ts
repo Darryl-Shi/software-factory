@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import type { Boat } from "../boat/boat.ts";
 import { Factory } from "../core/core.ts";
 import { type ConfigStore, expandHome, setDefaultSecretStore } from "../core/settings.ts";
-import { livePid, startDaemon, stopDaemon } from "../daemon.ts";
+import { livePid } from "../daemon.ts";
 import { type DoctorLine, runDoctorChecks } from "../doctor.ts";
 import { GitHub } from "../github/github.ts";
 import { GhApiHost } from "../github/host.ts";
@@ -15,6 +15,7 @@ import { createBoat, factoryHome } from "../main.ts";
 import { createModelHost, type ModelHost } from "../models/host.ts";
 import { Sandbox } from "../sandbox/sandbox.ts";
 import { SecretStore, secretsPath } from "../secrets/store.ts";
+import { detectService, restartFactory, runCommand as runRestart } from "../update/restart.ts";
 import type { SetupUi } from "./ui.ts";
 
 export const SECTIONS = ["prereqs", "github", "models", "roles", "qa", "search", "service"] as const;
@@ -149,23 +150,11 @@ export function buildSetupContext(p: SetupContextParts): SetupContext {
 	return ctx;
 }
 
-/** Restarts the running factory the way it was started: systemd unit, launchd agent, or `factory serve` daemon. */
-async function restartFactory(configPath: string, run: SetupContext["run"], platform: NodeJS.Platform): Promise<void> {
-	if ((await run("systemctl", ["--user", "is-active", "software-factory"])).code === 0) {
-		const r = await run("systemctl", ["--user", "restart", "software-factory"]);
-		if (r.code !== 0) throw new Error(`systemctl --user restart software-factory failed: ${(r.stderr || r.stdout).trim()}`);
-		return;
-	}
-	if (platform === "darwin") {
-		const target = `gui/${process.getuid?.() ?? 0}/dev.software-factory`;
-		if ((await run("launchctl", ["print", target])).code === 0) {
-			const r = await run("launchctl", ["kickstart", "-k", target]);
-			if (r.code !== 0) throw new Error(`launchctl kickstart -k ${target} failed: ${(r.stderr || r.stdout).trim()}`);
-			return;
-		}
-	}
-	await stopDaemon(configPath);
-	await startDaemon(configPath, []);
+/** Restarts the running factory the way it was started: systemd unit, launchd agent, or `factory serve` daemon
+ * (src/update/restart.ts, shared with the updater's restart helper). */
+async function restartRunningFactory(configPath: string): Promise<void> {
+	const how = await detectService(runRestart, process.platform);
+	await restartFactory(how, { configPath, root: repoRoot, serveArgs: [], run: runRestart });
 }
 
 /** The CLI's context: the real secret store (also the default for `store:` refs), host, boat, commands and daemon. */
@@ -187,7 +176,7 @@ export function createSetupContext(opts: { configPath: string; ui: SetupUi; fake
 		homedir: homedir(),
 		daemon: {
 			pid: () => livePid(configPath),
-			restart: () => restartFactory(configPath, runCommand, process.platform),
+			restart: () => restartRunningFactory(configPath),
 		},
 	});
 }
