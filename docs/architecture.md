@@ -348,8 +348,13 @@ server is its transport.
 - **Models:** `listModels()` returns `{ id: "provider/modelId", name?, provider }[]`, the models the model host
   reports as available (with credentials; `models.getAvailable()`, as `factory setup roles` uses). It is read-only and
   needs no project.
-- **Runs:** `startRun`, `getRun`, `listRuns`, `getConversation`, `cancelRun`, `retryRun`, `clearRuns`.
+- **Runs:** `startRun`, `getRun`, `listRuns`, `getConversation`, `cancelRun`, `cancelRuns`, `retryRun`, `clearRuns`.
   - `getRun` returns a `RunView`.
+  - `cancelRuns(runs, reason?)` is the bulk `cancelRun` (the board's select mode uses it). It checks the whole call
+    first (`invalid` for an empty or malformed list, `not_found`, `conflict` for a terminal run or a member of an
+    active bundle, `FAILED` included), re-checks inside one commit that sets `cancelReason` on every run, and only
+    then aborts each run's task (`harness.abortTask`). Each run then reaches `CANCELLED` through the run task's own
+    cancellation path, exactly as with `cancelRun`. Returns `{ cancelled }`.
   - `clearRuns(runs)` archives terminal runs (`DELIVERED`, `FAILED`, `CANCELLED`) so they leave the board: it sets
     `cleared: { at, by }` on each run's `RunDoc` and deletes nothing (record, conversations, screenshots, worktree and
     delivery stay; `RunIndex` is unchanged). The whole call is checked first and applied in one commit: an empty list

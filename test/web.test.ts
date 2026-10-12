@@ -251,6 +251,50 @@ describe("clearing runs", () => {
 	});
 });
 
+describe("bulk cancel", () => {
+	test("cancelRuns over HTTP: status mapping, all or nothing (a bundle member names its bundle), then CANCELLED with run.state on the stream", async () => {
+		const { port, token } = await serve();
+		await t!.host.seedRepo("me/p", { "README.md": "# p\n" });
+		await op(port, token, "createProject", ["p", "me/p"]);
+		const start = async () => JSON.parse((await op(port, token, "startRun", ["p", { source: "web", title: "hello", body: "make hello" }])).body).result as string;
+		const member = await start();
+		await until(t!.factory, member, inState("READY"));
+		const bundle = JSON.parse((await op(port, token, "createBundle", ["p", [member]])).body).result as string;
+		await t!.factory.setSetting({ project: "p" }, "policy.approvals", ["spec"]);
+		const a = await start();
+		const b = await start();
+		await until(t!.factory, a, inState("AWAITING_APPROVAL"));
+		await until(t!.factory, b, inState("AWAITING_APPROVAL"));
+		const gone = await start();
+		await until(t!.factory, gone, inState("AWAITING_APPROVAL"));
+		expect((await op(port, token, "cancelRun", [gone])).status).toBe(200);
+		await until(t!.factory, gone, inState("CANCELLED"));
+		const es = await sse(port, token, "project=p");
+
+		for (const [args, status, code, names] of [
+			[[[]], 400, "invalid", ""],
+			[["x"], 400, "invalid", ""],
+			[[[a, "nope"]], 404, "not_found", "nope"],
+			[[[a, gone]], 409, "conflict", gone],
+			[[[a, b, member]], 409, "conflict", bundle],
+		] as const) {
+			const r = await op(port, token, "cancelRuns", args as unknown as unknown[]);
+			expect(r.status).toBe(status);
+			expect(JSON.parse(r.body).code).toBe(code);
+			expect(JSON.parse(r.body).error).toContain(names);
+		}
+		await new Promise((r) => setTimeout(r, 200));
+		for (const id of [a, b]) expect((await t!.factory.getRun(id)).state).toBe("AWAITING_APPROVAL");
+
+		const ok = await op(port, token, "cancelRuns", [[a, b]]);
+		expect(ok.status).toBe(200);
+		expect(JSON.parse(ok.body).result).toEqual({ cancelled: [a, b] });
+		for (const id of [a, b]) expect((await until(t!.factory, id, inState("CANCELLED"))).failure).toMatchObject({ reason: "cancelled by web" });
+		await waitFor(() => es.got.filter((e) => e.type === "run.state" && e.to === "CANCELLED").length === 2);
+		expect((await t!.factory.getRun(member)).bundle).toBe(bundle);
+	});
+});
+
 /** Opens `/api/events?<query>` and collects its frames into `got`. */
 async function sse(port: number, token: string, query: string) {
 	const got: any[] = [];

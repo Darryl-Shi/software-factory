@@ -197,7 +197,15 @@ The core's whole outside surface is `FactoryCore` (`src/core/types.ts`). Every o
 
 - **Projects:** `createProject`, `getProject`, `listProjects`.
 - **Runs:** `startRun`, `getRun`, `listRuns`, `getConversation`, `cancelRun`, `retryRun`, `answer`, `approve`,
-  `reject`, `submitHumanFindings`, `resolveEscalation`, `message`, `getScreenshot`, `clearRuns`.
+  `reject`, `submitHumanFindings`, `resolveEscalation`, `message`, `getScreenshot`, `clearRuns`, `cancelRuns`.
+  - `cancelRuns(runs, reason?)` cancels several live runs at once (spec `docs/specs/run-mv545v95-rg77.md`), with the
+    same effect per run as `cancelRun`. All or nothing, checked before anything changes: an empty list, a non-array or
+    an id that is not a non-empty string is `invalid` (duplicates are collapsed), an unknown id `not_found`, a terminal
+    run or a run in an active bundle (a `FAILED` bundle included) `conflict`, naming the run and its state or bundle.
+    One commit sets `cancelReason` on every run (`reason`, or `cancelled by <interface>`, the interface captured
+    before the first await); then each run's task is aborted, and each run reaches `CANCELLED` through the run task's
+    own cancellation path (final notice, environments and QA VM disposed, `run.state`). Returns `{ cancelled }`, the
+    runs whose tasks were aborted.
   - `clearRuns(runs)` soft-archives terminal runs (spec `docs/specs/run-mv46ek2u-7omz.md`): it sets
     `cleared: { at, by }` on each run's Document in one commit and deletes nothing. All or nothing: an empty list is
     `invalid`, an unknown id `not_found`, a non-terminal run `conflict`; already-cleared runs are skipped (idempotent).
@@ -335,6 +343,18 @@ rejected.
   leave the board, its counts and counters, live in every tab (`run.cleared`), and stay off across restarts; the board
   still loads them (`includeCleared`) so ticket keys don't shift. A cleared run opened by link is read-only, marked
   cleared, with no Retry.
+- **Select mode (bulk cancel and clear):** **Select** in the board header turns it on and off. Every run card in every
+  column gets a checkbox (Planning, Build & Review, Ready, the legacy run cards in Shipping, Done); bundle cards and
+  runs in an active bundle get none. Each column header gets a "select all" checkbox acting on exactly the cards the
+  column shows (project filter, search and "Show closed" apply; indeterminate when some are selected). The selection
+  may span projects and columns, and holds only cards the board shows: a selected card that leaves the board (cleared,
+  hidden by a filter) or becomes unselectable (joined a bundle) drops out, live. In select mode the Ready column's
+  ship checkboxes become selection checkboxes and **Ship N tickets** is hidden; leaving select mode clears the
+  selection and brings the ship ticks back as they were. While anything is selected, an action bar shows "N
+  selected", **Cancel K** (the K live selected runs; two clicks, "Click again to cancel K"; one `cancelRuns` call),
+  **Clear M** (the M terminal, not yet cleared selected runs; two clicks; one `clearRuns` call) and **Clear
+  selection**; each button shows only when its count is at least 1. Runs acted on leave the selection; cancelled runs
+  move to Done (visible with "Show closed"). A refused call shows the error toast and changes nothing.
 - **Run view:** full screen for any run: a left rail with the conversations (architect, builder and its helpers,
   reviewers, QA agents) and a timeline; the transcript with every tool call as a plain row (QA screenshots inline); a
   chat box to the agent the run is with; approval and escalation cards floating over it with the final round's
@@ -499,3 +519,7 @@ downgrades from the UI, and no automatic updates.
     Conversation.
 20. Setting an invalid value (e.g. `ci.fixRounds` 5 or `bundle.mergeMethod` `fast`) is rejected and the config file
     is unchanged; a valid change affects only new runs and bundles.
+21. With **Select** on, ticking Planning and Build & Review cards and clicking **Cancel N** twice stops them all in one
+    `cancelRuns` call; they move to Done as Cancelled. A selection mixing live and finished runs shows both **Cancel
+    K** and **Clear M**, each acting only on its own subset; a run inside a bundle cannot be selected, and
+    `cancelRuns` with it is refused (409, naming the bundle) without cancelling anything.
