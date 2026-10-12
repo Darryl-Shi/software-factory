@@ -279,7 +279,7 @@ function renderDiscussionView() {
   if (ui.mode !== "discussion") return;
   const d = openDisc();
   $("#rv-key").textContent = d?.project ?? "";
-  $("#rv-title").textContent = d ? d.title : "New chat";
+  $("#rv-title").textContent = d ? d.title : "New chat"; $("#rv-title").title = d ? d.title : "";
   $("#rv-state").innerHTML = "";
   $("#rv-cost").textContent = d ? money(d.cost.usd) : "";
   $("#rv-cost").title = d ? "Cost of this chat" : "";
