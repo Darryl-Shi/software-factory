@@ -49,9 +49,11 @@ projects, automatic shipping, stacked PRs.
 
 ### 3.1 Discussions (optional, before a ticket)
 
-- `startDiscussion(project, { title, message, model? })` opens a read-only checkout of the default branch (or an empty
+- `startDiscussion(project, { title?, message, model? })` opens a read-only checkout of the default branch (or an empty
   workspace for a repo that doesn't exist yet) and one `discussant` Conversation. The model defaults to
-  `discussion.model`, which defaults to the architect's; it is pinned for the discussion's life.
+  `discussion.model`, which defaults to the architect's; it is pinned for the discussion's life. A missing or blank
+  title is derived from the first message (first non-empty line, markdown markers stripped, cut to 60 characters on a
+  word boundary with `…`); an empty message is `invalid`.
 - States: `PREPARING` → `OPEN` → `CLOSED` (reopen resyncs the checkout to the latest default branch); an error leads
   to `FAILED` (Retry). Setup scripts do not run for discussions.
 - Turns, one at a time: `say` (the human's text; the reply is the model's last message) and `requestDrafts` (the model
@@ -76,7 +78,7 @@ projects, automatic shipping, stacked PRs.
 | `ESCALATED` | Pending ask: accept as is / N more rounds / abort | accept → `DELIVERING` · more rounds → `BUILDING` · abort → `CANCELLED` |
 | `DELIVERING` | If the diff differs from the last reviewed fingerprint → `REVIEWING` (no round added). Else commit what the builder left uncommitted and, for an existing repo, push `factory/<run-id>` to `origin`. No PR, no repo creation, no CI | → `READY` · error → `FAILED` |
 | `READY` | Waits for a bundle. Not terminal | bundle merged → `DELIVERED` · builder changed the diff after a message → `REVIEWING` → … → `READY` |
-| `DELIVERED` / `FAILED` / `CANCELLED` | Terminal. Environments disposed, worktrees kept. A final notice (`run.notice` with `final`) carries the URL, advisory and accepted findings, the QA status and any "no CI" note | `retryRun` resumes a `FAILED` or `CANCELLED` run from the state it failed in |
+| `DELIVERED` / `FAILED` / `CANCELLED` | Terminal. Environments disposed, worktrees kept. A final notice (`run.notice` with `final`) carries the URL, advisory and accepted findings, the QA status and any "no CI" note | `retryRun` resumes a `FAILED` or `CANCELLED` run from the state it failed in (not a cleared one) · `clearRuns` archives it off the board |
 
 - **The builder** is the only build role the core talks to. It may spawn helpers (`subagent`) that write code in the
   same worktree and environment; the core never sees, splits, locks or merges their work. Helpers finish within the
@@ -187,7 +189,14 @@ The core's whole outside surface is `FactoryCore` (`src/core/types.ts`). Every o
 
 - **Projects:** `createProject`, `getProject`, `listProjects`.
 - **Runs:** `startRun`, `getRun`, `listRuns`, `getConversation`, `cancelRun`, `retryRun`, `answer`, `approve`,
-  `reject`, `submitHumanFindings`, `resolveEscalation`, `message`, `getScreenshot`.
+  `reject`, `submitHumanFindings`, `resolveEscalation`, `message`, `getScreenshot`, `clearRuns`.
+  - `clearRuns(runs)` soft-archives terminal runs (spec `docs/specs/run-mv46ek2u-7omz.md`): it sets
+    `cleared: { at, by }` on each run's Document in one commit and deletes nothing. All or nothing: an empty list is
+    `invalid`, an unknown id `not_found`, a non-terminal run `conflict`; already-cleared runs are skipped (idempotent).
+    `listRuns` leaves cleared runs out unless `includeCleared: true`; `getRun` still returns them; `retryRun` refuses
+    them with `conflict`.
+- **Models:** `listModels()` returns the models the model host has credentials for
+  (`{ id: "provider/modelId", name?, provider }[]`); read-only, no project.
 - **Settings:** `settingsSchema`, `getSettings`, `setSetting`, `unsetSetting`.
 - **Discussions:** `startDiscussion`, `getDiscussion`, `listDiscussions`, `getDiscussionConversation`, `say`,
   `stopTurn`, `requestDrafts`, `updateDraft`, `deleteDraft`, `createTicket`, `closeDiscussion`, `reopenDiscussion`,
@@ -196,14 +205,14 @@ The core's whole outside surface is `FactoryCore` (`src/core/types.ts`). Every o
   already in an active bundle), `getBundle`, `listBundles`, `getBundleConversation`, `mergeBundle`,
   `requestBundleChanges`, `dropFromBundle`, `resolveBundleEscalation` (`{ moreRounds }` | `{ drop }` | `{ abort }`),
   `cancelBundle`, `retryBundle`, `messageBundle`, `getBundleScreenshot`.
-- **Events** (`subscribe` over `GET /api/events`, server-sent): `run.state`, `run.ask`, `run.askResolved`,
+- **Events** (`subscribe` over `GET /api/events`, server-sent): `run.state`, `run.cleared`, `run.ask`, `run.askResolved`,
   `run.notice`, `run.message`, `conversation.updated`, `settings.changed`, `discussion.state`, `discussion.updated`,
   `discussion.conversation.updated`, `bundle.state`, `bundle.ask`, `bundle.askResolved`, `bundle.notice`,
   `bundle.conversation.updated`. Filters: `project` (matches run, discussion and bundle events), `run`, `discussion`,
   `bundle`. Member runs emit their own `run.state` as they change.
 - **Views:** `RunView` (state, gate, rounds and caps, pending ask, spec and delivery artifacts, conversations, reviews
   with QA status and VM, findings log, advisory and accepted findings, notices, messages, history, cost, `specPath`,
-  `bundle`) and `BundleView` (members with key, spec path and branch, dropped runs, merge method, delivery, CI, pending
+  `bundle`, `cleared`) and `BundleView` (members with key, spec path and branch, dropped runs, merge method, delivery, CI, pending
   ask, escalation, `mergeRequested`, the latest integration, rounds, conversations, reviews, findings, notices,
   messages, history, cost, failure).
 - **Pending asks are core state,** stored in the Document and published as events. The first valid answer resolves an
@@ -283,6 +292,14 @@ Served by the factory at `http://127.0.0.1:7317` (static files, no build step). 
 `factory serve` prints; the first visit swaps it for an HttpOnly cookie. Foreign `Host` and `Origin` headers are
 rejected.
 
+- **Markdown** (spec `docs/specs/run-mv46mros-6c1p.md`): prose (transcripts, notices, chat bubbles, the spec modal and
+  preview, the request, the discussion summary, draft bodies, the architect's question) renders as CommonMark + GFM
+  through `markdown.js` (`md()`; `inline()` for finding descriptions and one-line labels): `marked` parses, `DOMPurify`
+  sanitises, links open in a new tab with `rel="noopener noreferrer"`, images load only from the UI's origin or
+  `data:`. Both libraries are served from `node_modules` at the exact routes `/vendor/marked.js` and
+  `/vendor/purify.js`; the CSP is unchanged. Without them, prose falls back to escaped text. Tool panels and evidence
+  stay raw.
+
 - **Board:** columns Intake, Discussion, Spec approval, Build, Review, **Ready**, Deliver, Done. **Create** submits a
   ticket (creating the project if it is new). Cards move on their own and show "Your turn" when the human is needed.
 - **Ready column:** each card has a checkbox. Ticking a card of one project disables other projects' checkboxes, with
@@ -290,6 +307,11 @@ rejected.
   ticked) and shows a toast linking to it. A Ready run's view has **Ship this ticket**.
 - **Deliver column:** bundle cards (id, state, member keys, "Your turn"); member runs show inside their bundle card.
   Legacy runs still delivering the old way show as ordinary cards. **Done** shows merged runs with a bundle chip.
+- **Clearing Done runs:** **Clear all** in the Done header (two clicks) clears exactly the Done cards shown (project
+  filter, search and "Show closed" apply); a finished run's view has **Clear from board** (two clicks). Cleared runs
+  leave the board, its counts and counters, live in every tab (`run.cleared`), and stay off across restarts; the board
+  still loads them (`includeCleared`) so ticket keys don't shift. A cleared run opened by link is read-only, marked
+  cleared, with no Retry.
 - **Run view:** full screen for any run: a left rail with the conversations (architect, builder and its helpers,
   reviewers, QA agents) and a timeline; the transcript with every tool call as a plain row (QA screenshots inline); a
   chat box to the agent the run is with; approval and escalation cards floating over it with the final round's
@@ -301,8 +323,13 @@ rejected.
   **Drop tickets…**), the escalation card (reason, findings, **More rounds**, **Drop tickets…**, **Abort**), and a
   failed bundle's **Retry**. **Cancel bundle** is available on every bundle that is not merged or cancelled,
   including a failed one.
-- **Discussions tab:** start a discussion, chat (with **Stop**), **Draft tickets**, edit drafts, **Create ticket**,
-  **Close discussion**, **Reopen**, **Retry**.
+- **Chat** (spec `docs/specs/run-mv46hn3a-f4fa.md`; the Discussions tab is gone): a **Chat** button next to
+  **Create** opens discussions as a full-screen chat in the run view's sheet: the last discussion of the browser
+  session or a blank new chat (`#chat`; a discussion is `#disc=<id>`). Project (or **New project…**), model
+  (`listModels`, the project's `discussion.model` marked "(default)") and thinking dropdowns at the top, locked to the
+  pinned values after the first message; a collapsible history rail of the project's discussions with **New chat**;
+  the transcript and composer (**Stop**); a drafts panel (**Draft tickets**, edit drafts, **Create ticket**); a ⋯ menu
+  with **Close discussion**, **Reopen**, **Retry**.
 - **Settings:** a form generated from `settingsSchema()`, global or per project, each field with its source and a
   Reset/Inherit button.
 

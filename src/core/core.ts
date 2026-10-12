@@ -24,7 +24,7 @@ import { type Boat, boatProblems } from "../boat/boat.ts";
 import { type GitHub, githubProblems } from "../github/github.ts";
 import { type Sandbox, sandboxProblems } from "../sandbox/sandbox.ts";
 import { Bridge, BridgeDoc, bridgeToolsNotFor, EnvDoc } from "./bridge.ts";
-import { DiscussionDoc, type DiscussionDocState, DiscussionIndex, toDiscussionView } from "./discussion-doc.ts";
+import { DiscussionDoc, type DiscussionDocState, DiscussionIndex, deriveTitle, toDiscussionView } from "./discussion-doc.ts";
 import { createDiscussionTask, draftInstructions, takeCheckoutNote } from "./discussion-task.ts";
 import { humanFindings } from "./findings.ts";
 import { BundleDoc, type BundleDocState, BundleIndex, toBundleView } from "./bundle-doc.ts";
@@ -58,6 +58,7 @@ import {
 	type Gate,
 	type HumanFinding,
 	type HumanMessage,
+	type ModelInfo,
 	type Project,
 	type Request,
 	type Role,
@@ -398,6 +399,7 @@ export class Factory implements FactoryCore {
 		const scope = { project: v.project, run: v.id };
 		const hist = v.history.slice(prev?.history.length ?? 0);
 		for (const h of hist) this.emit({ type: "run.state", run: v.id, project: v.project, from: h.from, to: h.to, round: h.round }, scope);
+		if (v.cleared && !prev?.cleared) this.emit({ type: "run.cleared", run: v.id, project: v.project }, scope);
 		const prevAsk = prev?.pendingAsk;
 		if (prevAsk && !prevAsk.response && (v.pendingAsk?.id !== prevAsk.id || v.pendingAsk.response)) {
 			const by = v.pendingAsk?.id === prevAsk.id ? v.pendingAsk.response!.by : v.closedAsk?.id === prevAsk.id ? v.closedAsk.by : "core";
@@ -480,6 +482,11 @@ export class Factory implements FactoryCore {
 	async getProject(name: string): Promise<Project> {
 		return this.config.project(name);
 	}
+	async listModels(): Promise<ModelInfo[]> {
+		const available = await this.opts.models.getAvailable();
+		return available.map((m) => ({ id: `${m.provider}/${m.id}`, ...(m.name ? { name: m.name } : {}), provider: String(m.provider) }));
+	}
+
 	async listProjects(): Promise<Project[]> {
 		return this.config.projects();
 	}
@@ -551,14 +558,16 @@ export class Factory implements FactoryCore {
 		return this.doc(run);
 	}
 
-	async listRuns(filter?: { project?: string; states?: RunState[] }): Promise<RunView[]> {
+	async listRuns(filter?: { project?: string; states?: RunState[]; includeCleared?: boolean }): Promise<RunView[]> {
 		checkStates(filter?.states, RUN_STATES);
+		if (filter?.includeCleared !== undefined && typeof filter.includeCleared !== "boolean") throw new FactoryError("invalid", "includeCleared must be a boolean");
 		const idx = await this.harness.snapshot(RunIndex, this.ctx);
 		const out: RunView[] = [];
 		for (const id of idx?.runs ?? []) {
 			const d = await this.doc(id);
 			if (filter?.project && d.project !== filter.project) continue;
 			if (filter?.states && !filter.states.includes(d.state)) continue;
+			if (d.cleared && !filter?.includeCleared) continue;
 			out.push(toView(d));
 		}
 		return out;
@@ -656,11 +665,13 @@ export class Factory implements FactoryCore {
 	async retryRun(run: RunId): Promise<void> {
 		const by = this.by;
 		const d = await this.doc(run);
+		if (d.cleared) throw new FactoryError("conflict", `run ${run} was cleared; it cannot be retried`);
 		if (d.state !== "FAILED" && d.state !== "CANCELLED") throw new FactoryError("conflict", `run ${run} is ${d.state}; only FAILED or CANCELLED runs can be retried`);
 		const old = await this.harness.getTask(d.taskId as never, this.ctx);
 		if (old && old.state.status !== "terminal") throw new FactoryError("conflict", `run ${run} is still finishing; retry in a moment`);
 		await this.root.commit(async (tx) => {
 			const doc = (await tx.doc(RunDoc, run, null as never)) as unknown as RunDocState;
+			if (doc.cleared) throw new FactoryError("conflict", `run ${run} was cleared; it cannot be retried`);
 			const f = doc.failure!;
 			const to: RunState = f.state === "DELIVERED" || f.state === "FAILED" || f.state === "CANCELLED" ? "RECEIVED" : f.state;
 			doc.history.push({ from: doc.state, to, at: this.now(), round: doc.counters.reviewRound });
@@ -676,6 +687,36 @@ export class Factory implements FactoryCore {
 			doc.taskId = taskId as unknown as string;
 		}, this.ctx);
 		this.harness.resume();
+	}
+
+	async clearRuns(runs: RunId[]): Promise<{ cleared: RunId[] }> {
+		const by = this.by; // before any await (see startRun)
+		if (!Array.isArray(runs) || runs.length === 0) throw new FactoryError("invalid", "clearRuns needs a non-empty array of run ids");
+		if (!runs.every((r) => typeof r === "string" && r.length > 0)) throw new FactoryError("invalid", "run ids must be non-empty strings");
+		const ids = [...new Set(runs)];
+		// Check the whole call first (runs are never deleted, so existence holds), then apply it in one commit.
+		const conflict = (d: RunDocState) => new FactoryError("conflict", `run ${d.id} is ${d.state}; only DELIVERED, FAILED or CANCELLED runs can be cleared`);
+		for (const id of ids) {
+			const d = await this.doc(id); // not_found
+			if (!TERMINAL_STATES.includes(d.state)) throw conflict(d);
+		}
+		const cleared: RunId[] = [];
+		await this.root.commit(async (tx) => {
+			const docs: RunDocState[] = [];
+			for (const id of ids) {
+				const d = (await tx.doc(RunDoc, id, null as never)) as unknown as RunDocState | undefined;
+				if (!d?.id) throw new FactoryError("not_found", `run ${id} does not exist`);
+				if (!TERMINAL_STATES.includes(d.state)) throw conflict(d);
+				docs.push(d);
+			}
+			const at = this.now();
+			for (const d of docs) {
+				if (d.cleared) continue;
+				d.cleared = { at, by };
+				cleared.push(d.id);
+			}
+		}, this.ctx);
+		return { cleared };
 	}
 
 	// ------------------------------------------------------------------ answers to pending asks
@@ -1134,13 +1175,14 @@ export class Factory implements FactoryCore {
 	}
 
 	// ------------------------------------------------------------------ discussions (a pre-ticket chat per project)
-	async startDiscussion(project: string, d: { title: string; message: string; model?: { model: string; thinking: string } }): Promise<DiscussionId> {
+	async startDiscussion(project: string, d: { title?: string; message: string; model?: { model: string; thinking: string } }): Promise<DiscussionId> {
 		const by = this.by;
 		const p = this.config.project(project);
-		const title = typeof d?.title === "string" ? d.title.trim() : "";
 		const message = typeof d?.message === "string" ? d.message.trim() : "";
-		if (!title) throw new FactoryError("invalid", "a discussion needs a title");
 		if (!message) throw new FactoryError("invalid", "a discussion needs a first message");
+		const explicit = typeof d?.title === "string" ? d.title.trim() : "";
+		const title = explicit || deriveTitle(message);
+		if (!title) throw new FactoryError("invalid", "a discussion needs a title");
 		const eff = this.config.effective({ project });
 		const def = eff.discussion?.model ?? {};
 		const model = d.model ? { model: String(d.model.model ?? ""), thinking: String(d.model.thinking ?? "") } : { model: String(def.model ?? ""), thinking: String(def.thinking ?? "medium") };

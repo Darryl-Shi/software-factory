@@ -4,19 +4,30 @@
 //   GET  /api/events?run=&project=&discussion=&bundle=   server-sent events from core.subscribe (the same filter)
 //   GET  /api/runs/<run>/screenshots/<id> a QA screenshot (core.getScreenshot), as image/png
 //   GET  /api/bundles/<id>/screenshots/<sid> a bundle review's QA screenshot (core.getBundleScreenshot)
-//   GET  /, /app.js, /discussions.js, /bundles.js, /app.css   the UI (static files, no build step)
+//   GET  /, /markdown.js, /app.js, /discussions.js, /bundles.js, /app.css   the UI (static files, no build step)
+//   GET  /vendor/marked.js, /vendor/purify.js   the markdown libraries, from node_modules (exact routes)
 // Access needs a token: `factory serve` prints a link carrying it, and the first visit swaps it for an HttpOnly,
 // SameSite=Strict cookie. The server binds to localhost by default and rejects foreign Host and Origin headers.
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { dirname, join } from "node:path";
+import { createRequire } from "node:module";
+import { dirname, join, resolve } from "node:path";
 import { CORE_OPS, type FactoryCore, type FactoryError } from "../core/types.ts";
 
 const COOKIE = "factory_web";
 const UI_DIR = join(import.meta.dirname, "ui");
+const require = createRequire(import.meta.url);
+// The markdown libraries' prebuilt browser builds, served straight from node_modules (no build step, no CDN).
+// `marked` exports only its ESM entry, so its UMD build is found next to it.
+const VENDOR_MARKED = join(dirname(require.resolve("marked")), "marked.umd.js");
+const VENDOR_PURIFY = require.resolve("dompurify/dist/purify.min.js");
+// Exact paths only: [file (absolute, or relative to UI_DIR), content type].
 const STATIC: Record<string, [string, string]> = {
 	"/": ["index.html", "text/html; charset=utf-8"],
+	"/markdown.js": ["markdown.js", "text/javascript; charset=utf-8"],
+	"/vendor/marked.js": [VENDOR_MARKED, "text/javascript; charset=utf-8"],
+	"/vendor/purify.js": [VENDOR_PURIFY, "text/javascript; charset=utf-8"],
 	"/app.js": ["app.js", "text/javascript; charset=utf-8"],
 	"/discussions.js": ["discussions.js", "text/javascript; charset=utf-8"],
 	"/bundles.js": ["bundles.js", "text/javascript; charset=utf-8"],
@@ -100,8 +111,8 @@ export async function startWebServer(core: FactoryCore, opts: WebOptions): Promi
 				if (req.method === "GET" && url.pathname === "/") return send(res, 401, loginPage(false), "text/html; charset=utf-8");
 				return json(res, 401, { ok: false, error: "open the link `factory serve` printed (or run `factory web`)", code: "unauthorized" });
 			}
-			const file = STATIC[url.pathname];
-			if (req.method === "GET" && file) return send(res, 200, readFileSync(join(UI_DIR, file[0]), "utf8"), file[1]);
+			const file = Object.hasOwn(STATIC, url.pathname) ? STATIC[url.pathname] : undefined;
+			if (req.method === "GET" && file) return send(res, 200, readFileSync(resolve(UI_DIR, file[0]), "utf8"), file[1]);
 			if (req.method === "GET" && url.pathname === "/api/events") return events(req, res, url);
 			const shot = /^\/api\/(runs|bundles)\/([A-Za-z0-9._-]+)\/screenshots\/([A-Za-z0-9._-]+)$/.exec(url.pathname);
 			if (req.method === "GET" && shot) {

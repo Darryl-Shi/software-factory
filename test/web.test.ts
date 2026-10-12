@@ -9,7 +9,7 @@ import { Script } from "node:vm";
 import { afterEach, describe, expect, test } from "vitest";
 import type { FactoryEvent } from "../src/core/types.ts";
 import { loadToken, startWebServer } from "../src/web/server.ts";
-import { inState, makeFactory, type TestEnv, until } from "./helpers.ts";
+import { inState, makeFactory, shipAndMerge, type TestEnv, until } from "./helpers.ts";
 
 let t: TestEnv | undefined;
 let stops: (() => Promise<void>)[] = [];
@@ -202,6 +202,55 @@ describe("operations and events", () => {
 	});
 });
 
+describe("clearing runs", () => {
+	test("clearRuns over HTTP: status mapping, all or nothing, listRuns includeCleared, retryRun refused, run.cleared on the stream", async () => {
+		const { port, token } = await serve();
+		await op(port, token, "createProject", ["p", "me/p"]);
+		const start = async () => JSON.parse((await op(port, token, "startRun", ["p", { source: "web", title: "hello", body: "make hello" }])).body).result as string;
+		const delivered = await start();
+		expect((await shipAndMerge(t!.factory, delivered)).state).toBe("DELIVERED");
+		await t!.factory.setSetting({ project: "p" }, "policy.approvals", ["spec"]);
+		const cancelled = await start();
+		await until(t!.factory, cancelled, inState("AWAITING_APPROVAL"));
+		expect((await op(port, token, "cancelRun", [cancelled])).status).toBe(200);
+		await until(t!.factory, cancelled, inState("CANCELLED"));
+		const live = await start();
+		await until(t!.factory, live, inState("AWAITING_APPROVAL"));
+		const es = await sse(port, token, "project=p");
+
+		for (const [args, status, code] of [
+			[[[]], 400, "invalid"],
+			[["x"], 400, "invalid"],
+			[[[delivered, "nope"]], 404, "not_found"],
+			[[[delivered, cancelled, live]], 409, "conflict"],
+		] as const) {
+			const r = await op(port, token, "clearRuns", args as unknown as unknown[]);
+			expect(r.status).toBe(status);
+			expect(JSON.parse(r.body).code).toBe(code);
+		}
+		expect(JSON.parse((await op(port, token, "listRuns")).body).result).toHaveLength(3);
+
+		const ok = await op(port, token, "clearRuns", [[delivered, cancelled]]);
+		expect(ok.status).toBe(200);
+		expect(JSON.parse(ok.body).result).toEqual({ cleared: [delivered, cancelled] });
+		expect(JSON.parse((await op(port, token, "clearRuns", [[delivered]])).body).result).toEqual({ cleared: [] });
+		const listed = JSON.parse((await op(port, token, "listRuns")).body).result as { id: string }[];
+		expect(listed.map((r) => r.id)).toEqual([live]);
+		const all = JSON.parse((await op(port, token, "listRuns", [{ includeCleared: true }])).body).result as { id: string; cleared?: { by: string } }[];
+		expect(all.map((r) => r.id).sort()).toEqual([delivered, cancelled, live].sort());
+		for (const r of all.filter((x) => x.id !== live)) expect(r.cleared).toMatchObject({ by: "web" });
+		expect(JSON.parse((await op(port, token, "getRun", [delivered])).body).result.cleared).toMatchObject({ by: "web" });
+		const retry = await op(port, token, "retryRun", [cancelled]);
+		expect(retry.status).toBe(409);
+		expect(JSON.parse(retry.body).code).toBe("conflict");
+		await waitFor(() => es.got.filter((e) => e.type === "run.cleared").length === 2);
+		expect(es.got.filter((e) => e.type === "run.cleared")).toEqual([
+			{ type: "run.cleared", run: delivered, project: "p" },
+			{ type: "run.cleared", run: cancelled, project: "p" },
+		]);
+	});
+});
+
 /** Opens `/api/events?<query>` and collects its frames into `got`. */
 async function sse(port: number, token: string, query: string) {
 	const got: any[] = [];
@@ -255,6 +304,30 @@ describe("discussions", () => {
 	});
 });
 
+describe("chat ops", () => {
+	test("listModels over HTTP returns the available models; startDiscussion without a title derives it", async () => {
+		const { port, token } = await serve();
+		const models = await op(port, token, "listModels");
+		expect(models.body).toContain("\"ok\":true");
+		expect(models.status).toBe(200);
+		const list = JSON.parse(models.body).result as { id: string; name?: string; provider: string }[];
+		expect(Array.isArray(list)).toBe(true);
+		expect(list.length).toBeGreaterThan(0);
+		for (const m of list) {
+			expect(m.id.startsWith(`${m.provider}/`)).toBe(true);
+		}
+		expect(list.map((m) => m.id)).toContain("scripted/discussant");
+		await t!.host.seedRepo("me/p", { "README.md": "# p\n" });
+		await op(port, token, "createProject", ["p", "me/p"]);
+		const res = await op(port, token, "startDiscussion", ["p", { message: "## Why is the build slow?\nIt takes ages." }]);
+		expect(res.status).toBe(200);
+		const id = JSON.parse(res.body).result;
+		const v = JSON.parse((await op(port, token, "getDiscussion", [id])).body).result;
+		expect(v.title).toBe("Why is the build slow?");
+		await t!.factory.waitForDiscussion(id, (d) => d.state !== "PREPARING");
+	});
+});
+
 describe("static UI", () => {
 	test("app.js parses; index.html loads only same-origin files and has no inline script (CSP)", () => {
 		const js = readFileSync(join(UI, "app.js"), "utf8");
@@ -265,8 +338,25 @@ describe("static UI", () => {
 		const bundles = readFileSync(join(UI, "bundles.js"), "utf8");
 		// classic scripts after app.js: they share app.js's globals and parse in the same global scope
 		expect(() => new Script(`${js}\n;${disc}\n;${bundles}`, { filename: "app.js+discussions.js+bundles.js" })).not.toThrow();
-		expect([...html.matchAll(/<script\b[^>]*>/g)].map((m) => m[0])).toEqual(['<script src="/app.js" defer>', '<script src="/discussions.js" defer>', '<script src="/bundles.js" defer>']);
-		expect(html).toContain('data-view="discussions"');
+		// md()/inline() come only from markdown.js, which shares the same global scope
+		const mdjs = readFileSync(join(UI, "markdown.js"), "utf8");
+		expect(() => new Script(`${mdjs}\n;${js}\n;${disc}\n;${bundles}`, { filename: "markdown.js+app.js+discussions.js+bundles.js" })).not.toThrow();
+		expect(`${js}\n${disc}\n${bundles}`).not.toMatch(/(function|const|let|var)\s+(md|inline)\b/);
+		expect([...html.matchAll(/<script\b[^>]*>/g)].map((m) => m[0])).toEqual([
+			'<script src="/vendor/marked.js" defer>',
+			'<script src="/vendor/purify.js" defer>',
+			'<script src="/markdown.js" defer>',
+			'<script src="/app.js" defer>',
+			'<script src="/discussions.js" defer>',
+			'<script src="/bundles.js" defer>',
+		]);
+		// the nav is Board and Settings; the Chat button sits right after Create; the Discussions list and modal are gone
+		expect([...html.matchAll(/data-view="([a-z]+)"/g)].map((m) => m[1])).toEqual(["board", "settings"]);
+		expect(html).toMatch(/id="create-btn"[^]*?<\/button>\s*<button type="button" class="btn" id="chat-btn"/);
+		expect(html).not.toContain("view-discussions");
+		expect(html).toContain('id="chatbar"');
+		for (const gone of ["openNewDiscussion", "renderDiscussions", "#disc-list", "#view-discussions"]) expect(`${js}\n${disc}`).not.toContain(gone);
+		expect(disc).toContain("core.listModels(");
 		expect(html).not.toMatch(/https?:\/\//);
 		expect(readFileSync(join(UI, "app.css"), "utf8")).not.toMatch(/@import|url\(https?:/);
 		// every operation the UI calls is one the server allows
@@ -274,6 +364,37 @@ describe("static UI", () => {
 		used.delete("subscribe");
 		const server = readFileSync(join(import.meta.dirname, "../src/core/types.ts"), "utf8");
 		for (const name of used) expect(server).toContain(`"${name}",`);
+	});
+
+	test("vendor markdown libraries and markdown.js: exact routes, JavaScript, same auth, no path traversal", async () => {
+		const { port, token } = await serve();
+		const get = (path: string, auth = true) => http(port, "GET", path, { headers: auth ? { authorization: `Bearer ${token}` } : {} });
+		for (const [path, marker] of [["/vendor/marked.js", "marked v18.1.0"], ["/vendor/purify.js", "DOMPurify"], ["/markdown.js", "DOMPurify"]] as const) {
+			const r = await get(path);
+			expect(r.status).toBe(200);
+			expect(r.headers["content-type"]).toBe("text/javascript; charset=utf-8");
+			expect(r.headers["x-content-type-options"]).toBe("nosniff");
+			expect(r.headers["content-security-policy"]).toBe((await get("/app.js")).headers["content-security-policy"]);
+			expect(r.body).toContain(marker);
+			expect(() => new Script(r.body, { filename: path })).not.toThrow();
+			// same rule as /app.js: refused without the token or cookie
+			const anon = await get(path, false);
+			expect(anon.status).toBe(401);
+			expect(anon.body).not.toContain(marker);
+		}
+		// only the exact entries: no directory listing, no other files, no traversal
+		for (const path of [
+			"/vendor/", "/vendor", "/vendor/marked.umd.js", "/vendor/purify.min.js", "/vendor/../package.json", "/vendor/%2e%2e/package.json",
+			"/vendor/..%2f..%2fpackage.json", "/vendor/marked.js/../../server.ts", "/node_modules/marked/package.json", "/../server.ts", "/%2e%2e/server.ts", "/constructor", "/__proto__", "/hasOwnProperty",
+		]) {
+			const r = await get(path);
+			expect(r.status, path).not.toBe(200);
+			expect(r.body, path).not.toMatch(/"name":|import \{/);
+		}
+		// the CSP gains no unsafe-eval and no foreign origin
+		const csp = String((await get("/")).headers["content-security-policy"]);
+		expect(csp).not.toMatch(/unsafe-eval|https?:/);
+		expect(csp).toContain("script-src 'self'");
 	});
 
 	test("discussions.js is served, parses, and is loaded by index.html", async () => {
