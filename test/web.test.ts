@@ -349,7 +349,10 @@ describe("static UI", () => {
 			'<script src="/app.js" defer>',
 			'<script src="/discussions.js" defer>',
 			'<script src="/bundles.js" defer>',
+			'<script src="/update.js" defer>',
 		]);
+		const upd = readFileSync(join(UI, "update.js"), "utf8");
+		expect(() => new Script(`${mdjs}\n;${js}\n;${disc}\n;${bundles}\n;${upd}`, { filename: "all UI scripts" })).not.toThrow();
 		// the nav is Board and Settings; the Chat button sits right after Create; the Discussions list and modal are gone
 		expect([...html.matchAll(/data-view="([a-z]+)"/g)].map((m) => m[1])).toEqual(["board", "settings"]);
 		expect(html).toMatch(/id="create-btn"[^]*?<\/button>\s*<button type="button" class="btn" id="chat-btn"/);

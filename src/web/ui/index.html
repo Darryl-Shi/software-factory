@@ -12,6 +12,7 @@
 <script src="/app.js" defer></script>
 <script src="/discussions.js" defer></script>
 <script src="/bundles.js" defer></script>
+<script src="/update.js" defer></script>
 </head>
 <body>
 <div class="app" id="app">
@@ -24,10 +25,12 @@
     <div class="top-spacer"></div>
     <label class="search"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6.5 1a5.5 5.5 0 0 1 4.38 8.83l3.65 3.64-1.06 1.06-3.64-3.65A5.5 5.5 0 1 1 6.5 1zm0 1.5a4 4 0 1 0 0 8 4 4 0 0 0 0-8z"/></svg><input id="q" type="search" placeholder="Search tickets" aria-label="Search tickets"></label>
     <div class="top-actions">
+      <button type="button" class="vchip" id="ver-chip" hidden title="Factory version"></button>
       <button type="button" class="btn primary" id="create-btn"><span aria-hidden="true">+</span> Create</button>
       <button type="button" class="btn" id="chat-btn" title="Talk a problem through with a model before it becomes a ticket"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 2.5h11a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1H7.2L4 14v-2.5H2.5a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1zm.5 1.5v6h2.5v1.2L6.7 10H13V4z"/></svg> Chat</button>
     </div>
   </header>
+  <div class="upd-banner" id="upd-banner" hidden role="status"></div>
 
   <main class="view" id="view-board">
     <div class="board-wrap">

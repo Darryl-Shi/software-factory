@@ -4,7 +4,7 @@
 // storage, and then starts the web server, the factory's interface. A busy web port stops it before any run resumes.
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { Boat } from "./boat/boat.ts";
 import { BoatApiBackend, type BoatBackend, LocalBoatBackend } from "./boat/backend.ts";
@@ -15,6 +15,9 @@ import { GhApiHost, type GitHubHost, LocalGitHubHost } from "./github/host.ts";
 import { createModelHost } from "./models/host.ts";
 import { Sandbox } from "./sandbox/sandbox.ts";
 import { SecretStore, secretsPath } from "./secrets/store.ts";
+import type { FactoryCore } from "./core/types.ts";
+import type { StartedBy } from "./update/restart.ts";
+import { type ActiveWork, Updater } from "./update/updater.ts";
 import { startWebServer } from "./web/server.ts";
 
 export interface ProcessOptions {
@@ -29,9 +32,34 @@ export interface ProcessOptions {
 	webPort?: number;
 	ciPollMs?: number;
 	log?: (m: string) => void;
+	/** How the process was started (systemd, launchd, daemon or foreground) and the daemon's serve arguments:
+	 * the updater restarts it the same way. Default: foreground. */
+	startedBy?: StartedBy;
+	serveArgs?: string[];
+	/** The install root the updater updates (default: this code's checkout, src/'s parent). */
+	installRoot?: string;
+	/** Run the startup and periodic update checks (default true). */
+	updateChecks?: boolean;
 }
 
 export const DEFAULT_CONFIG = "~/.factory/config.yaml";
+
+/** The directory that holds the running code (src/'s parent): what bin/factory and the service unit run. */
+export const INSTALL_ROOT = resolve(import.meta.dirname, "..");
+
+/** Runs and bundles in these states have an agent working or the core acting; an update redoes their step. */
+const WORKING_STATES = ["PREPARING", "DISCUSSING", "BUILDING", "REVIEWING", "DELIVERING", "INTEGRATING", "FIXING", "AWAITING_CI"];
+
+export async function activeWork(factory: FactoryCore): Promise<ActiveWork[]> {
+	const [runs, bundles, discussions] = await Promise.all([factory.listRuns(), factory.listBundles(), factory.listDiscussions()]);
+	return [
+		...runs.filter((r) => WORKING_STATES.includes(r.state)).map((r) => ({ kind: "run" as const, id: r.id, project: r.project, title: r.request.title, state: r.state })),
+		...bundles
+			.filter((b) => WORKING_STATES.includes(b.state))
+			.map((b) => ({ kind: "bundle" as const, id: b.id, project: b.project, title: b.members.map((m) => m.title).join(", "), state: b.state })),
+		...discussions.filter((d) => d.turn).map((d) => ({ kind: "discussion" as const, id: d.id, project: d.project, title: d.title, state: d.state })),
+	];
+}
 
 export function factoryHome(configPath: string) {
 	return dirname(configPath);
@@ -49,6 +77,7 @@ export function createBoat(configPath: string, fake?: string): Boat {
 
 export interface FactoryProcess {
 	factory: Factory;
+	updater: Updater;
 	web: { url: string; stop(): Promise<void> };
 	/** Stops the web server, then the factory. */
 	close(): Promise<void>;
@@ -109,9 +138,20 @@ export async function startFactoryProcess(opts: ProcessOptions = {}): Promise<Fa
 	// Fail on a busy port before start() resumes any run; startWebServer below is the real check.
 	if (webPort !== 0) await probePort(webHost, webPort);
 	await factory.start();
+	const updater = new Updater({
+		root: opts.installRoot ?? INSTALL_ROOT,
+		home,
+		configPath,
+		startedBy: opts.startedBy ?? "foreground",
+		serveArgs: opts.serveArgs ?? [],
+		log,
+		activeWork: () => activeWork(factory),
+	});
 	let web: FactoryProcess["web"];
 	try {
+		await updater.init();
 		web = await startWebServer(factory.as("web"), {
+			updater,
 			host: webHost,
 			port: webPort,
 			tokenFile: join(factoryHome(configPath), "web-token"),
@@ -121,10 +161,13 @@ export async function startFactoryProcess(opts: ProcessOptions = {}): Promise<Fa
 		await factory.close().catch(() => {});
 		throw e;
 	}
+	if (opts.updateChecks !== false) updater.startChecks();
 	return {
 		factory,
+		updater,
 		web,
 		async close() {
+			updater.stop();
 			try {
 				await web.stop();
 			} finally {

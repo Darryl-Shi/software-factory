@@ -4,10 +4,9 @@ import { chmodSync, closeSync, existsSync, mkdirSync, openSync, rmSync, writeFil
 import { userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import { daemonFiles, stopDaemon } from "../../daemon.ts";
+import { LABEL, UNIT } from "../../update/restart.ts";
 import type { SetupContext, Step, StepStatus } from "../context.ts";
 
-const UNIT = "software-factory";
-const LABEL = "dev.software-factory";
 
 export function servicePaths(homedir: string): { unit: string; plist: string } {
 	return {

@@ -10,7 +10,7 @@ for (let i = 0; i < argv.length; i++) {
 	const a = argv[i]!;
 	if (a.startsWith("--")) {
 		const [k, v] = a.slice(2).split("=", 2) as [string, string | undefined];
-		const bool = ["scripted", "help", "foreground"].includes(k);
+		const bool = ["scripted", "help", "foreground", "yes"].includes(k);
 		flags[k] = v ?? (bool ? true : argv[++i] ?? "");
 	} else pos.push(a);
 }
@@ -20,13 +20,15 @@ const HELP = `factory — software factory on Pi Durable
 
   factory serve [--config p] [--port n] [--fake-github dir] [--fake-boat dir] [--scripted] [--ci-poll-ms n] [--foreground]
   factory stop [--config p]
-  factory status [--config p]
+  factory status [--config p]       whether it runs, its link and the running version
+  factory update [--yes] [--config p]   update the factory to its upstream branch's tip, then restart it
   factory web [--config p]          print the web UI's link
   factory doctor [--config p]
   factory setup [section] [--config p]
 `;
 const SERVE_FLAGS = ["config", "port", "fake-github", "fake-boat", "scripted", "ci-poll-ms", "foreground", "help"];
 const SETUP_FLAGS = ["config", "help"];
+const UPDATE_FLAGS = ["config", "yes", "help"];
 
 /** The config file's absolute path: --config, else $FACTORY_CONFIG, else ~/.factory/config.yaml. */
 async function configPath(): Promise<string> {
@@ -55,7 +57,10 @@ async function main() {
 				print("not running");
 				process.exit(1);
 			}
-			return print(`running (pid ${pid}) ${url ?? "(web UI not listening)"}`);
+			print(`running (pid ${pid}) ${url ?? "(web UI not listening)"}`);
+			const v = url ? await runningVersion(url) : undefined;
+			const { describeVersion } = await import("./update/cli.ts");
+			return print(v ? `version ${describeVersion(v)}` : `version ${await diskVersion()} (on disk; the running version is not reachable)`);
 		}
 		if (pid === undefined || url === undefined) {
 			console.error("not running: start it with `factory serve`");
@@ -63,9 +68,29 @@ async function main() {
 		}
 		return print(url);
 	}
+	if (cmd === "update") {
+		const unknown = Object.keys(flags).find((k) => !UPDATE_FLAGS.includes(k));
+		if (unknown) throw new Error(`unknown option --${unknown}`);
+		const { updateCommand } = await import("./update/cli.ts");
+		process.exit(await updateCommand(await configPath(), { yes: !!flags.yes }));
+	}
 	if (cmd === "doctor") return doctor();
 	if (cmd === "setup") return setup();
 	throw new Error(`unknown command ${cmd}\n\n${HELP}`);
+}
+
+/** GET /api/version from the running factory (its web-url carries the token), or undefined. */
+async function runningVersion(link: string) {
+	const { fetchVersion } = await import("./update/cli.ts");
+	return fetchVersion(link).catch(() => undefined);
+}
+
+/** The checkout's HEAD (short SHA), when no factory answers. */
+async function diskVersion(): Promise<string> {
+	const { INSTALL_ROOT } = await import("./main.ts");
+	const { runCommand } = await import("./update/restart.ts");
+	const r = await runCommand("git", ["log", "-1", "--format=%h (%cI)"], { cwd: INSTALL_ROOT });
+	return r.code === 0 ? r.stdout.trim() : "unknown (not a git checkout)";
 }
 
 async function serve() {
@@ -92,6 +117,9 @@ async function serve() {
 		return print(url);
 	}
 	const { startFactoryProcess } = await import("./main.ts");
+	const { DAEMON_ENV, detectStartedBy, runCommand } = await import("./update/restart.ts");
+	const { startedBy, serveArgs } = await detectStartedBy(process.env, runCommand);
+	delete process.env[DAEMON_ENV]; // not for the processes the factory starts
 	let proc: Awaited<ReturnType<typeof startFactoryProcess>>;
 	try {
 		proc = await startFactoryProcess({
@@ -101,6 +129,8 @@ async function serve() {
 			...(typeof flags["fake-boat"] === "string" ? { fakeBoat: flags["fake-boat"] } : {}),
 			...(typeof flags["ci-poll-ms"] === "string" ? { ciPollMs: Number(flags["ci-poll-ms"]) } : {}),
 			scripted: !!flags.scripted || process.env.FACTORY_SCRIPTED === "1",
+			startedBy,
+			serveArgs,
 		});
 	} catch (e) {
 		// One line: factory.log's last line is the reason `serve` reports.
