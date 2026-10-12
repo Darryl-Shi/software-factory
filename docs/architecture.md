@@ -428,9 +428,36 @@ server is its transport.
 - `stop` sends SIGTERM and waits for the process to exit; `status` prints the pid and the link; `web` prints the
   link from `web-url`; `doctor` (`src/doctor.ts`) checks the config, extensions, models, sandbox, GitHub identity,
   boat.dev and Parallel keys and `gh`; `setup` runs the wizard above.
+- `factory update` and the web UI's Update fast-forward the checkout and restart the process the way it was started
+  (see Updates below).
 - `factory setup service` can install a systemd user unit or a launchd agent that runs `serve --foreground`. It
   writes the same pid file, so `stop`, `status` and `web` work the same way; `stop` makes it exit 0, which the
   service does not restart.
+
+## Updates
+
+`src/update/` updates the factory to its checkout's upstream tip (spec §12). It is a service next to the core, not
+a core operation: `main.ts` builds an `Updater` over the install root (`INSTALL_ROOT`, `src/`'s parent), the factory
+home, how the process was started (`detectStartedBy` in `cli.ts serve`) and the active work (`activeWork`: listRuns,
+listBundles, listDiscussions), and hands it to `startWebServer` (`/api/version`, `/api/update/{check,apply,dismiss}`).
+
+```
+check:  git fetch <remote>  →  rev-list --left-right --count HEAD...@{u}, log HEAD..@{u}, status --porcelain
+apply:  re-check (stale SHA → conflict; dirty/ahead/up to date → invalid) → update.json pulling
+        → git merge --ff-only <sha> → [installing: npm ci; failure → reset + npm ci → failed]
+        → foreground: done ("Restart the factory to finish the update")
+        → else restarting: spawn helper (detached; systemd-run --user under systemd)
+helper: restartFactory(startedBy) → poll /api/version (≤ 90 s) for the target SHA → done
+        | reset --hard <from> (+ npm ci) → restartFactory → rolled-back (reason + factory.log tail)
+```
+
+- `restart.ts` (node builtins only) holds `detectStartedBy`, `detectService` (the setup wizard's view from outside)
+  and `restartFactory`; `record.ts` reads and writes `update.json`; `helper.ts` is the restart helper. The updater
+  reads the three files at startup and writes them to `<home>/update-helper/` when it spawns the helper, so the helper
+  that may roll back is the running version's, not the pulled one.
+- `startDaemon` marks its child with `FACTORY_DAEMON_ARGS` (the serve arguments); `serve` reads and unsets it.
+- `src/update/cli.ts` is `factory update`: through the running factory's HTTP API, or a local `Updater` (pull and
+  install only) when none runs.
 
 ## Security boundaries
 

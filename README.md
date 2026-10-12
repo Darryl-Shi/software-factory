@@ -138,6 +138,7 @@ use **Ship this ticket** in its run view. Then click **Merge** on the bundle's c
 factory serve [--config p] [--port n] [--fake-github dir] [--scripted] [--ci-poll-ms n] [--foreground]
 factory stop [--config p]
 factory status [--config p]
+factory update [--yes] [--config p]   update to the upstream branch's tip, then restart
 factory web [--config p]          print the web UI's link
 factory doctor [--config p]
 factory setup [section] [--config p]
@@ -151,7 +152,13 @@ factory setup [section] [--config p]
     or still has the removed `stages`/`workers` sections or `roles.<role>.extensions` keys (see [configuration](docs/configuration.md#old-config-files)). The factory never runs without its web UI.
   - Unknown options are refused.
 - **`stop`** stops the running factory and waits for it to exit.
-- **`status`** prints `running (pid N)` and the link, or `not running` (exit 1).
+- **`status`** prints `running (pid N)` and the link, then `version <short SHA> (<date>, v<version>)` for the running
+  code; or `not running` (exit 1).
+- **`update`** updates the factory to the tip of its checkout's upstream branch (normally `origin/main`): it prints
+  the incoming commits and the active work, asks (or takes `--yes`), fast-forwards, runs `npm ci` if the lockfile
+  changed and restarts the factory the way it was started (systemd unit, launchd agent or `serve` daemon; a
+  foreground factory is told to restart by hand). A version that doesn't come up within 90 s is rolled back. With no
+  factory running it only pulls and installs. The same is in the web UI (the version chip in the header).
 - **`web`** prints the link again.
 - **`doctor`** checks the setup and prints one `ok`/`warn`/`FAIL` line per check.
 - **`setup`** is the interactive setup wizard. It needs a terminal: without one (stdin or stdout not a TTY) it exits 1
@@ -180,6 +187,7 @@ The factory keeps its files next to the config file (`~/.factory/` by default):
 - `factory.log`: the background process's output (mode 0600; it carries the link).
 - `web-token`: the web UI's access token (mode 0600).
 - `web-url`: the link, written while the web UI listens.
+- `update.json`: the last update's record (mode 0600) and `update-helper/`, the restart helper's copy.
 - `secrets.json`: the secrets `factory setup` stored (mode 0600; see
   [configuration](docs/configuration.md#secret-references)).
 - `pi/`: the model host's directory: provider packages, `models.json` and `auth.json` (see
@@ -199,6 +207,14 @@ The factory keeps its files next to the config file (`~/.factory/` by default):
     the search box and "Show closed"), after a second click to confirm. Clearing archives a run and deletes nothing:
     its record, conversations, screenshots, worktree and delivery stay, cleared runs stay off the board across
     restarts, and the other cards keep their ticket keys. There is no undo on the board.
+- **Version and updates:** the chip in the header shows the running commit (short SHA; hover for the date and
+  version), or **Update available (N)** when the factory's upstream branch has N new commits (checked shortly after
+  startup, every 6 hours and with **Check now**). Its dialog lists the incoming commits, anything that blocks the
+  update (local changes in tracked files, local commits), and the runs, bundles and chats working now, which resume
+  after the restart with only their current step redone. **Update** (after a confirmation) fast-forwards the
+  checkout, reinstalls dependencies if the lockfile changed and restarts the factory; the page reloads by itself and a
+  banner says "Updated from <old> to <new>" (or why it was rolled back). Started in the foreground (`scripts/run.sh`),
+  it pulls and asks you to restart. Not a git checkout or a detached HEAD: "Updates unavailable" with the reason.
 - **Bundle view:** click a bundle card. It reuses the run view: the integrator, reviewers and QA conversations and a
   timeline on the left, the transcript and a chat box (to the integrator, or the reviewer while reviewing), and a
   header with the member tickets and the PR. The merge card has **Merge**, **Request changes** and **Drop tickets…**;
@@ -272,6 +288,8 @@ npm run typecheck   # tsc (noEmit)
 | `test/web.test.ts` | The web server: token and cookie, Host/Origin/content-type checks, operations and error codes (discussion and bundle operations, `clearRuns`, `listModels` and `startDiscussion` without a title too), the event stream and its `discussion` and `bundle` filters, bundle screenshots, a busy port as an error, the static UI and the vendor markdown routes |
 | `test/web-markdown.test.ts` | `markdown.js` in jsdom: GFM rendering, sanitising (scripts, `javascript:` links, foreign images), links with `rel="noopener noreferrer"`, the plain-text fallback |
 | `test/web-search.test.ts` | `web_search` against a fake Parallel endpoint: request shape, result formatting, errors, a run using pinned `webSearch` settings |
+| `test/update.test.ts` | The updater on a temporary bare upstream and clone: checks (behind, ahead, dirty, detached HEAD, no upstream, a failed fetch), apply (fast-forward to the checked SHA, refusals, a stale SHA, one at a time, foreground), `npm ci` and its rollback, the restart helper's done/rolled-back, `update.json` phases, start detection, the web routes' auth and Origin checks |
+| `test/update-daemon.test.ts` | A real `serve` daemon from a clone updated through the web API: restart on the new SHA with the same serve arguments, `status`'s SHA; a version that can't start is rolled back |
 | `test/daemon.test.ts` | `serve`/`stop`/`status`/`web` as real processes: detaching, a second `serve`, a busy port, a bad or legacy config, unknown options, stale pid files, a fresh install |
 | `test/secrets.test.ts` | The secret store: file and directory modes, atomic writes, refusing a loose or unparseable file, `store:` refs |
 | `test/model-host.test.ts` | The model host: built-in providers, `models.json`, an installed provider package, extension errors as diagnostics, no `.pi/` from the cwd, live `auth.json` |
@@ -296,6 +314,8 @@ src/github/        github.ts (GitHub: open, create, diff, writeArtifact, pushBra
                    host.ts (GitHubHost: GhApiHost for github.com, LocalGitHubHost as a local fake), git.ts (git helpers)
 src/boat/          boat.ts (Boat: QA VMs per review round, BoatEnv), backend.ts (BoatApiBackend on @boatdev/sdk, LocalBoatBackend fake)
 src/sandbox/       sandbox.ts (Sandbox: per-role environments in the run's worktree, inside sandbox-runtime)
+src/update/        updater.ts (check/apply), helper.ts (the detached restart helper), restart.ts (restart the way it
+                   was started), record.ts (update.json), cli.ts (factory update)
 src/web/           server.ts (HTTP + server-sent events) and ui/ (the static web UI, no build step;
                    discussions.js is the full-screen chat behind the Chat button, bundles.js the bundle cards and view)
 src/agents/        tools.ts (coding, coding-readonly, subagent, test-runner, computer, browser; each role's fixed set),

@@ -8,7 +8,8 @@ one project together as a **bundle**: one PR (or a push to `main` for a new repo
   [`docs/specs/run-mv4ghzj2-allm.md`](docs/specs/run-mv4ghzj2-allm.md); clearing Done runs:
   [`docs/specs/run-mv46ek2u-7omz.md`](docs/specs/run-mv46ek2u-7omz.md); the Chat button and full-screen chat:
   [`docs/specs/run-mv46hn3a-f4fa.md`](docs/specs/run-mv46hn3a-f4fa.md); markdown rendering:
-  [`docs/specs/run-mv46mros-6c1p.md`](docs/specs/run-mv46mros-6c1p.md)).
+  [`docs/specs/run-mv46mros-6c1p.md`](docs/specs/run-mv46mros-6c1p.md); self-update from the web UI:
+  [`docs/specs/run-mv4rp25k-mqna.md`](docs/specs/run-mv4rp25k-mqna.md), product spec §12).
 - **Design and deviations:** `docs/design-spec.md`, `docs/superpowers/specs/*`, `DEVIATIONS.md`.
 - **How it fits together:** `docs/architecture.md`; settings: `docs/configuration.md`.
 
@@ -31,13 +32,14 @@ under `.factory-dev/`, sandbox off). The web UI listens on **http://127.0.0.1:73
 printed link (it carries the access token; also in `.factory-dev/web-url`).
 
 Real use: `bin/factory setup` (credentials, models, service), then `bin/factory serve` (background) /
-`bin/factory web` (prints the link) / `bin/factory stop` / `bin/factory status` / `bin/factory doctor`.
+`bin/factory web` (prints the link) / `bin/factory stop` / `bin/factory status` / `bin/factory doctor` /
+`bin/factory update [--yes]` (update to the checkout's upstream tip and restart).
 
 ## Map
 
 ```
 bin/factory              CLI entry (tsx src/cli.ts)
-src/cli.ts               serve/stop/status/web/doctor/setup
+src/cli.ts               serve/stop/status/web/doctor/setup/update
 src/main.ts              process wiring: secret store, model host, GitHub, Sandbox, Boat, Factory, web server
 src/daemon.ts            background serve (factory.pid, factory.log)
 src/core/
@@ -59,7 +61,10 @@ src/boat/                boat.dev VMs for AQ testing (fake backend in backend.ts
 src/web/                 HTTP + SSE server; ui/ (app.js board + run view, bundles.js bundle view, discussions.js the full-screen chat behind the Chat button)
                          ui/markdown.js: md()/inline() (marked + DOMPurify, served at /vendor/marked.js, /vendor/purify.js
                          from node_modules as exact STATIC routes); index.html loads vendor → markdown.js → app.js →
-                         discussions.js → bundles.js (classic scripts, one global scope; strict CSP, no build step)
+                         discussions.js → bundles.js → update.js (version chip, Update dialog, banner) (classic scripts, one global scope; strict CSP, no build step)
+src/update/              self-update: updater.ts (check/apply, wired in main.ts, routes /api/version + /api/update/*),
+                         helper.ts (detached restart helper: wait 90 s for the new SHA, else roll back), restart.ts
+                         (restart as started: systemd/launchd/daemon; shared with setup), record.ts (update.json), cli.ts
 src/setup/               the setup wizard
 src/testing/             scripted model provider and the dry run's scripted agents
 scripts/                 setup.sh, run.sh, dry-run.ts
