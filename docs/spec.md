@@ -49,9 +49,11 @@ projects, automatic shipping, stacked PRs.
 
 ### 3.1 Discussions (optional, before a ticket)
 
-- `startDiscussion(project, { title, message, model? })` opens a read-only checkout of the default branch (or an empty
+- `startDiscussion(project, { title?, message, model? })` opens a read-only checkout of the default branch (or an empty
   workspace for a repo that doesn't exist yet) and one `discussant` Conversation. The model defaults to
-  `discussion.model`, which defaults to the architect's; it is pinned for the discussion's life.
+  `discussion.model`, which defaults to the architect's; it is pinned for the discussion's life. A missing or blank
+  title is derived from the first message (first non-empty line, markdown markers stripped, cut to 60 characters on a
+  word boundary with `…`); an empty message is `invalid`.
 - States: `PREPARING` → `OPEN` → `CLOSED` (reopen resyncs the checkout to the latest default branch); an error leads
   to `FAILED` (Retry). Setup scripts do not run for discussions.
 - Turns, one at a time: `say` (the human's text; the reply is the model's last message) and `requestDrafts` (the model
@@ -193,6 +195,8 @@ The core's whole outside surface is `FactoryCore` (`src/core/types.ts`). Every o
     `invalid`, an unknown id `not_found`, a non-terminal run `conflict`; already-cleared runs are skipped (idempotent).
     `listRuns` leaves cleared runs out unless `includeCleared: true`; `getRun` still returns them; `retryRun` refuses
     them with `conflict`.
+- **Models:** `listModels()` returns the models the model host has credentials for
+  (`{ id: "provider/modelId", name?, provider }[]`); read-only, no project.
 - **Settings:** `settingsSchema`, `getSettings`, `setSetting`, `unsetSetting`.
 - **Discussions:** `startDiscussion`, `getDiscussion`, `listDiscussions`, `getDiscussionConversation`, `say`,
   `stopTurn`, `requestDrafts`, `updateDraft`, `deleteDraft`, `createTicket`, `closeDiscussion`, `reopenDiscussion`,
@@ -311,8 +315,13 @@ rejected.
   **Drop tickets…**), the escalation card (reason, findings, **More rounds**, **Drop tickets…**, **Abort**), and a
   failed bundle's **Retry**. **Cancel bundle** is available on every bundle that is not merged or cancelled,
   including a failed one.
-- **Discussions tab:** start a discussion, chat (with **Stop**), **Draft tickets**, edit drafts, **Create ticket**,
-  **Close discussion**, **Reopen**, **Retry**.
+- **Chat** (spec `docs/specs/run-mv46hn3a-f4fa.md`; the Discussions tab is gone): a **Chat** button next to
+  **Create** opens discussions as a full-screen chat in the run view's sheet: the last discussion of the browser
+  session or a blank new chat (`#chat`; a discussion is `#disc=<id>`). Project (or **New project…**), model
+  (`listModels`, the project's `discussion.model` marked "(default)") and thinking dropdowns at the top, locked to the
+  pinned values after the first message; a collapsible history rail of the project's discussions with **New chat**;
+  the transcript and composer (**Stop**); a drafts panel (**Draft tickets**, edit drafts, **Create ticket**); a ⋯ menu
+  with **Close discussion**, **Reopen**, **Retry**.
 - **Settings:** a form generated from `settingsSchema()`, global or per project, each field with its source and a
   Reset/Inherit button.
 

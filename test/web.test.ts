@@ -304,6 +304,30 @@ describe("discussions", () => {
 	});
 });
 
+describe("chat ops", () => {
+	test("listModels over HTTP returns the available models; startDiscussion without a title derives it", async () => {
+		const { port, token } = await serve();
+		const models = await op(port, token, "listModels");
+		expect(models.body).toContain("\"ok\":true");
+		expect(models.status).toBe(200);
+		const list = JSON.parse(models.body).result as { id: string; name?: string; provider: string }[];
+		expect(Array.isArray(list)).toBe(true);
+		expect(list.length).toBeGreaterThan(0);
+		for (const m of list) {
+			expect(m.id.startsWith(`${m.provider}/`)).toBe(true);
+		}
+		expect(list.map((m) => m.id)).toContain("scripted/discussant");
+		await t!.host.seedRepo("me/p", { "README.md": "# p\n" });
+		await op(port, token, "createProject", ["p", "me/p"]);
+		const res = await op(port, token, "startDiscussion", ["p", { message: "## Why is the build slow?\nIt takes ages." }]);
+		expect(res.status).toBe(200);
+		const id = JSON.parse(res.body).result;
+		const v = JSON.parse((await op(port, token, "getDiscussion", [id])).body).result;
+		expect(v.title).toBe("Why is the build slow?");
+		await t!.factory.waitForDiscussion(id, (d) => d.state !== "PREPARING");
+	});
+});
+
 describe("static UI", () => {
 	test("app.js parses; index.html loads only same-origin files and has no inline script (CSP)", () => {
 		const js = readFileSync(join(UI, "app.js"), "utf8");
@@ -315,7 +339,13 @@ describe("static UI", () => {
 		// classic scripts after app.js: they share app.js's globals and parse in the same global scope
 		expect(() => new Script(`${js}\n;${disc}\n;${bundles}`, { filename: "app.js+discussions.js+bundles.js" })).not.toThrow();
 		expect([...html.matchAll(/<script\b[^>]*>/g)].map((m) => m[0])).toEqual(['<script src="/app.js" defer>', '<script src="/discussions.js" defer>', '<script src="/bundles.js" defer>']);
-		expect(html).toContain('data-view="discussions"');
+		// the nav is Board and Settings; the Chat button sits right after Create; the Discussions list and modal are gone
+		expect([...html.matchAll(/data-view="([a-z]+)"/g)].map((m) => m[1])).toEqual(["board", "settings"]);
+		expect(html).toMatch(/id="create-btn"[^]*?<\/button>\s*<button type="button" class="btn" id="chat-btn"/);
+		expect(html).not.toContain("view-discussions");
+		expect(html).toContain('id="chatbar"');
+		for (const gone of ["openNewDiscussion", "renderDiscussions", "#disc-list", "#view-discussions"]) expect(`${js}\n${disc}`).not.toContain(gone);
+		expect(disc).toContain("core.listModels(");
 		expect(html).not.toMatch(/https?:\/\//);
 		expect(readFileSync(join(UI, "app.css"), "utf8")).not.toMatch(/@import|url\(https?:/);
 		// every operation the UI calls is one the server allows

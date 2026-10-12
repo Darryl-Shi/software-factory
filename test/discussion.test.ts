@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { BridgeDoc } from "../src/core/bridge.ts";
+import { deriveTitle } from "../src/core/discussion-doc.ts";
 import { draftInstructions } from "../src/core/discussion-task.ts";
 import type { DiscussionView, FactoryEvent, RunCtx } from "../src/core/types.ts";
 import { git, gitOut } from "../src/github/git.ts";
@@ -306,8 +307,8 @@ describe("life cycle", () => {
 		await expect(t!.factory.getDiscussion("disc-99")).rejects.toMatchObject({ code: "not_found" });
 		await expect(t!.factory.say("disc-99", "x")).rejects.toMatchObject({ code: "not_found" });
 		await expect(t!.factory.startDiscussion("nope", { title: "t", message: "m" })).rejects.toMatchObject({ code: "not_found" });
-		await expect(t!.factory.startDiscussion("p", { title: " ", message: "m" })).rejects.toMatchObject({ code: "invalid" });
 		await expect(t!.factory.startDiscussion("p", { title: "t", message: "" })).rejects.toMatchObject({ code: "invalid" });
+		await expect(t!.factory.startDiscussion("p", { message: "   \n  " })).rejects.toMatchObject({ code: "invalid" });
 		await expect(t!.factory.startDiscussion("p", { title: "t", message: "m", model: { model: "scripted/nope", thinking: "low" } })).rejects.toMatchObject({
 			code: "invalid",
 		});
@@ -345,6 +346,42 @@ describe("life cycle", () => {
 		}
 		expect(byRun).toEqual([]);
 		expect(byOtherProject).toEqual([]);
+	});
+});
+
+describe("derived title", () => {
+	beforeEach(setup);
+
+	test("deriveTitle: first non-empty line, whitespace collapsed, markdown markers stripped, cut at 60 on a word with …", () => {
+		expect(deriveTitle("\n  \n  How   should\tlogin work?\nmore text")).toBe("How should login work?");
+		expect(deriveTitle("## Auth flow redesign")).toBe("Auth flow redesign");
+		expect(deriveTitle("- a bullet")).toBe("a bullet");
+		expect(deriveTitle("* star bullet")).toBe("star bullet");
+		expect(deriveTitle("1. numbered")).toBe("numbered");
+		expect(deriveTitle("> quoted")).toBe("quoted");
+		expect(deriveTitle("#\n- \nreal line")).toBe("real line");
+		const long = "We should rework the authentication flow so that sessions survive restarts of the server";
+		const title = deriveTitle(long);
+		expect(title.endsWith("…")).toBe(true);
+		expect(title.length).toBeLessThanOrEqual(61);
+		expect(title).toBe("We should rework the authentication flow so that sessions…");
+		expect(long.startsWith(title.slice(0, -1))).toBe(true);
+		expect(deriveTitle("x".repeat(80))).toBe(`${"x".repeat(60)}…`);
+		expect(deriveTitle("a".repeat(60))).toBe("a".repeat(60));
+		expect(deriveTitle("   ")).toBe("");
+	});
+
+	test("startDiscussion: a missing or blank title is derived; an explicit one is kept as is", async () => {
+		const long = "# Rework the authentication flow so that sessions survive restarts of the server\nand more";
+		const a = await t!.factory.startDiscussion("p", { message: long });
+		expect((await t!.factory.getDiscussion(a)).title).toBe("Rework the authentication flow so that sessions survive…");
+		await t!.factory.waitForDiscussion(a, open);
+		const b = await t!.factory.startDiscussion("p", { title: "  ", message: "- check the **cache**" });
+		expect((await t!.factory.getDiscussion(b)).title).toBe("check the **cache**");
+		await t!.factory.waitForDiscussion(b, open);
+		const c = await t!.factory.startDiscussion("p", { title: "My # title", message: "# other" });
+		expect((await t!.factory.getDiscussion(c)).title).toBe("My # title");
+		await t!.factory.waitForDiscussion(c, open);
 	});
 });
 

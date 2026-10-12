@@ -78,11 +78,17 @@ const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
 const same = (a, b) => a != null && b != null && String(a) === String(b);
 const TERMINAL = ["DELIVERED", "FAILED", "CANCELLED"];
 
-// `action` ({ label, onClick }) adds a button to the toast, e.g. a link that opens what was just created.
+// `action` adds to the toast either a button ({ label, onClick }, e.g. a link that opens what was just created) or,
+// as a function, makes the whole toast clickable (e.g. open the discussion it is about).
 function toast(text, kind = "", action) {
   const el = document.createElement("div");
   el.className = `toast ${kind}`; el.textContent = text;
-  if (action) {
+  if (typeof action === "function") {
+    el.classList.add("clickable"); el.setAttribute("role", "button"); el.tabIndex = 0;
+    const go = () => { el.remove(); action(); };
+    el.addEventListener("click", go);
+    el.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } });
+  } else if (action) {
     const b = document.createElement("button");
     b.type = "button"; b.className = "toast-act"; b.textContent = action.label;
     b.addEventListener("click", () => { el.remove(); action.onClick(); });
@@ -489,7 +495,6 @@ async function resync() {
     if (ui.mode === "discussion") withDiscussions(resyncDiscussion);
     else if (ui.mode === "bundle") resyncBundle();
     else if (ui.open) { if (ui.runs.has(ui.open)) { renderRunView(); loadThread(false); } else closeRun(); }
-    if (!$("#view-discussions").hidden) withDiscussions(renderDiscussions);
     if (!$("#view-settings").hidden) renderSettings();
   } catch (e) { toast(String(e.message ?? e), "error"); }
 }
@@ -622,9 +627,10 @@ async function closeRun() {
   if (!ui.open || closing) return;
   closing = true;
   const id = ui.open, rv = $("#runview"), bd = $("#rv-backdrop"), wasDiscussion = ui.mode === "discussion";
-  // A run shrinks back into its board card, a discussion into its row in the list.
-  const home = () => (wasDiscussion ? (typeof discRowEl === "function" ? discRowEl(id) : null) : cardEl(id));
+  // A run shrinks back into its board card, the chat view into the Chat button.
+  const home = () => (wasDiscussion ? $("#chat-btn") : cardEl(id));
   $("#rv-threads").classList.remove("open");
+  if (wasDiscussion) withDiscussions(chatClosing);
   bd.classList.remove("on");
   try { history.replaceState(null, "", location.pathname); } catch {}
   if (!reduceMotion()) {
@@ -636,7 +642,6 @@ async function closeRun() {
   ui.open = null; ui.mode = null; delete rv.dataset.mode; sheetLabels(false); ui.tx.clear(); rv.hidden = true; bd.hidden = true; closing = false;
   $("#rv-links").innerHTML = ""; $("#rv-extra").innerHTML = ""; delete $("#rv-extra").dataset.key;
   renderBoard();
-  if (wasDiscussion) withDiscussions(renderDiscussions);
   const c = home();
   if (c) { c.focus({ preventScroll: true }); if (!reduceMotion()) c.animate([{ boxShadow: "0 0 0 3px var(--accent-line)" }, { boxShadow: "0 0 0 0 transparent" }], { duration: 900, easing: "ease-out" }); }
 }
@@ -1223,9 +1228,10 @@ async function saveSetting(el) {
 
 // ===================================================================== wiring
 function showView(name) {
-  for (const v of ["board", "discussions", "settings"]) $(`#view-${v}`).hidden = v !== name;
+  if (!["board", "settings"].includes(name)) name = "board";
+  for (const v of ["board", "settings"]) $(`#view-${v}`).hidden = v !== name;
   document.querySelectorAll(".nav button").forEach((b) => (b.dataset.view === name ? b.setAttribute("aria-current", "page") : b.removeAttribute("aria-current")));
-  if (name === "settings") renderSettings(); else if (name === "discussions") withDiscussions(renderDiscussions); else renderBoard();
+  if (name === "settings") renderSettings(); else renderBoard();
 }
 // discussions.js (a deferred script after this one) defines the discussion globals; run `f` once it has loaded.
 function withDiscussions(f) {
@@ -1235,13 +1241,16 @@ function withDiscussions(f) {
 // The sheet's labels: a run's ticket, or a discussion.
 function sheetLabels(discussion) {
   const close = discussion ? "Close discussion view" : "Close ticket", details = discussion ? "Discussion details" : "Ticket details";
-  $("#rv-close").setAttribute("aria-label", close); $("#rv-close").title = `${discussion ? "Back to the list" : "Close"} (Esc)`;
+  $("#rv-close").setAttribute("aria-label", close); $("#rv-close").title = `${discussion ? "Back to the board" : "Close"} (Esc)`;
   $("#rv-details-btn").setAttribute("aria-label", details); $("#rv-details-btn").title = details;
   $("#rv-details").setAttribute("aria-label", details);
+  $("#rv-threads-btn").setAttribute("aria-label", discussion ? "Show or hide the chat history" : "Show conversations");
+  $("#rv-threads").setAttribute("aria-label", discussion ? "Chat history" : "Conversations");
 }
 function wire() {
   document.querySelectorAll(".nav button").forEach((b) => b.addEventListener("click", () => showView(b.dataset.view)));
   $("#create-btn").addEventListener("click", openCreate);
+  $("#chat-btn").addEventListener("click", () => withDiscussions(openChat));
   $("#board").addEventListener("click", async (e) => {
     const ca = e.target.closest("[data-clear-all]"); if (ca) return clearAll(ca);
     const go = e.target.closest("[data-ship-go]");
@@ -1271,6 +1280,7 @@ function wire() {
   });
   $("#rv-close").addEventListener("click", closeRun);
   $("#rv-threads").addEventListener("click", (e) => {
+    if (ui.mode === "discussion") return; // the chat view's history rail (discussions.js)
     const t = e.target.closest(".thread"); if (!t) return;
     ui.thread = t.dataset.thread;
     ui.stick = true; showJump(false);
@@ -1278,7 +1288,10 @@ function wire() {
     if (ui.mode === "bundle") { renderBundleThreads(openBundleData()); loadBundleThread(true); return; }
     renderThreads(openRunData()); loadThread(true);
   });
-  $("#rv-threads-btn").addEventListener("click", () => $("#rv-threads").classList.toggle("open"));
+  $("#rv-threads-btn").addEventListener("click", () => {
+    if (ui.mode === "discussion" && innerWidth > 760) return withDiscussions(toggleChatRail);
+    $("#rv-threads").classList.toggle("open");
+  });
   $("#rv-details-btn").addEventListener("click", () => setDetails(!ui.details));
   $("#transcript").addEventListener("click", () => $("#rv-threads").classList.remove("open"));
   $("#transcript").addEventListener("scroll", () => {
@@ -1337,9 +1350,12 @@ async function boot() {
     for (const b of bundles) ui.bundles.set(b.id, b);
   } catch (e) { toast(String(e.message ?? e), "error"); }
   renderProjectFilter(); renderBoard();
+  // #run=, #disc= and #bundle=<id> reopen a run, a discussion or a bundle; #chat a blank new chat; anything else is the board.
   const m = /^#run=(.+)$/.exec(location.hash), d = /^#disc=(.+)$/.exec(location.hash), b = /^#bundle=(.+)$/.exec(location.hash);
   if (m && ui.runs.has(decodeURIComponent(m[1]))) openRun(decodeURIComponent(m[1]), null);
-  else if (d) withDiscussions(() => { showView("discussions"); openDiscussion(decodeURIComponent(d[1])); });
+  else if (d) withDiscussions(() => openDiscussion(decodeURIComponent(d[1])));
   else if (b) withBundles(() => openBundle(decodeURIComponent(b[1]), null));
+  else if (location.hash === "#chat") withDiscussions(() => openChat({ blank: true }));
+  else if (location.hash) try { history.replaceState(null, "", location.pathname); } catch {}
 }
 boot();

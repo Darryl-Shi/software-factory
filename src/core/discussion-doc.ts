@@ -101,3 +101,33 @@ export function toDiscussionView(d: DiscussionDocState, cost: { usd: number; tot
 		updatedAt: d.updatedAt,
 	};
 }
+
+/** The longest title `deriveTitle` makes, before the `…`. */
+export const DERIVED_TITLE_MAX = 60;
+
+/**
+ * A discussion title from its first message: the first non-empty line, whitespace collapsed, markdown heading, bullet,
+ * numbered-list and quote markers stripped, cut to 60 characters on a word boundary with `…` appended when cut.
+ */
+export function deriveTitle(message: string): string {
+	for (const raw of String(message ?? "").split(/\r?\n/)) {
+		let line = raw.replace(/\s+/g, " ").trim();
+		// strip leading markers, repeatedly: "> - # x", "1. x", "- [ ] x"
+		for (let prev = ""; prev !== line; ) {
+			prev = line;
+			line = line
+				.replace(/^#{1,6}(\s+|$)/, "")
+				.replace(/^>\s*/, "")
+				.replace(/^[-*+](\s+|$)/, "")
+				.replace(/^\d+[.)](\s+|$)/, "")
+				.replace(/^\[[ xX]\](\s+|$)/, "")
+				.trim();
+		}
+		if (!line) continue;
+		if (line.length <= DERIVED_TITLE_MAX) return line;
+		const head = line.slice(0, DERIVED_TITLE_MAX);
+		const cut = line[DERIVED_TITLE_MAX] === " " ? head : head.slice(0, Math.max(head.lastIndexOf(" "), 0));
+		return `${(cut.trim() || head).trimEnd()}…`;
+	}
+	return "";
+}

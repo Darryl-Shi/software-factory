@@ -24,7 +24,7 @@ import { type Boat, boatProblems } from "../boat/boat.ts";
 import { type GitHub, githubProblems } from "../github/github.ts";
 import { type Sandbox, sandboxProblems } from "../sandbox/sandbox.ts";
 import { Bridge, BridgeDoc, bridgeToolsNotFor, EnvDoc } from "./bridge.ts";
-import { DiscussionDoc, type DiscussionDocState, DiscussionIndex, toDiscussionView } from "./discussion-doc.ts";
+import { DiscussionDoc, type DiscussionDocState, DiscussionIndex, deriveTitle, toDiscussionView } from "./discussion-doc.ts";
 import { createDiscussionTask, draftInstructions, takeCheckoutNote } from "./discussion-task.ts";
 import { humanFindings } from "./findings.ts";
 import { BundleDoc, type BundleDocState, BundleIndex, toBundleView } from "./bundle-doc.ts";
@@ -58,6 +58,7 @@ import {
 	type Gate,
 	type HumanFinding,
 	type HumanMessage,
+	type ModelInfo,
 	type Project,
 	type Request,
 	type Role,
@@ -481,6 +482,11 @@ export class Factory implements FactoryCore {
 	async getProject(name: string): Promise<Project> {
 		return this.config.project(name);
 	}
+	async listModels(): Promise<ModelInfo[]> {
+		const available = await this.opts.models.getAvailable();
+		return available.map((m) => ({ id: `${m.provider}/${m.id}`, ...(m.name ? { name: m.name } : {}), provider: String(m.provider) }));
+	}
+
 	async listProjects(): Promise<Project[]> {
 		return this.config.projects();
 	}
@@ -1169,13 +1175,14 @@ export class Factory implements FactoryCore {
 	}
 
 	// ------------------------------------------------------------------ discussions (a pre-ticket chat per project)
-	async startDiscussion(project: string, d: { title: string; message: string; model?: { model: string; thinking: string } }): Promise<DiscussionId> {
+	async startDiscussion(project: string, d: { title?: string; message: string; model?: { model: string; thinking: string } }): Promise<DiscussionId> {
 		const by = this.by;
 		const p = this.config.project(project);
-		const title = typeof d?.title === "string" ? d.title.trim() : "";
 		const message = typeof d?.message === "string" ? d.message.trim() : "";
-		if (!title) throw new FactoryError("invalid", "a discussion needs a title");
 		if (!message) throw new FactoryError("invalid", "a discussion needs a first message");
+		const explicit = typeof d?.title === "string" ? d.title.trim() : "";
+		const title = explicit || deriveTitle(message);
+		if (!title) throw new FactoryError("invalid", "a discussion needs a title");
 		const eff = this.config.effective({ project });
 		const def = eff.discussion?.model ?? {};
 		const model = d.model ? { model: String(d.model.model ?? ""), thinking: String(d.model.thinking ?? "") } : { model: String(def.model ?? ""), thinking: String(def.thinking ?? "medium") };

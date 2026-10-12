@@ -1,0 +1,26 @@
+name: CI
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: git config --global user.email ci@example.com && git config --global user.name ci && git config --global init.defaultBranch main
+      # The sandbox tests need bubblewrap and socat, and Ubuntu 24.04's AppArmor blocks the unprivileged user
+      # namespaces bwrap needs (sandbox-runtime issue #74); allow them on this throwaway runner.
+      - name: Sandbox prerequisites
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q bubblewrap socat ripgrep
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          bwrap --ro-bind / / --unshare-net true && echo "bwrap ok"
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
