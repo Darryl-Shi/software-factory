@@ -3,8 +3,8 @@
 // CI checks and delivery notes. One git worktree per run. Reads the run's pinned `workdir` and `github.*` settings;
 // the GitHub identity (PAT, bot or App) is never visible to agents.
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join, sep } from "node:path";
 import { expandHome, type Obj } from "../core/settings.ts";
 import type { CiStatus, Delivery, DeliveryContext, Diff, Finding, PrRef, QaStatus, RepoRef, RunCtx, Workspace } from "../core/types.ts";
 import { git, gitOut } from "./git.ts";
@@ -17,21 +17,72 @@ const workdirOf = (rc: RunCtx): string => expandHome(rc.config.workdir ?? "~/fac
 const cloneOf = (workdir: string, ref: RepoRef): string => join(workdir, "repos", ref.replace("/", "__"));
 const gitReason = (r: { stderr: string; stdout: string }) => r.stderr.trim() || r.stdout.trim() || "no output from git";
 
+/** What a cleanup step did: what it removed (paths/refs that existed) and what it could not remove ("<step>: <why>"). */
+export interface StepResult {
+	removed: string[];
+	failures: string[];
+}
+
+export type CheckoutArea = "runs" | "bundles" | "discussions";
+
+const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
 /**
- * Remove a checkout and its manifest: the git worktree (from `ws.repo`'s clone, if that clone exists), the directory
- * and the local branch. Every step is best effort; a branch that can't be deleted is reset by the next `open` of a
- * discussion (`worktree add -B`), so it is never reattached as it was.
+ * Remove a checkout and its manifest: the git worktree (from `clone`, if that clone exists), the directory, `git
+ * worktree prune`, the local branch and the manifest. Every step is attempted and idempotent (a missing thing counts as
+ * success); failures are reported, never thrown. A branch that can't be deleted is reset by the next `open` of a
+ * discussion (`worktree add -B`), so it is never reattached as it was. Call under the clone's lock.
  */
-async function discard(ws: Workspace, workdir: string, manifest: string): Promise<void> {
-	const clone = cloneOf(workdir, ws.repo);
+async function discardPaths(clone: string, path: string, branch: string, manifest: string): Promise<StepResult> {
+	const out: StepResult = { removed: [], failures: [] };
 	const hasClone = existsSync(join(clone, ".git"));
-	if (hasClone) await git(clone, ["worktree", "remove", "--force", ws.path], { allowFail: true });
-	rmSync(ws.path, { recursive: true, force: true });
-	if (hasClone) {
-		await git(clone, ["worktree", "prune"], { allowFail: true });
-		await git(clone, ["branch", "-D", ws.branch], { allowFail: true });
+	const hadPath = existsSync(path);
+	try {
+		if (hasClone && hadPath) await git(clone, ["worktree", "remove", "--force", path], { allowFail: true });
+		rmSync(path, { recursive: true, force: true });
+		if (existsSync(path)) out.failures.push(`worktree: ${path} is still there`);
+		else if (hadPath) out.removed.push(`worktree ${path}`);
+	} catch (e) {
+		out.failures.push(`worktree: ${path}: ${errText(e)}`);
 	}
-	rmSync(manifest, { force: true });
+	if (hasClone) {
+		const pruned = await git(clone, ["worktree", "prune"], { allowFail: true }).catch((e) => ({ code: 1, stderr: errText(e), stdout: "" }));
+		if (pruned.code !== 0) out.failures.push(`worktree prune: ${clone}: ${gitReason(pruned)}`);
+		try {
+			const has = (await git(clone, ["rev-parse", "--verify", "-q", `refs/heads/${branch}`], { allowFail: true })).code === 0;
+			if (has) {
+				const r = await git(clone, ["branch", "-D", branch], { allowFail: true });
+				if (r.code !== 0) out.failures.push(`local branch: ${branch} in ${clone}: ${gitReason(r)}`);
+				else out.removed.push(`local branch ${branch} (${clone})`);
+			}
+		} catch (e) {
+			out.failures.push(`local branch: ${branch} in ${clone}: ${errText(e)}`);
+		}
+	}
+	try {
+		const had = existsSync(manifest);
+		rmSync(manifest, { force: true });
+		if (had) out.removed.push(`manifest ${manifest}`);
+	} catch (e) {
+		out.failures.push(`manifest: ${manifest}: ${errText(e)}`);
+	}
+	return out;
+}
+
+/** discardPaths for a stale manifest's workspace (`open`, `refresh().again()`): best effort, results ignored. */
+async function discardStale(ws: Workspace, workdir: string, manifest: string): Promise<void> {
+	await discardPaths(cloneOf(workdir, ws.repo), ws.path, ws.branch, manifest);
+}
+
+/** The clone a worktree belongs to, read from its `.git` file (`gitdir: <clone>/.git/worktrees/<name>`), if any. */
+export function cloneOfWorktree(path: string): string | undefined {
+	try {
+		const m = /^gitdir:\s*(.+?)\s*$/m.exec(readFileSync(join(path, ".git"), "utf8"));
+		const i = m?.[1]?.lastIndexOf(`${sep}.git${sep}worktrees${sep}`) ?? -1;
+		return i > 0 ? m![1]!.slice(0, i) : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 /** Rules on the `github` settings section; problems are relative to the section. */
@@ -95,6 +146,89 @@ function withClone<T>(clone: string, f: () => Promise<T>): Promise<T> {
 export class GitHub {
 	constructor(readonly host: GitHubHost) {}
 
+	// ------------------------------------------------------------------ disk cleanup (docs/specs/run-mv58bn4q-q2zs.md)
+
+	/**
+	 * Remove an owner's checkout under `<workdir>/<area>/<id>`: its git worktree, the directory, `git worktree prune`, its
+	 * local branch `factory/<id>` in the shared clone of `repo`, and the manifest. Paths are derived from area, id and repo,
+	 * so it works when the manifest is already gone. Under the clone's lock; never throws.
+	 */
+	discard(area: CheckoutArea, id: string, repo: RepoRef, workdir: string): Promise<StepResult> {
+		const clone = cloneOf(workdir, repo);
+		return withClone(clone, () => discardPaths(clone, join(workdir, area, id), `factory/${id}`, join(workdir, area, `${id}.json`))).catch((e) => ({
+			removed: [],
+			failures: [`checkout: ${errText(e)}`],
+		}));
+	}
+
+	/**
+	 * Delete `factory/<rc.runId>` on the host (a run's or bundle's pushed branch). Refuses any other branch and the repo's
+	 * default branch; skipped when the repo does not exist on the host (a new-repo project's local-only clone). Returns
+	 * whether a branch was deleted; throws on a host error.
+	 */
+	async deleteRemoteBranch(repo: RepoRef, branch: string, rc: RunCtx): Promise<boolean> {
+		if (branch !== `factory/${rc.runId}`) throw new Error(`refusing to delete ${branch}: only factory/${rc.runId} belongs to ${rc.runId}`);
+		const id = identityOf(rc);
+		if (!(await this.host.repoExists(repo, id))) return false;
+		if ((await this.host.defaultBranch(repo, id)) === branch) throw new Error(`refusing to delete ${branch}: it is the default branch of ${repo}`);
+		return this.host.deleteBranch(repo, branch, id);
+	}
+
+	/** Remove an orphan worktree directory: `git worktree remove --force` from its clone (when known and present), then the directory. */
+	removeOrphanWorktree(path: string): Promise<StepResult> {
+		const clone = cloneOfWorktree(path);
+		const remove = async (): Promise<StepResult> => {
+			const out: StepResult = { removed: [], failures: [] };
+			if (!existsSync(path)) return out;
+			try {
+				if (clone && existsSync(join(clone, ".git"))) await git(clone, ["worktree", "remove", "--force", path], { allowFail: true });
+				rmSync(path, { recursive: true, force: true });
+				if (existsSync(path)) out.failures.push(`worktree: ${path} is still there`);
+				else out.removed.push(`worktree ${path}`);
+			} catch (e) {
+				out.failures.push(`worktree: ${path}: ${errText(e)}`);
+			}
+			return out;
+		};
+		return clone ? withClone(clone, remove) : remove();
+	}
+
+	/**
+	 * The startup sweep of one shared clone: `git worktree prune`, then delete every local `refs/heads/factory/*` branch
+	 * that no worktree has checked out and that `deletable(<owner id>)` allows. Under the clone's lock; never throws.
+	 */
+	sweepClone(clone: string, deletable: (ownerId: string) => boolean): Promise<StepResult> {
+		return withClone(clone, async () => {
+			const out: StepResult = { removed: [], failures: [] };
+			if (!existsSync(join(clone, ".git"))) return out;
+			const pruned = await git(clone, ["worktree", "prune"], { allowFail: true });
+			if (pruned.code !== 0) out.failures.push(`worktree prune: ${clone}: ${gitReason(pruned)}`);
+			const refs = await git(clone, ["for-each-ref", "--format=%(refname)", "refs/heads/factory/"], { allowFail: true });
+			if (refs.code !== 0) {
+				out.failures.push(`list branches: ${clone}: ${gitReason(refs)}`);
+				return out;
+			}
+			const list = await git(clone, ["worktree", "list", "--porcelain"], { allowFail: true });
+			const checkedOut = new Set(list.stdout.split("\n").filter((l) => l.startsWith("branch ")).map((l) => l.slice(7).trim()));
+			for (const ref of refs.stdout.split("\n").map((l) => l.trim()).filter(Boolean)) {
+				const branch = ref.slice("refs/heads/".length);
+				const owner = branch.slice("factory/".length);
+				if (checkedOut.has(ref) || !owner || owner.includes("/") || !deletable(owner)) continue;
+				const r = await git(clone, ["branch", "-D", branch], { allowFail: true });
+				if (r.code !== 0) out.failures.push(`local branch: ${branch} in ${clone}: ${gitReason(r)}`);
+				else out.removed.push(`local branch ${branch} (${clone})`);
+			}
+			return out;
+		}).catch((e) => ({ removed: [], failures: [`clone sweep: ${clone}: ${errText(e)}`] }));
+	}
+
+	/** The shared clones under `<workdir>/repos`. */
+	clones(workdir: string): string[] {
+		const dir = join(workdir, "repos");
+		if (!existsSync(dir)) return [];
+		return readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => join(dir, e.name));
+	}
+
 	/** A run's (or, with `area: "discussions"`, a discussion's) checkout under `<workdir>/<area>/<rc.runId>`. */
 	open(ref: RepoRef, rc: RunCtx, area: "runs" | "discussions" = "runs"): Promise<Workspace> {
 		return withClone(cloneOf(workdirOf(rc), ref), () => this.openLocked(ref, rc, area));
@@ -108,7 +242,7 @@ export class GitHub {
 			const ws = JSON.parse(readFileSync(m, "utf8")) as Workspace;
 			if (ws.repo === ref && existsSync(ws.path)) return ws;
 			// A manifest for another repo is stale (the id was reused, e.g. after the factory's storage was reset): start over.
-			if (ws.repo !== ref) await discard(ws, workdir, m);
+			if (ws.repo !== ref) await discardStale(ws, workdir, m);
 		}
 		const id = identityOf(rc);
 		const clone = cloneOf(workdir, ref);
@@ -168,7 +302,7 @@ export class GitHub {
 		const clone = cloneOf(workdir, ws.repo);
 		const manifest = join(workdir, "discussions", `${rc.runId}.json`);
 		const again = async () => {
-			await discard(ws, workdir, manifest);
+			await discardStale(ws, workdir, manifest);
 			return this.openLocked(ws.repo, rc, "discussions");
 		};
 		if (ws.newRepo) {
@@ -371,7 +505,7 @@ export class GitHub {
 		if (existsSync(m)) {
 			const ws = JSON.parse(readFileSync(m, "utf8")) as Workspace;
 			if (ws.repo === ref && existsSync(ws.path)) return ws;
-			if (ws.repo !== ref) await discard(ws, workdir, m);
+			if (ws.repo !== ref) await discardStale(ws, workdir, m);
 		}
 		const clone = cloneOf(workdir, ref);
 		if (!existsSync(join(clone, ".git"))) throw new Error(`the project's clone of ${ref} is missing (${clone}); its runs' branches live there`);

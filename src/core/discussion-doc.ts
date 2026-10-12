@@ -1,5 +1,6 @@
 // The `factory.discussion` Document (discussions spec §1.1): one session-scoped family member per discussion, beside
 // the run documents. The discussion Task and the core's operations change it; `toDiscussionView` is what interfaces get.
+import type { CleanedUp } from "./cleanup.ts";
 import { defineDoc, defineDocFamily } from "@earendil-works/pi-durable";
 import type { DiscussionId, DiscussionNotice, DiscussionState, DiscussionView, Draft, RepoRef, RunId, RunState, TurnCost, Workspace } from "./types.ts";
 
@@ -30,6 +31,8 @@ export type DiscussionDocState = {
 	state: DiscussionState;
 	/** FAILED only. */
 	error?: string;
+	/** Disk cleanup done (src/core/cleanup.ts): set when every step succeeded; deleted by a reopen or retry. */
+	cleanedUp?: CleanedUp;
 	/** Pinned at start, never changed. */
 	model: { model: string; thinking: string };
 	/** The project's effective settings at start, as a run pins them. */

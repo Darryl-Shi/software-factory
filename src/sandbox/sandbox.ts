@@ -4,16 +4,16 @@
 // Write access is fixed by role: only the builder and its helpers (which run in the builder's environment) may write the
 // worktree (and its git dirs); the architect and reviewer may write only their scratch dir. The QA agent works in a
 // boat.dev VM instead (src/boat). The core's credentials (GitHub token, boat API key) are denied to every command.
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
 import type { Context } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { type ExecutionEnv, ExecutionError, FileError, type Result, type ShellExecOptions, type ShellExecResult } from "@earendil-works/pi-durable/env";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { DEFAULT_DENY_READ, expandHome, type Obj } from "../core/settings.ts";
-import type { Role, RunCtx, Workspace } from "../core/types.ts";
+import { ROLES, type Role, type RunCtx, type Workspace } from "../core/types.ts";
 import { gitOut } from "../github/git.ts";
 
 export const CREDENTIAL_ENV_VARS = ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "FACTORY_GIT_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "AWS_SECRET_ACCESS_KEY", "BOAT_API_KEY", "PARALLEL_API_KEY"];
@@ -378,10 +378,61 @@ export class Sandbox {
 		return new SandboxedEnv(rec, input.cwd ?? rec.cwd, p.writeRoots, p.denyWrite, p.homeDeny, p.deny, p.allowRead, p.shellEnv, p.wrap);
 	}
 
+	/**
+	 * Delete an owner's scratch dirs: `<workdir>/scratch/<ownerId>-<role>` for every role (exact names, so `bundle-1`
+	 * never matches `bundle-10-…`), and the `scratch` path of any surviving record of that owner. The records are kept;
+	 * `policy()` recreates home/tmp/cache/npm-cache the next time the environment is used. Never throws.
+	 */
+	removeScratch(ownerId: string, workdir: string): { removed: string[]; failures: string[] } {
+		const out = { removed: [] as string[], failures: [] as string[] };
+		const paths = new Set<string>();
+		for (const role of ROLES) {
+			paths.add(join(workdir, "scratch", `${ownerId}-${role}`));
+			try {
+				const p = this.recordPath(`${ownerId}-${role}`);
+				if (existsSync(p)) {
+					const s = (JSON.parse(readFileSync(p, "utf8")) as EnvRecord).scratch;
+					// only a dir of that environment's own name (a record never makes the cleanup delete anything else)
+					if (typeof s === "string" && isAbsolute(s) && basename(s) === `${ownerId}-${role}`) paths.add(s);
+				}
+			} catch {
+				// an unreadable record: its default scratch path is covered above
+			}
+		}
+		for (const p of paths) {
+			try {
+				if (!existsSync(p)) continue;
+				rmSync(p, { recursive: true, force: true });
+				if (existsSync(p)) out.failures.push(`scratch: ${p} is still there`);
+				else out.removed.push(`scratch ${p}`);
+			} catch (e) {
+				out.failures.push(`scratch: ${p}: ${e instanceof Error ? e.message : String(e)}`);
+			}
+		}
+		return out;
+	}
+
+	/** Delete an environment's record file and drop its in-memory record and network entry. Idempotent; returns whether a file was deleted. */
+	destroy(envId: string): boolean {
+		this.network.delete(envId);
+		this.records.delete(envId);
+		const p = this.recordPath(envId);
+		if (!existsSync(p)) return false;
+		rmSync(p, { force: true });
+		if (existsSync(p)) throw new Error(`${p} is still there`);
+		return true;
+	}
+
+	/** The ids of the environment records on disk (`<owner id>-<role>`). */
+	recordIds(): string[] {
+		if (!existsSync(this.stateDir)) return [];
+		return readdirSync(this.stateDir).filter((f) => f.endsWith(".json")).map((f) => f.slice(0, -5));
+	}
+
 	async dispose(envId: string): Promise<void> {
 		this.network.delete(envId);
 		this.records.delete(envId);
-		// The worktree stays for inspection; only the environment record is retired.
+		// Only the environment record is retired here; the cleanup service (src/core/cleanup.ts) deletes the files.
 		const p = this.recordPath(envId);
 		if (existsSync(p)) writeFileSync(p, JSON.stringify({ ...JSON.parse(readFileSync(p, "utf8")), disposed: true }, null, 2));
 	}

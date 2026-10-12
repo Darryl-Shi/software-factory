@@ -160,3 +160,23 @@ Decisions:
 - The clean-combination reviewer wording is chosen from the facts (no conflict resolved, 2+ members), so it also
   appears in later rounds of that review (after FIXING) — the merge itself is still conflict-free.
 - Full suite: only the 8 bubblewrap sandbox tests fail (no user namespaces on this host), as on the base.
+
+## Disk cleanup (run run-mv58bn4q-q2zs; spec docs/specs/run-mv58bn4q-q2zs.md)
+
+- [x] host: `GitHubHost.deleteBranch` (gh: DELETE refs, 404/422 = gone; fake: update-ref -d; `failDeleteBranch` test control)
+- [x] github: public `discard(area,id,repo,workdir)` (withClone, per-step results), `deleteRemoteBranch`, `sweepClone`,
+      `removeOrphanWorktree`, `clones`
+- [x] sandbox: `removeScratch`, `destroy`, `recordIds`
+- [x] core/cleanup.ts: `cleanupScope`, `Cleaner` (per-owner lock, background + settled, cleanup steps, sweep)
+- [x] Tasks: run/bundle finalize+abort, discussion CLOSED/FAILED/abort; marker in the terminal commit
+- [x] core: clearRuns + cancelBundle(FAILED) background cleanup; retries under `cleaner.exclusive` delete the marker;
+      startup sweep; `gc` op (CORE_OPS); test hook `cleanupsSettledForTests`
+- [ ] CLI `factory gc`
+- [ ] tests (acceptance 1-15)
+- [ ] docs
+
+Decisions:
+- The scope a core-started cleanup uses is recomputed inside the per-owner lock from the record as committed then.
+- Retries run their commit inside the owner's cleanup lock (not just "wait, then commit") so no cleanup can start in between.
+- Sweep counts: runs/bundles/discussions = worktrees + manifests removed in that area; scratch dirs; env records;
+  local/remote branches.

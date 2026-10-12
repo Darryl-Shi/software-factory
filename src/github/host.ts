@@ -52,6 +52,8 @@ export interface GitHubHost {
 	getPr(repo: string, number: number, id: Identity): Promise<PrInfo>;
 	mergePr(repo: string, number: number, how: "merge" | "squash" | "rebase", id: Identity): Promise<void>;
 	checks(repo: string, sha: string, id: Identity): Promise<CheckRun[]>;
+	/** Delete a branch on the host. Returns false when it was already gone (a missing ref counts as success). */
+	deleteBranch(repo: string, branch: string, id: Identity): Promise<boolean>;
 }
 
 // ------------------------------------------------------------------ secrets (references only, resolved at use)
@@ -197,6 +199,14 @@ export class GhApiHost implements GitHubHost {
 		await this.ok(id, "PUT", `/repos/${repo}/pulls/${number}/merge`, { merge_method: how });
 	}
 
+	async deleteBranch(repo: string, branch: string, id: Identity): Promise<boolean> {
+		const path = `/repos/${repo}/git/refs/heads/${branch.split("/").map(encodeURIComponent).join("/")}`;
+		const r = await this.api(id, "DELETE", path);
+		if (r.status === 404 || r.status === 422) return false;
+		if (r.status >= 300) throw new Error(`GitHub DELETE ${path}: ${r.status} ${JSON.stringify(r.json)?.slice(0, 300)}`);
+		return true;
+	}
+
 	async checks(repo: string, sha: string, id: Identity): Promise<CheckRun[]> {
 		const runs = await this.ok(id, "GET", `/repos/${repo}/commits/${sha}/check-runs?per_page=100`);
 		const status = await this.ok(id, "GET", `/repos/${repo}/commits/${sha}/status`);
@@ -294,6 +304,20 @@ export class LocalGitHubHost implements GitHubHost {
 	}
 	async defaultBranch() {
 		return "main";
+	}
+	/** Test control: the next `deleteBranch` calls throw (forced cleanup failures). */
+	failDeleteBranch = 0;
+	async deleteBranch(repo: string, branch: string): Promise<boolean> {
+		if (this.failDeleteBranch > 0) {
+			this.failDeleteBranch--;
+			throw new Error(`forced deleteBranch failure for ${branch}`);
+		}
+		if (!existsSync(this.bare(repo))) return false;
+		const ref = `refs/heads/${branch}`;
+		if ((await git(this.bare(repo), ["rev-parse", "--verify", "-q", ref], { allowFail: true })).code !== 0) return false;
+		await git(this.bare(repo), ["update-ref", "-d", ref]);
+		this.log("deleteBranch", repo, { branch });
+		return true;
 	}
 	remoteUrl(repo: string) {
 		return this.bare(repo);

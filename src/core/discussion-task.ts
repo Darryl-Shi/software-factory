@@ -7,6 +7,7 @@ import type { AssistantMessage, UserMessage } from "@earendil-works/pi-ai";
 import { type ConversationHandle, configure, defineTask, type SettledSubmissionRecord, type TaskRuntime, type Tx, UsageDoc } from "@earendil-works/pi-durable";
 import { ROLE_TOOLS } from "../agents/tools.ts";
 import { BridgeDoc, bridgeToolsNotFor, EnvDoc } from "./bridge.ts";
+import { cleanAtEnd, discussionOwner, nextMarker } from "./cleanup.ts";
 import { DiscussionDoc, type DiscussionDocState } from "./discussion-doc.ts";
 import { humanContent } from "./messages.ts";
 import { RunConfigDoc } from "./run-config.ts";
@@ -19,7 +20,7 @@ type Checkpoint = { phase: Phase; n: number };
 type DiscussionInput = { discussionId: string; start: "PREPARING" };
 type RT = TaskRuntime<DiscussionInput, Checkpoint, string, object>;
 
-export type DiscussionServices = Pick<CoreServices, "github" | "sandbox" | "bridge" | "now" | "log"> & {
+export type DiscussionServices = Pick<CoreServices, "github" | "sandbox" | "cleanup" | "bridge" | "now" | "log"> & {
 	/** Resolves when the discussion's document changes (say, stop, close); never rejects. */
 	changed(id: string, ms: number): Promise<void>;
 };
@@ -318,7 +319,11 @@ export function createDiscussionTask(svc: DiscussionServices) {
 				const doc = await read(rt, d.id, c);
 				if (doc.state !== "OPEN") {
 					await disposeEnv(rt, c, doc);
-					return transition(rt, c, d.id, () => "FINAL");
+					const cleaned = await cleanAtEnd(svc.cleanup, discussionOwner(doc));
+					return transition(rt, c, d.id, (x) => {
+						if (cleaned) x.cleanedUp = nextMarker(x.cleanedUp, cleaned, svc.now());
+						return "FINAL";
+					});
 				}
 				if (doc.turn) {
 					await runTurn(rt, c, doc);
@@ -356,10 +361,13 @@ export function createDiscussionTask(svc: DiscussionServices) {
 							svc.log(`discussion ${d.id}: could not abort the conversation: ${abortError instanceof Error ? abortError.message : String(abortError)}`);
 						}
 						await disposeEnv(rt, c, d);
+						// A FAILED discussion is cleaned at once (a retry re-creates the checkout and the environment).
+						const cleaned = await cleanAtEnd(svc.cleanup, discussionOwner({ ...(await read(rt, d.id, c)), state: "FAILED" })).catch(() => undefined);
 						// FAILED and the end of the Task in one commit, so that Retry can follow at once.
 						await transition(rt, c, d.id, async (doc, tx): Promise<Phase> => {
 							doc.state = "FAILED";
 							doc.error = reason;
+							if (cleaned) doc.cleanedUp = nextMarker(doc.cleanedUp, cleaned, svc.now());
 							await clearTurn(tx, doc);
 							return "FINAL";
 						});
@@ -370,6 +378,11 @@ export function createDiscussionTask(svc: DiscussionServices) {
 		// The operations never abort the Task (Stop aborts the Conversation's work). If it is aborted all the same, the
 		// discussion goes to FAILED so that Retry brings it back.
 		abort: async (task, rt, c) => {
+			// The discussion leaves OPEN (to FAILED, unless it is already CLOSED or FAILED): clean it before the commit.
+			const before = await read(rt, task.input.discussionId, c).catch(() => undefined);
+			const cleaned = before
+				? await cleanAtEnd(svc.cleanup, discussionOwner({ ...before, state: before.state === "PREPARING" || before.state === "OPEN" ? "FAILED" : before.state })).catch(() => undefined)
+				: undefined;
 			await rt.commit(async (tx) => {
 				const doc = (await tx.doc(DiscussionDoc, task.input.discussionId, null as never)) as unknown as DiscussionDocState;
 				if (doc.state === "PREPARING" || doc.state === "OPEN") {
@@ -378,6 +391,7 @@ export function createDiscussionTask(svc: DiscussionServices) {
 					await clearTurn(tx, doc);
 					doc.updatedAt = svc.now();
 				}
+				if (cleaned) doc.cleanedUp = nextMarker(doc.cleanedUp, cleaned, svc.now());
 				return { status: "terminal", outcome: { status: "aborted", reason: "aborted" } };
 			}, c);
 		},
