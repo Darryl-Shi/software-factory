@@ -171,12 +171,17 @@ Decisions:
 - [x] Tasks: run/bundle finalize+abort, discussion CLOSED/FAILED/abort; marker in the terminal commit
 - [x] core: clearRuns + cancelBundle(FAILED) background cleanup; retries under `cleaner.exclusive` delete the marker;
       startup sweep; `gc` op (CORE_OPS); test hook `cleanupsSettledForTests`
-- [ ] CLI `factory gc`
-- [ ] tests (acceptance 1-15)
-- [ ] docs
+- [x] CLI `factory gc` (src/gc.ts: web-url → POST /api/op/gc; exit 1 when not running or on failures)
+- [x] tests: test/cleanup.test.ts (acceptance 1-15 + rules, deleteRemoteBranch, removeScratch), github-api
+      (GhApiHost.deleteBranch), discussion.test (CLOSED now deletes the env record); helpers: makeFactory `log`,
+      discussant "READ: path"
+- [x] docs: spec.md §8.1 + rows, architecture, configuration, README, AGENTS, DEVIATIONS 9/49, old clear spec note
+- [x] dry run 104/104; full suite: only the 8 bubblewrap sandbox tests fail (no user namespaces here), as on the base
 
 Decisions:
 - The scope a core-started cleanup uses is recomputed inside the per-owner lock from the record as committed then.
 - Retries run their commit inside the owner's cleanup lock (not just "wait, then commit") so no cleanup can start in between.
 - Sweep counts: runs/bundles/discussions = worktrees + manifests removed in that area; scratch dirs; env records;
   local/remote branches.
+- `factory gc` exits 1 when the sweep reported failures too (scriptable); "no factory is running" when web-url is
+  missing or the connection is refused.

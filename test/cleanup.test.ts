@@ -111,6 +111,46 @@ describe("the rules", () => {
 		expect(cleanupScope({ kind: "discussion", state: "PREPARING" })).toBe("none");
 	});
 
+	test("deleteRemoteBranch deletes only factory/<owner id>, never the default branch, and skips a repo the host lacks", async () => {
+		await setup();
+		const gh = new GitHub(t!.host);
+		const rc = (runId: string) => ({ runId, config: {} });
+		await expect(gh.deleteRemoteBranch("me/p", "main", rc("run-1"))).rejects.toThrow(/refusing/);
+		await expect(gh.deleteRemoteBranch("me/p", "factory/run-2", rc("run-1"))).rejects.toThrow(/refusing/);
+		const def = vi.spyOn(t!.host, "defaultBranch").mockResolvedValueOnce("factory/run-1");
+		await expect(gh.deleteRemoteBranch("me/p", "factory/run-1", rc("run-1"))).rejects.toThrow(/default branch/);
+		def.mockRestore();
+		expect(await gh.deleteRemoteBranch("me/nothere", "factory/run-1", rc("run-1"))).toBe(false);
+		expect(await gh.deleteRemoteBranch("me/p", "factory/run-1", rc("run-1"))).toBe(false); // absent: already gone
+		await git(t!.host.bare("me/p"), ["update-ref", "refs/heads/factory/run-1", "refs/heads/main"]);
+		expect(await gh.deleteRemoteBranch("me/p", "factory/run-1", rc("run-1"))).toBe(true);
+		expect((await git(t!.host.bare("me/p"), ["rev-parse", "--verify", "-q", "refs/heads/factory/run-1"], { allowFail: true })).code).not.toBe(0);
+		expect((await git(t!.host.bare("me/p"), ["rev-parse", "--verify", "-q", "refs/heads/main"], { allowFail: true })).code).toBe(0);
+	});
+
+	test("Sandbox.removeScratch deletes exactly <id>-<role> dirs (bundle-1 never matches bundle-10-…) and keeps records; destroy deletes a record", async () => {
+		const { mkdtempSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const { Sandbox } = await import("../src/sandbox/sandbox.ts");
+		const dir = mkdtempSync(join(tmpdir(), "sf-scratch-"));
+		const sb = new Sandbox({ stateDir: join(dir, "env") });
+		const work = join(dir, "work");
+		for (const n of ["bundle-1-integrator", "bundle-1-reviewer", "bundle-10-integrator", "bundle-1-x"]) mkdirSync(join(work, "scratch", n, "home"), { recursive: true });
+		mkdirSync(join(dir, "env"), { recursive: true });
+		const elsewhere = join(dir, "other", "bundle-1-qa");
+		mkdirSync(elsewhere, { recursive: true });
+		writeFileSync(join(dir, "env", "bundle-1-qa.json"), JSON.stringify({ envId: "bundle-1-qa", scratch: elsewhere }));
+		const r = sb.removeScratch("bundle-1", work);
+		expect(r.failures).toEqual([]);
+		expect(r.removed.sort()).toEqual([`scratch ${elsewhere}`, `scratch ${join(work, "scratch", "bundle-1-integrator")}`, `scratch ${join(work, "scratch", "bundle-1-reviewer")}`].sort());
+		expect(readdirSync(join(work, "scratch")).sort()).toEqual(["bundle-1-x", "bundle-10-integrator"]);
+		expect(existsSync(join(dir, "env", "bundle-1-qa.json"))).toBe(true);
+		expect(sb.recordIds()).toEqual(["bundle-1-qa"]);
+		expect(sb.destroy("bundle-1-qa")).toBe(true);
+		expect(sb.destroy("bundle-1-qa")).toBe(false);
+		expect(sb.recordIds()).toEqual([]);
+	});
+
 	test("scratch and record names match exact <id>-<role>", () => {
 		expect(ownerOfEnvName("bundle-1-integrator")).toBe("bundle-1");
 		expect(ownerOfEnvName("bundle-10-reviewer")).toBe("bundle-10");

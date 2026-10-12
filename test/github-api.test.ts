@@ -152,3 +152,19 @@ describe("GhApiHost over gh api", () => {
 		}
 	});
 });
+
+describe("GhApiHost: deleting branches (disk cleanup)", () => {
+	test("deleteBranch: DELETE git/refs/heads/<branch>; 404 and 422 count as already gone; other errors throw", async () => {
+		const h = new GhApiHost();
+		route("DELETE /repos/me/del/git/refs/heads/factory/run-1", 204);
+		expect(await h.deleteBranch("me/del", "factory/run-1", pat)).toBe(true);
+		const c = calls().filter((x) => x.method === "DELETE").at(-1)!;
+		expect(c.path).toBe("/repos/me/del/git/refs/heads/factory/run-1");
+		expect(c.token).toBe("ghp_test_token_123");
+		route("DELETE /repos/me/del/git/refs/heads/factory/run-2", 422, { message: "Reference does not exist" });
+		expect(await h.deleteBranch("me/del", "factory/run-2", pat)).toBe(false);
+		expect(await h.deleteBranch("me/del", "factory/run-3", pat)).toBe(false); // unrouted: 404
+		route("DELETE /repos/me/del/git/refs/heads/factory/run-4", 403, { message: "Forbidden" });
+		await expect(h.deleteBranch("me/del", "factory/run-4", pat)).rejects.toThrow(/403/);
+	});
+});
