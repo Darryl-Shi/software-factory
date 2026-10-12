@@ -66,7 +66,7 @@ it is created, so a settings change applies only to new runs and bundles.
 | `policy.reviewRoundCap` | `3` (1–20) | Review rounds before escalation, for a run and, separately, for a bundle's reviews |
 | `policy.escalateOnNoProgress` | `true` | Escalate when a fix round leaves the diff unchanged |
 | `policy.messages` | `[architect, builder, reviewer]` | Roles a human can message while a run is going (the web UI's chat box). Drop `reviewer` for a review no human can sway (it also covers a bundle's reviewer; a bundle's integrator always takes messages). `discussant` can't be listed: you talk to it in its discussion |
-| `workdir` | `~/factory/work` | Clones, per-run worktrees, bundles' worktrees (`bundles/<id>`), discussions' read-only checkouts (`discussions/<id>`) and the roles' scratch dirs |
+| `workdir` | `~/factory/work` | Clones, per-run worktrees, bundles' worktrees (`bundles/<id>`), discussions' read-only checkouts (`discussions/<id>`) and the roles' scratch dirs; finished work is deleted from it (see [What lives in `workdir`](#what-lives-in-workdir)) |
 | `github.identity` | `{ kind: pat, tokenRef: env:GH_TOKEN }` | How the factory authenticates to GitHub (see below) |
 | `github.visibility` | `private` | Visibility of the repos the factory creates |
 | `bundle.mergeMethod` | `squash` | How **Merge** merges a bundle's PR: `merge`, `squash` or `rebase`. Global or per project |
@@ -83,6 +83,25 @@ it is created, so a settings change applies only to new runs and bundles.
 | `webSearch.apiKey` | `env:PARALLEL_API_KEY` | Reference to the Parallel API key (`env:`, `file:` or `store:`, never the key) |
 | `webSearch.endpoint` | `https://api.parallel.ai/v1/search` | Search endpoint |
 | `storage.kind` / `storage.path` | `sqlite` / `~/.factory/factory.sqlite` | Harness storage (`sqlite` or `jsonl`); global only |
+
+#### What lives in `workdir`
+
+Each run, bundle and discussion keeps using the `workdir` pinned when it started, and is cleaned there
+(`docs/specs/run-mv58bn4q-q2zs.md`, `docs/spec.md` §8.1):
+
+| Path | What | Deleted |
+|---|---|---|
+| `runs/<id>`, `runs/<id>.json` | a run's worktree on `factory/<id>` and its manifest | when the run is `DELIVERED`, or `FAILED`/`CANCELLED` and cleared (with its local and remote branch) |
+| `bundles/<id>`, `bundles/<id>.json` | a bundle's worktree and manifest | when the bundle is `MERGED` or `CANCELLED` (with its local and remote branch) |
+| `discussions/<id>`, `discussions/<id>.json` | a discussion's read-only checkout and manifest | when the discussion is `CLOSED` or `FAILED` (with its local branch); reopen or retry re-creates it |
+| `repos/<owner>__<repo>` | the project's shared clone, holding the local `factory/*` branches | never; its finished owners' branches are deleted |
+| `scratch/<id>-<role>` | a role's HOME, TMPDIR, caches and `setup.log` | with the owner's full cleanup; for an uncleared `FAILED`/`CANCELLED` run or a `FAILED` bundle, as soon as it ends (only the scratch goes) |
+
+Environment records live outside `workdir`, in `<factory home>/environments/<id>-<role>.json`. They are kept while a
+`FAILED`/`CANCELLED` owner can still be retried and deleted with the rest by a full cleanup. A `READY` run keeps
+everything. At every start (and on `factory gc`) a sweep finishes failed cleanups and removes factory-named
+entries (`run-*`, `bundle-*`, `disc-*`, `<id>-<role>`) that no record owns; other names are never touched. QA
+screenshots, conversations and the storage are never deleted.
 
 Each role has two fields:
 - `model`: `provider/modelId`, as known to the model host: a pi-ai built-in provider, a compatible endpoint in

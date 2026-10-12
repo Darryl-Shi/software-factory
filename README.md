@@ -142,6 +142,7 @@ factory stop [--config p]
 factory status [--config p]
 factory update [--yes] [--config p]   update to the upstream branch's tip, then restart
 factory web [--config p]          print the web UI's link
+factory gc [--config p]           delete finished runs', bundles' and discussions' files and branches now
 factory doctor [--config p]
 factory setup [section] [--config p]
 ```
@@ -162,6 +163,9 @@ factory setup [section] [--config p]
   foreground factory is told to restart by hand). A version that doesn't come up within 90 s is rolled back. With no
   factory running it only pulls and installs. The same is in the web UI (the version chip in the header).
 - **`web`** prints the link again.
+- **`gc`** asks the running factory to run its disk sweep now (it also runs at every start; see
+  [what lives in `workdir`](docs/configuration.md#what-lives-in-workdir)) and prints the summary line, what was removed
+  (or `Nothing was removed.`) and any failures. Exits 1 when no factory is running or a deletion failed.
 - **`doctor`** checks the setup and prints one `ok`/`warn`/`FAIL` line per check.
 - **`setup`** is the interactive setup wizard. It needs a terminal: without one (stdin or stdout not a TTY) it exits 1
   with `factory setup is interactive; run it in a terminal`. There is no non-interactive mode.
@@ -206,9 +210,11 @@ The factory keeps its files next to the config file (`~/.factory/` by default):
   - **Shipping:** bundle cards (id, state, member ticket keys), with their member runs inside. Legacy runs still
     delivering the old way show as ordinary cards. **Done** shows merged runs with a bundle chip.
   - **Clear all** in the Done column header clears exactly the Done cards shown (so it follows the project filter,
-    the search box and "Show closed"), after a second click to confirm. Clearing archives a run and deletes nothing:
-    its record, conversations, screenshots, worktree and delivery stay, cleared runs stay off the board across
-    restarts, and the other cards keep their ticket keys. There is no undo on the board.
+    the search box and "Show closed"), after a second click to confirm. Clearing archives a run and deletes its files
+    and branches in the background (worktree, local and remote `factory/<run-id>` branch, scratch dirs, environment
+    records); its record, conversations, screenshots and delivery stay, cleared runs stay off the board across
+    restarts, and the other cards keep their ticket keys. There is no undo on the board, and a cleared run can't be
+    retried. (A delivered run's files and branches are already deleted when its bundle merges.)
 - **Version and updates:** the chip in the header shows the running commit (short SHA; hover for the date and
   version), or **Update available (N)** when the factory's upstream branch has N new commits (checked shortly after
   startup, every 6 hours and with **Check now**). Its dialog lists the incoming commits, anything that blocks the
@@ -310,7 +316,8 @@ src/core/          core.ts (Factory), run-task.ts (state machine), run-doc.ts, b
                    messages.ts (who gets a message, and when), usage.ts (cost records), types.ts, run-config.ts,
                    bundle-task.ts (a bundle's state machine), bundle-doc.ts, task-kit.ts (what run and bundle Tasks
                    share: role Conversations, agents, review rounds with QA, the CI wait),
-                   discussion-task.ts (a discussion's state machine), discussion-doc.ts
+                   discussion-task.ts (a discussion's state machine), discussion-doc.ts,
+                   cleanup.ts (disk cleanup rules, the Cleaner, the startup sweep / gc)
 src/github/        github.ts (GitHub: open, create, diff, writeArtifact, pushBranch, openBundle, mergeMember,
                    deliverBundle, deliver, checks, annotate, merge, prState, closePr),
                    host.ts (GitHubHost: GhApiHost for github.com, LocalGitHubHost as a local fake), git.ts (git helpers)

@@ -11,7 +11,8 @@ one project together as a **bundle**: one PR (or a push to `main` for a new repo
   [`docs/specs/run-mv46mros-6c1p.md`](docs/specs/run-mv46mros-6c1p.md); the five-column board and UI sizing:
   [`docs/specs/run-mv4rgjw0-ch4q.md`](docs/specs/run-mv4rgjw0-ch4q.md); self-update from the web UI:
   [`docs/specs/run-mv4rp25k-mqna.md`](docs/specs/run-mv4rp25k-mqna.md), product spec §12; the combined review of
-  clean multi-ticket bundles: [`docs/specs/run-mv4vd9xu-g2si.md`](docs/specs/run-mv4vd9xu-g2si.md)).
+  clean multi-ticket bundles: [`docs/specs/run-mv4vd9xu-g2si.md`](docs/specs/run-mv4vd9xu-g2si.md); disk cleanup and
+  `gc`: [`docs/specs/run-mv58bn4q-q2zs.md`](docs/specs/run-mv58bn4q-q2zs.md), product spec §8.1).
 - **Design and deviations:** `docs/design-spec.md`, `docs/superpowers/specs/*`, `DEVIATIONS.md`.
 - **How it fits together:** `docs/architecture.md`; settings: `docs/configuration.md`.
 
@@ -35,13 +36,15 @@ printed link (it carries the access token; also in `.factory-dev/web-url`).
 
 Real use: `bin/factory setup` (credentials, models, service), then `bin/factory serve` (background) /
 `bin/factory web` (prints the link) / `bin/factory stop` / `bin/factory status` / `bin/factory doctor` /
-`bin/factory update [--yes]` (update to the checkout's upstream tip and restart).
+`bin/factory update [--yes]` (update to the checkout's upstream tip and restart) / `bin/factory gc` (run the disk
+sweep now).
 
 ## Map
 
 ```
 bin/factory              CLI entry (tsx src/cli.ts)
-src/cli.ts               serve/stop/status/web/doctor/setup/update
+src/cli.ts               serve/stop/status/web/doctor/setup/update/gc
+src/gc.ts                factory gc: POST /api/op/gc through web-url, print what was removed
 src/main.ts              process wiring: secret store, model host, GitHub, Sandbox, Boat, Factory, web server
 src/daemon.ts            background serve (factory.pid, factory.log)
 src/core/
@@ -54,6 +57,7 @@ src/core/
   bundle-doc.ts          factory.bundle Document, BundleView
   task-kit.ts            shared by run and bundle Tasks: role Conversations, runAgent, review rounds + QA, CI wait
   discussion-task.ts     discussions (pre-ticket chats), discussion-doc.ts its Document
+  cleanup.ts             disk cleanup: cleanupScope rules, Cleaner (per-owner), startup sweep / gc
   bridge.ts              agent → core tools (ask_human, submit_spec, report_done, submit_review, submit_qa, submit_tickets)
   findings.ts            submission validation; messages.ts human messages (runs and bundles); usage.ts costs
   settings.ts            layered config + schema (bundle.mergeMethod, roles.integrator, ...)

@@ -23,6 +23,7 @@ const HELP = `factory — software factory on Pi Durable
   factory status [--config p]       whether it runs, its link and the running version
   factory update [--yes] [--config p]   update the factory to its upstream branch's tip, then restart it
   factory web [--config p]          print the web UI's link
+  factory gc [--config p]           delete finished runs', bundles' and discussions' files and branches now
   factory doctor [--config p]
   factory setup [section] [--config p]
 `;
@@ -73,6 +74,10 @@ async function main() {
 		if (unknown) throw new Error(`unknown option --${unknown}`);
 		const { updateCommand } = await import("./update/cli.ts");
 		process.exit(await updateCommand(await configPath(), { yes: !!flags.yes }));
+	}
+	if (cmd === "gc") {
+		const { gcCommand } = await import("./gc.ts");
+		process.exit(await gcCommand(await configPath()));
 	}
 	if (cmd === "doctor") return doctor();
 	if (cmd === "setup") return setup();
