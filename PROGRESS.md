@@ -160,3 +160,15 @@ Decisions:
 - The clean-combination reviewer wording is chosen from the facts (no conflict resolved, 2+ members), so it also
   appears in later rounds of that review (after FIXING) — the merge itself is still conflict-free.
 - Full suite: only the 8 bubblewrap sandbox tests fail (no user namespaces on this host), as on the base.
+
+## Bulk cancel and clear (run run-mv545v95-rg77; spec docs/specs/run-mv545v95-rg77.md)
+
+- [x] Core `cancelRuns` (+CORE_OPS): checks all, one commit of cancelReasons (re-checked in the tx), then abortTask each.
+- [x] UI: Select toggle (#f-select), per-card `input[data-sel]` (reuses the .ship-wrap layout), per-column
+      `input[data-sel-col]` (indeterminate when partial), action bar #sel-bar in the board head (Cancel K / Clear M /
+      Clear selection, two-click confirm with 4 s timeout and reset on click elsewhere / set change).
+- Decision: the selection holds only cards the board currently shows; filtering a selected card out drops it (so a
+  bulk action never acts on tickets the user can't see). Spanning projects works with "All projects".
+- Decision: ship ticks (ui.ship) are kept untouched during select mode, so leaving it restores them as they were.
+- Decision: the UI passes reason "cancelled from the web UI" (same as the run view's Cancel run).
+- [x] Tests: test/cancel-runs.test.ts, web.test.ts "bulk cancel", web-board.test.ts select mode. Docs updated.

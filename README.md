@@ -209,6 +209,11 @@ The factory keeps its files next to the config file (`~/.factory/` by default):
     the search box and "Show closed"), after a second click to confirm. Clearing archives a run and deletes nothing:
     its record, conversations, screenshots, worktree and delivery stay, cleared runs stay off the board across
     restarts, and the other cards keep their ticket keys. There is no undo on the board.
+  - **Select** in the board header turns on select mode: a checkbox on every run card (not on bundles or tickets in
+    a bundle, which keep the bundle's own Drop tickets and Cancel bundle) and a "select all" checkbox in each column
+    header (it follows the filters). An action bar shows "N selected" with **Cancel K** for the live tickets
+    selected and **Clear M** for the finished ones, each after a second click, and **Clear selection**. In select
+    mode the Ready column's **Ship** is hidden; turning Select off brings it back.
 - **Version and updates:** the chip in the header shows the running commit (short SHA; hover for the date and
   version), or **Update available (N)** when the factory's upstream branch has N new commits (checked shortly after
   startup, every 6 hours and with **Check now**). Its dialog lists the incoming commits, anything that blocks the
@@ -286,8 +291,9 @@ npm run typecheck   # tsc (noEmit)
 | `test/sandbox-write.test.ts` | A write root around the factory home: neither the home nor the storage is writable; the builder's worktree inside the home still is |
 | `test/github-api.test.ts` | `GhApiHost` request shapes, token handling, the GitHub App JWT exchange |
 | `test/messages.test.ts` | `message`: routing, refusals, side turns and their cost, spec revision at the gate, steering a busy builder, held messages, re-review of changes made at the delivery gate |
+| `test/cancel-runs.test.ts` | `cancelRuns`: validation (all or nothing; terminal runs and members of active and failed bundles refused), `DISCUSSING` and `BUILDING` runs ending `CANCELLED` with environments disposed, the result, attribution, events, a restart |
 | `test/clear.test.ts` | `clearRuns`: validation (all or nothing), idempotency, `listRuns` with and without `includeCleared`, `retryRun` refused, the `run.cleared` event, the flag across a restart |
-| `test/web.test.ts` | The web server: token and cookie, Host/Origin/content-type checks, operations and error codes (discussion and bundle operations, `clearRuns`, `listModels` and `startDiscussion` without a title too), the event stream and its `discussion` and `bundle` filters, bundle screenshots, a busy port as an error, the static UI and the vendor markdown routes |
+| `test/web.test.ts` | The web server: token and cookie, Host/Origin/content-type checks, operations and error codes (discussion and bundle operations, `clearRuns`, `cancelRuns`, `listModels` and `startDiscussion` without a title too), the event stream and its `discussion` and `bundle` filters, bundle screenshots, a busy port as an error, the static UI and the vendor markdown routes |
 | `test/web-markdown.test.ts` | `markdown.js` in jsdom: GFM rendering, sanitising (scripts, `javascript:` links, foreign images), links with `rel="noopener noreferrer"`, the plain-text fallback |
 | `test/web-search.test.ts` | `web_search` against a fake Parallel endpoint: request shape, result formatting, errors, a run using pinned `webSearch` settings |
 | `test/update.test.ts` | The updater on a temporary bare upstream and clone: checks (behind, ahead, dirty, detached HEAD, no upstream, a failed fetch), apply (fast-forward to the checked SHA, refusals, a stale SHA, one at a time, foreground), `npm ci` and its rollback, the restart helper's done/rolled-back, `update.json` phases, start detection, the web routes' auth and Origin checks |
