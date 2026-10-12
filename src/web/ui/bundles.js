@@ -88,7 +88,7 @@ async function openRunFromBundle(runId) {
 function renderBundleView() {
   const b = openBundleData(); if (!b) return;
   $("#rv-key").textContent = b.id;
-  $("#rv-title").textContent = bundleTitle(b);
+  $("#rv-title").textContent = bundleTitle(b); $("#rv-title").title = bundleTitle(b);
   $("#rv-state").innerHTML = bundleStateLabel(b);
   $("#rv-cost").textContent = money(totalUsd(b));
   const { idx, name, cls } = bundleStage(b), merged = b.state === "MERGED";

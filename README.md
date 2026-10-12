@@ -188,12 +188,12 @@ The factory keeps its files next to the config file (`~/.factory/` by default):
 ## Web UI
 
 `factory serve` prints a link like `http://127.0.0.1:7317/?token=…`; `bin/factory web` prints it again. Open it to get:
-- **Board:** one column per stage (Intake, Discussion, Spec approval, Build, Review, Ready, Deliver, Done). **Create**
+- **Board:** five columns (Planning, Build & Review, Ready, Shipping, Done); each card shows its exact stage. **Create**
   submits a ticket (a run), and creates the project if it is new; cards move on their own and show "Your turn" when a
   run or bundle waits for you.
   - **Ready:** each card has a checkbox. Ticking a card disables other projects' cards; **Ship N tickets** in the
     column header creates a bundle of the ticked tickets, in the order ticked.
-  - **Deliver:** bundle cards (id, state, member ticket keys), with their member runs inside. Legacy runs still
+  - **Shipping:** bundle cards (id, state, member ticket keys), with their member runs inside. Legacy runs still
     delivering the old way show as ordinary cards. **Done** shows merged runs with a bundle chip.
   - **Clear all** in the Done column header clears exactly the Done cards shown (so it follows the project filter,
     the search box and "Show closed"), after a second click to confirm. Clearing archives a run and deletes nothing:

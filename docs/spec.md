@@ -300,12 +300,27 @@ rejected.
   `/vendor/purify.js`; the CSP is unchanged. Without them, prose falls back to escaped text. Tool panels and evidence
   stay raw.
 
-- **Board:** columns Intake, Discussion, Spec approval, Build, Review, **Ready**, Deliver, Done. **Create** submits a
-  ticket (creating the project if it is new). Cards move on their own and show "Your turn" when the human is needed.
+- **Board** (spec `docs/specs/run-mv4rgjw0-ch4q.md`): five columns, **Planning** (received, preparing, discussing,
+  spec ready, the spec gate), **Build & Review** (building, reviewing, escalated from either), **Ready** (Ready and in
+  no active bundle), **Shipping** (bundles, the delivery gate, delivering, awaiting CI, legacy escalations from CI and
+  any other non-terminal state) and **Done** (delivered; with "Show closed" also failed and cancelled). One function
+  maps a run to its column; the run view's eight fine-grained stages (Intake … Done, "Failed in <stage>") are a
+  separate mapping. Each card shows its exact stage as its lozenge. In a column, "Your turn" cards come first, then
+  pipeline order of the stage, oldest first (Done: most recently updated first; bundle cards before run cards in
+  Shipping). Under each column name is a plain-language hint (raw states as its tooltip) and, when the column holds
+  several stages, a breakdown such as "2 discussing · 1 spec approval". **Create** submits a ticket (creating the
+  project if it is new). Cards move on their own and show "Your turn" when the human is needed.
+- **Sizing:** one set of breakpoints (phone ≤ 640px, tablet ≤ 1024px, wide ≥ 1600px; the run view also uses 1180px
+  and 760px). Columns grow equally from 272px to 440px; when they don't fit, the board (never the page) scrolls
+  sideways with proximity snapping, and each column scrolls vertically on its own. On phones a column is
+  `min(85vw, 360px)` wide so the next one peeks in; the search box takes its own row. Card titles wrap (3 lines max,
+  full title as the tooltip), the footer's left side wraps and its right side (cost · age, avatar) stays on one line;
+  keys, project names and bundle ids truncate with an ellipsis and a tooltip. Approval and escalation cards and modals
+  scroll inside themselves with their action buttons pinned at the bottom.
 - **Ready column:** each card has a checkbox. Ticking a card of one project disables other projects' checkboxes, with
   a hint. While any are ticked, the header shows **Ship N tickets**, which creates the bundle (tickets in the order
   ticked) and shows a toast linking to it. A Ready run's view has **Ship this ticket**.
-- **Deliver column:** bundle cards (id, state, member keys, "Your turn"); member runs show inside their bundle card.
+- **Shipping column:** bundle cards (id, state, member keys, "Your turn"); member runs show inside their bundle card.
   Legacy runs still delivering the old way show as ordinary cards. **Done** shows merged runs with a bundle chip.
 - **Clearing Done runs:** **Clear all** in the Done header (two clicks) clears exactly the Done cards shown (project
   filter, search and "Show closed" apply); a finished run's view has **Clear from board** (two clicks). Cleared runs
@@ -374,8 +389,8 @@ These are choices the bundles spec left open:
 1. Two tickets of an existing-repo project run in parallel. Each stops in **Ready** after its review passes, with
    branch `factory/<run-id>` pushed and no PR open.
 2. Each new run commits its spec at `docs/specs/<run-id>.md`; two Ready tickets never conflict on their spec files.
-3. Ticking two Ready cards of one project and clicking **Ship 2 tickets** creates one bundle card in Deliver holding
-   both; cards of another project cannot be ticked meanwhile.
+3. Ticking two Ready cards of one project and clicking **Ship 2 tickets** creates one bundle card in **Shipping**
+   holding both; cards of another project cannot be ticked meanwhile.
 4. When the branches merge cleanly, one PR opens with a section per ticket and no bundle review round; after CI,
    **Merge** merges it with `bundle.mergeMethod`, and both runs show Done with the same PR URL and a bundle chip.
 5. When two tickets edit the same lines, the bundle view shows the integrator resolving the conflict, then a fresh
