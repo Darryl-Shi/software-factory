@@ -405,8 +405,8 @@ server is its transport.
   `{ args }`, and `subscribe` as server-sent events at `/api/events` (`?run=`, `?project=`, `?discussion=`,
   `?bundle=`). QA screenshots are served at `GET /api/runs/<id>/screenshots/<sid>` and
   `GET /api/bundles/<id>/screenshots/<sid>`.
-- It also serves the UI: a board whose columns are pipeline stages (with a Ready column whose ticked cards are
-  shipped as a bundle, and bundle cards in Deliver), a full-screen run view with the run's conversations, a chat box
+- It also serves the UI: a five-column board (Planning, Build & Review, Ready whose ticked cards are shipped as a
+  bundle, Shipping with the bundle cards, Done), a full-screen run view with the run's conversations, a chat box
   addressed by `message`, and approvals in a card that floats over the transcript, a bundle view (`bundles.js`) that
   reuses it with the merge and escalation cards, a
   **Chat** button next to Create that opens discussions as a full-screen chat in the run view's sheet (a history

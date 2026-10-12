@@ -397,6 +397,34 @@ describe("static UI", () => {
 		expect(csp).toContain("script-src 'self'");
 	});
 
+	test("chat layout: the composer keeps the last row of the center grid even though chat mode hides .conv-head", async () => {
+		const { port, token } = await serve();
+		const css = (await http(port, "GET", "/app.css", { headers: { authorization: `Bearer ${token}` } })).body;
+		// top-level rules (media blocks are flattened: their inner rules are matched too), comments stripped
+		const rules = [...css.replace(/\/\*[^]*?\*\//g, "").matchAll(/([^{}]+)\{([^{}]*)\}/g)].map((m) => ({
+			sel: m[1]!.trim().replace(/^@media[^{]*$/, ""),
+			decl: m[2]!,
+		}));
+		const decl = (selector: string, prop: string) =>
+			rules.filter((r) => r.sel.split(",").map((s) => s.trim()).includes(selector)).map((r) => new RegExp(`(?:^|;)\\s*${prop}\\s*:\\s*([^;]+)`).exec(r.decl)?.[1]?.trim()).filter(Boolean);
+		// chat mode still hides the conversation header (a display:none element is not a grid item)
+		expect(css).toMatch(/\.runview\[data-mode="discussion"\][^{]*\.conv-head[^{]*\{\s*display:\s*none/);
+		// the center column is a 3-row grid: header, flexible transcript, composer
+		expect(decl(".rv-center", "grid-template-rows")).toEqual(["auto minmax(0, 1fr) auto"]);
+		// explicit placement: the transcript takes the flexible row and the composer the last one, whatever is hidden
+		expect(decl(".rv-center > .conv-head", "grid-row")).toEqual(["1"]);
+		expect(decl(".rv-center > .tx-wrap", "grid-row")).toEqual(["2"]);
+		expect(decl(".rv-center > #composer-wrap", "grid-row")).toEqual(["3"]);
+		// chat mode: the (empty) header row is zero, the transcript row is the flexible one, the composer row fits its content
+		expect(decl('.runview[data-mode="discussion"] .rv-center', "grid-template-rows")).toEqual(["0px minmax(0, 1fr) auto"]);
+		// no other rule moves the rows (e.g. inside a breakpoint)
+		for (const r of rules) if (/(\.tx-wrap|#composer-wrap|\.conv-head)\s*$/.test(r.sel) && !r.sel.startsWith(".rv-center >")) expect(r.decl, r.sel).not.toMatch(/grid-row|grid-area/);
+		// the sheet's height is viewport-bounded so the transcript scrolls instead of growing
+		expect(decl(".rv-body", "grid-template-rows")).toEqual(["minmax(0, 1fr)"]);
+		expect(decl(".transcript", "overflow-y")).toEqual(["auto"]);
+		expect(decl(".tx-wrap", "min-height")).toEqual(["0"]);
+	});
+
 	test("discussions.js is served, parses, and is loaded by index.html", async () => {
 		const { port, token } = await serve();
 		const get = (path: string) => http(port, "GET", path, { headers: { authorization: `Bearer ${token}` } });

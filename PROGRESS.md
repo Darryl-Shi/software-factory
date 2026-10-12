@@ -90,3 +90,26 @@ Decisions
 - No browser available in the build sandbox; layout checked by reasoning (grid minmax(0,1fr), .blk min-width:0).
 - Full suite: 8–9 failures in sandbox*.test.ts / durability.test.ts are pre-existing here (bwrap cannot create namespaces in this build host); identical on the base commit.
 - Integrated with bundles + chat: bundles.js loads after markdown.js and uses its inline(); the static-UI test checks all six scripts in order.
+
+## Continuous chat (run run-mv4rfo5d-i74d; spec docs/specs/run-mv4rfo5d-i74d.md)
+
+- [x] app.css: explicit grid-row for .rv-center > .conv-head/.tx-wrap/#composer-wrap; chat mode row template
+      `0px minmax(0, 1fr) auto`; .rv-body grid-template-rows minmax(0, 1fr) (definite, viewport-bounded row)
+- [x] test/web.test.ts "chat layout" test on the served /app.css (fails on the previous stylesheet)
+- [x] docs/spec.md Chat bullet
+Decisions
+- CSS only; no browser in the build host, layout checked by reasoning (all .rv-body siblings of .rv-center are in
+  its single row or position:fixed at ≤760/≤1180, so the bounded row holds at every breakpoint).
+
+## UI touch-up: five-column board (run run-mv4rgjw0-ch4q; spec docs/specs/run-mv4rgjw0-ch4q.md)
+
+- [x] app.js: COLUMNS (planning/build/ready/shipping/done) + `boardColumn` (one mapping, null = drawn in its bundle
+      card), `phaseOf` (rank + breakdown label), `breakdown`; `stageOf` (fine stage for the run view, was columnOf).
+- [x] Decision: "Failed in <stage>" now uses the run's history (the state it failed from) instead of always "Done".
+- [x] Cards: footer `.foot-l` (wraps) / `.foot-r` (nowrap); title clamp 3 lines + card tooltip; token tooltips.
+- [x] CSS: --col-min 272 / --col-max 440, snap proximity; breakpoints 640/1024/1600 (+1180/760); 960 → 1024.
+- [x] Human message: long approval/escalation dock cards now scroll inside (dock is a flex column, card shrinks) with
+      sticky actions; modal footers sticky.
+- [x] test/web-board.test.ts (jsdom: loads index.html + scripts with a stubbed core).
+- No browser available here (playwright download blocked), so layout was checked by reasoning, not screenshots.
+- [x] docs/spec.md §9 + acceptance 3, README, architecture, AGENTS.

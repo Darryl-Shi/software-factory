@@ -8,7 +8,8 @@ one project together as a **bundle**: one PR (or a push to `main` for a new repo
   [`docs/specs/run-mv4ghzj2-allm.md`](docs/specs/run-mv4ghzj2-allm.md); clearing Done runs:
   [`docs/specs/run-mv46ek2u-7omz.md`](docs/specs/run-mv46ek2u-7omz.md); the Chat button and full-screen chat:
   [`docs/specs/run-mv46hn3a-f4fa.md`](docs/specs/run-mv46hn3a-f4fa.md); markdown rendering:
-  [`docs/specs/run-mv46mros-6c1p.md`](docs/specs/run-mv46mros-6c1p.md)).
+  [`docs/specs/run-mv46mros-6c1p.md`](docs/specs/run-mv46mros-6c1p.md); the five-column board and UI sizing:
+  [`docs/specs/run-mv4rgjw0-ch4q.md`](docs/specs/run-mv4rgjw0-ch4q.md)).
 - **Design and deviations:** `docs/design-spec.md`, `docs/superpowers/specs/*`, `DEVIATIONS.md`.
 - **How it fits together:** `docs/architecture.md`; settings: `docs/configuration.md`.
 
@@ -20,7 +21,7 @@ through `tsx`).
 Test: `npm test`
 
 - Typecheck: `npm run typecheck`
-- One file: `npx vitest run test/bundle.test.ts`
+- One file: `npx vitest run test/bundle.test.ts` (the board's layout and columns: `test/web-board.test.ts`, jsdom)
 - `test/sandbox.test.ts` and `test/sandbox-write.test.ts` need a working bubblewrap + socat (they fail where user
   namespaces are not available, e.g. inside another sandbox).
 - Dry run (end to end through the HTTP API, scripted agents, fake GitHub): `DRYRUN_SANDBOX=0 npm run dry-run`

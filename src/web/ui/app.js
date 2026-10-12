@@ -103,20 +103,56 @@ function computeKeys() {
 }
 const keyOf = (id) => ui.keys.get(id) ?? id;
 
+// The board's five columns. `states` (the raw run states) is the hint line's tooltip.
 const COLUMNS = [
-  { key: "intake", name: "Intake", states: "RECEIVED · PREPARING" },
-  { key: "discussion", name: "Discussion", states: "DISCUSSING · SPEC_READY" },
-  { key: "spec", name: "Spec approval", states: "AWAITING_APPROVAL · spec" },
-  { key: "build", name: "Build", states: "BUILDING" },
-  { key: "review", name: "Review", states: "REVIEWING" },
-  { key: "ready", name: "Ready", states: "READY · tick tickets of one project, then Ship" },
-  { key: "deliver", name: "Deliver", states: "bundles · AWAITING_APPROVAL · delivery · DELIVERING · AWAITING_CI" },
-  { key: "done", name: "Done", states: "DELIVERED" },
+  { key: "planning", name: "Planning", hint: "Specifying with the architect", states: "RECEIVED · PREPARING · DISCUSSING · SPEC_READY · AWAITING_APPROVAL (spec)", empty: "New tickets are specified here" },
+  { key: "build", name: "Build & Review", hint: "Being built and reviewed", states: "BUILDING · REVIEWING · ESCALATED", empty: "Approved specs are built and reviewed here" },
+  { key: "ready", name: "Ready", hint: "Reviewed. Tick tickets of one project, then Ship", states: "READY", empty: "Reviewed tickets wait here to ship" },
+  { key: "shipping", name: "Shipping", hint: "Bundles, PRs and CI", states: "bundles · AWAITING_APPROVAL (delivery) · DELIVERING · AWAITING_CI · ESCALATED (from AWAITING_CI)", empty: "Shipped bundles move through PR and CI here" },
+  { key: "done", name: "Done", hint: "Merged", states: "DELIVERED", empty: "Merged tickets land here" },
 ];
-function columnOf(r) {
+const COLUMN_CLOSED = { hint: "Merged, failed or cancelled", states: "DELIVERED · FAILED · CANCELLED" };
+// The board column a run is drawn in (the one mapping for the board). null: a Ready run inside a bundle on the board
+// is drawn inside that bundle's card in Shipping.
+function boardColumn(r) {
+  const st = r.state;
+  if (st === "DELIVERED" || st === "FAILED" || st === "CANCELLED") return "done";
+  if (["RECEIVED", "PREPARING", "DISCUSSING", "SPEC_READY"].includes(st) || (st === "AWAITING_APPROVAL" && r.gate === "spec")) return "planning";
+  if (st === "BUILDING" || st === "REVIEWING") return "build";
+  if (st === "ESCALATED") { const from = r.escalation?.from; return !from || from === "BUILDING" || from === "REVIEWING" ? "build" : "shipping"; }
+  if (st === "READY") {
+    if (!inActiveBundle(r)) return "ready";
+    return ui.bundles.has(r.bundle) && bundleOnBoard(ui.bundles.get(r.bundle)) ? null : "shipping";
+  }
+  return "shipping"; // delivery gate, DELIVERING, AWAITING_CI and any other non-terminal state
+}
+// A card's exact stage within its column: [rank in pipeline order, label for the column's breakdown].
+function phaseOf(r) {
+  const st = r.state === "ESCALATED" ? null : r.state;
+  const P = {
+    RECEIVED: [0, "received"], PREPARING: [0, "preparing"], DISCUSSING: [1, "discussing"], SPEC_READY: [1, "spec ready"],
+    BUILDING: [0, "building"], REVIEWING: [1, "reviewing"], READY: [0, "ready"],
+    DELIVERING: [2, "delivering"], AWAITING_CI: [3, "awaiting CI"],
+    DELIVERED: [0, "merged"], FAILED: [1, "failed"], CANCELLED: [2, "cancelled"],
+  };
+  if (st === "AWAITING_APPROVAL") return r.gate === "spec" ? [2, "spec approval"] : [1, `${r.gate ?? "delivery"} approval`];
+  if (st == null) { const from = r.escalation?.from; return [!from || from === "BUILDING" ? 0.5 : from === "REVIEWING" ? 1.5 : 4, "escalated"]; }
+  return P[st] ?? [5, st.toLowerCase().replace(/_/g, " ")];
+}
+// "2 discussing · 1 spec approval", in pipeline order; empty when the column holds a single stage.
+function breakdown(items) {
+  const counts = new Map();
+  items.sort((a, b) => a[0] - b[0]).forEach(([, label]) => counts.set(label, (counts.get(label) ?? 0) + 1));
+  return counts.size > 1 ? [...counts].map(([label, n]) => (label === "bundle" ? plural(n, label) : `${n} ${label}`)).join(" · ") : "";
+}
+// The run's fine-grained pipeline stage (the run view's progress strip and "Failed in …"), not its board column.
+const PIPELINE = [["intake", "Intake"], ["discussion", "Discussion"], ["spec", "Spec approval"], ["build", "Build"], ["review", "Review"], ["ready", "Ready"], ["deliver", "Deliver"], ["done", "Done"]];
+function stageOf(r) {
   let st = r.state;
+  // A failed or cancelled run: the stage it was in when it stopped.
+  if (st === "FAILED" || st === "CANCELLED") { const prev = [...(r.history ?? [])].reverse().find((h) => h.to === st)?.from; if (!prev || TERMINAL.includes(prev)) return "done"; st = prev; }
   if (st === "ESCALATED") st = r.escalation?.from ?? "REVIEWING";
-  if (st === "FAILED" || st === "CANCELLED" || st === "DELIVERED") return "done";
+  if (st === "DELIVERED") return "done";
   if (st === "RECEIVED" || st === "PREPARING") return "intake";
   if (st === "DISCUSSING" || st === "SPEC_READY") return "discussion";
   if (st === "AWAITING_APPROVAL") return r.gate === "spec" ? "spec" : "deliver";
@@ -125,13 +161,6 @@ function columnOf(r) {
   if (st === "READY") return inActiveBundle(r) ? "deliver" : "ready";
   return "deliver";
 }
-// Where a run sits on the board: a Ready run inside a bundle shown in Deliver is drawn inside that bundle's card.
-function boardColumn(r) {
-  const col = columnOf(r);
-  if (r.state === "READY" && col === "deliver" && ui.bundles.has(r.bundle) && bundleOnBoard(ui.bundles.get(r.bundle))) return null;
-  return col;
-}
-const PIPELINE = [["intake", "Intake"], ["discussion", "Discussion"], ["spec", "Spec approval"], ["build", "Build"], ["review", "Review"], ["ready", "Ready"], ["deliver", "Deliver"], ["done", "Done"]];
 function stateLabel(r) {
   const map = {
     RECEIVED: ["Received", ""], PREPARING: ["Preparing", ""], DISCUSSING: ["Discussing", "progress"], SPEC_READY: ["Spec ready", ""],
@@ -213,13 +242,13 @@ function bundleCardHtml(b) {
   if (b.reviews?.length) chips.push(`<span class="rchip${b.reviewRound >= b.caps.review ? " hot" : ""}" title="Review round ${b.reviewRound} of ${b.caps.review}">R${b.reviewRound}/${b.caps.review}</span>`);
   if (b.ciFixes > 0 || b.state === "AWAITING_CI") chips.push(`<span class="rchip" title="CI fix rounds used">CI ${b.ciFixes}/${b.caps.ciFix}</span>`);
   const cls = ["card", "bundle-card", pa ? "turn" : "", b.state === "ESCALATED" || b.state === "FAILED" ? "esc" : ""].join(" ");
-  return `<button type="button" class="${cls}" data-id="${esc(b.id)}" data-bundle="${esc(b.id)}">
-    <div class="card-row"><span class="bchip">${esc(b.id)}</span><span class="meta">${plural(b.members.length, "ticket")}</span></div>
-    <div class="card-row">${bundleStateLabel(b)}${pa ? `<span class="turn-badge">${esc(bundleTurnText(pa.question))}</span>` : ""}${b.mergeRequested && !pa ? `<span class="meta" title="Merge was clicked: it merges by itself when the update is clean and green">merging when green</span>` : ""}</div>
-    <div class="bmembers">${b.members.map((m) => `<div class="bmember"><span class="key">${esc(memberKey(m))}</span><span class="bm-title">${esc(m.title)}</span></div>`).join("")}</div>
+  return `<button type="button" class="${cls}" data-id="${esc(b.id)}" data-bundle="${esc(b.id)}" title="${esc(bundleTitle(b))}">
+    <div class="card-row"><span class="bchip" title="${esc(b.id)}">${esc(b.id)}</span><span class="meta">${plural(b.members.length, "ticket")}</span></div>
+    <div class="card-row card-state">${bundleStateLabel(b)}${pa ? `<span class="turn-badge">${esc(bundleTurnText(pa.question))}</span>` : ""}${b.mergeRequested && !pa ? `<span class="meta" title="Merge was clicked: it merges by itself when the update is clean and green">merging when green</span>` : ""}</div>
+    <div class="bmembers">${b.members.map((m) => `<div class="bmember"><span class="key" title="${esc(memberKey(m))}">${esc(memberKey(m))}</span><span class="bm-title" title="${esc(m.title)}">${esc(m.title)}</span></div>`).join("")}</div>
     <div class="card-foot">
-      <div class="card-row">${ui.filter.project ? "" : `<span class="pchip">${esc(b.project)}</span>`}<span class="rounds">${chips.join("")}</span></div>
-      <div class="card-row"><span class="meta">${money(totalUsd(b))} · ${ago(b.createdAt)}</span>${role ? avatar(role, live) : ""}</div>
+      <div class="card-row foot-l">${ui.filter.project ? "" : `<span class="pchip" title="${esc(b.project)}">${esc(b.project)}</span>`}${chips.length ? `<span class="rounds">${chips.join("")}</span>` : ""}</div>
+      <div class="foot-r"><span class="meta">${money(totalUsd(b))} · ${ago(b.createdAt)}</span>${role ? avatar(role, live) : ""}</div>
     </div>
   </button>`;
 }
@@ -285,20 +314,22 @@ function cardHtml(r) {
   const flag = r.state === "ESCALATED" ? `<span class="flag">▲ ${r.escalation?.cap === "ciFix" ? "CI fix cap hit" : r.escalation?.cap === "review" ? "Review cap hit" : "Needs a decision"}</span>` : "";
   const cls = ["card", pa ? "turn" : "", r.state === "ESCALATED" ? "esc" : "", r.state === "FAILED" || r.state === "CANCELLED" ? "closed" : ""].join(" ");
   const from = r.request.meta?.discussion;
-  return `<button type="button" class="${cls}" data-id="${esc(r.id)}">
+  return `<button type="button" class="${cls}" data-id="${esc(r.id)}" title="${esc(r.request.title)}">
     <div class="card-title">${esc(r.request.title)}</div>
-    <div class="card-row">${stateLabel(r)}${pa ? `<span class="turn-badge">${esc(turnText(pa.question))}</span>` : ""}${flag}</div>
+    <div class="card-row card-state">${stateLabel(r)}${pa ? `<span class="turn-badge">${esc(turnText(pa.question))}</span>` : ""}${flag}</div>
     <div class="card-foot">
-      <div class="card-row"><span class="key">${esc(keyOf(r.id))}</span>${from ? `<span class="disc-mark" title="From discussion: ${esc(from.title)}" aria-label="From discussion: ${esc(from.title)}">${ICON.chat}</span>` : ""}${ui.filter.project ? "" : `<span class="pchip">${esc(r.project)}</span>`}${r.bundle && r.state !== "READY" ? `<span class="bchip" title="${r.state === "DELIVERED" ? "Merged in" : "Shipped in"} ${esc(r.bundle)}">${esc(r.bundle)}</span>` : ""}<span class="rounds">${chips.join("")}</span></div>
-      <div class="card-row"><span class="meta">${money(totalUsd(r))} · ${ago(r.createdAt)}</span>${role ? avatar(role, live) : ""}</div>
+      <div class="card-row foot-l"><span class="key" title="${esc(keyOf(r.id))}">${esc(keyOf(r.id))}</span>${from ? `<span class="disc-mark" title="From discussion: ${esc(from.title)}" aria-label="From discussion: ${esc(from.title)}">${ICON.chat}</span>` : ""}${ui.filter.project ? "" : `<span class="pchip" title="${esc(r.project)}">${esc(r.project)}</span>`}${r.bundle && r.state !== "READY" ? `<span class="bchip" title="${r.state === "DELIVERED" ? "Merged in" : "Shipped in"} ${esc(r.bundle)}">${esc(r.bundle)}</span>` : ""}${chips.length ? `<span class="rounds">${chips.join("")}</span>` : ""}</div>
+      <div class="foot-r"><span class="meta">${money(totalUsd(r))} · ${ago(r.createdAt)}</span>${role ? avatar(role, live) : ""}</div>
     </div>
   </button>`;
 }
-function colHead(c, n, byCol) {
+function colHead(c, n, byCol, sub) {
   let extra = "";
   if (c.key === "done" && byCol.done.length) extra = `<button type="button" class="btn small ghost col-clear${ui.confirmClearAll ? " confirm" : ""}" id="clear-all" data-clear-all title="Clear the Done cards shown from the board (nothing is deleted)">${ui.confirmClearAll ? `Click again to clear ${byCol.done.length}` : "Clear all"}</button>`;
   if (c.key === "ready" && ui.ship.length) extra = `<button type="button" class="btn primary small ship-go" data-ship-go>Ship ${plural(ui.ship.length, "ticket")}</button>`;
-  const head = `<div class="col-head"><span class="col-name">${c.name}</span><span class="col-count">${n}</span>${extra}</div>`;
+  const closed = c.key === "done" && ui.filter.closed, hint = closed ? COLUMN_CLOSED.hint : c.hint, states = closed ? COLUMN_CLOSED.states : c.states;
+  const head = `<div class="col-head"><span class="col-name">${esc(c.name)}</span><span class="col-count">${n}</span>${extra}</div>
+      <div class="col-hint" title="${esc(states)}"><span>${esc(hint)}</span>${sub ? `<span class="col-break">${esc(sub)}</span>` : ""}</div>`;
   if (c.key !== "ready" || !ui.ship.length) return head;
   const proj = shipProject(), others = byCol.ready.some((r) => r.project !== proj);
   return `${head}<div class="ship-note">${others ? `A bundle holds tickets of one project: only <b>${esc(proj)}</b> tickets can be added.` : `Tickets ship in the order you ticked them.`}</div>`;
@@ -315,7 +346,8 @@ function renderBoard() {
   const runs = visibleRuns();
   const byCol = Object.fromEntries(COLUMNS.map((c) => [c.key, []]));
   runs.forEach((r) => { const col = boardColumn(r); if (col) byCol[col].push(r); });
-  for (const k in byCol) byCol[k].sort((a, b) => (pending(b) ? 1 : 0) - (pending(a) ? 1 : 0) || (k === "done" ? b.updatedAt - a.updatedAt : a.createdAt - b.createdAt));
+  // "Your turn" first; then pipeline order of the exact stage, oldest first (Done: most recently updated first).
+  for (const k in byCol) byCol[k].sort((a, b) => (pending(b) ? 1 : 0) - (pending(a) ? 1 : 0) || (k === "done" ? b.updatedAt - a.updatedAt : phaseOf(a)[0] - phaseOf(b)[0] || a.createdAt - b.createdAt));
   // Ticks survive renders while their runs stay in the Ready column.
   ui.ship = ui.ship.filter((id) => byCol.ready.some((r) => r.id === id));
   const bundles = visibleBundles().sort((a, b) => (pending(b) ? 1 : 0) - (pending(a) ? 1 : 0) || a.createdAt - b.createdAt);
@@ -325,12 +357,12 @@ function renderBoard() {
   ui.doneIds = byCol.done.map((r) => r.id);
   const first = ui.runs.size === 0;
   board.innerHTML = COLUMNS.map((c) => {
-    const states = esc(c.key === "done" && ui.filter.closed ? "DELIVERED · FAILED · CANCELLED" : c.states);
-    const cards = c.key === "ready" ? byCol.ready.map(readyCardHtml) : c.key === "deliver" ? [...bundles.map(bundleCardHtml), ...byCol.deliver.map(cardHtml)] : byCol[c.key].map(cardHtml);
-    return `<section class="col${c.key === "done" ? " done-col" : ""}" data-col="${c.key}" aria-label="${c.name}">
-      ${colHead(c, cards.length, byCol)}
-      <div class="col-states" title="${states}">${states}</div>
-      <div class="col-body">${cards.join("") || `<div class="col-empty">${first && c.key === "intake" ? "Press <b>Create</b> to submit your first ticket" : c.key === "ready" ? "Reviewed tickets wait here to ship" : "No tickets"}</div>`}</div>
+    const cards = c.key === "ready" ? byCol.ready.map(readyCardHtml) : c.key === "shipping" ? [...bundles.map(bundleCardHtml), ...byCol.shipping.map(cardHtml)] : byCol[c.key].map(cardHtml);
+    const phases = [...(c.key === "shipping" ? bundles.map(() => [0, "bundle"]) : []), ...byCol[c.key].map(phaseOf)];
+    const sub = breakdown(phases);
+    return `<section class="col${c.key === "done" ? " done-col" : ""}" data-col="${c.key}" aria-label="${esc(c.name)}">
+      ${colHead(c, cards.length, byCol, sub)}
+      <div class="col-body">${cards.join("") || `<div class="col-empty">${first && c.key === "planning" ? "Press <b>Create</b> to submit your first ticket" : esc(c.empty)}</div>`}</div>
     </section>`;
   }).join("");
   board.querySelectorAll(".col").forEach((el) => ($(".col-body", el).scrollTop = scrolls[el.dataset.col] ?? 0));
@@ -632,13 +664,13 @@ async function closeRun() {
 
 // ---------------------------------------------------------------- header, progress, threads
 function stageInfo(r) {
-  const idx = PIPELINE.findIndex(([k]) => k === columnOf(r));
+  const idx = PIPELINE.findIndex(([k]) => k === stageOf(r));
   return { idx, name: PIPELINE[idx][1], cls: pending(r) ? "wait" : r.state === "ESCALATED" || r.state === "FAILED" ? "bad" : "" };
 }
 function renderRunView() {
   const r = openRunData(); if (!r) return;
   $("#rv-key").textContent = keyOf(r.id);
-  $("#rv-title").textContent = r.request.title;
+  $("#rv-title").textContent = r.request.title; $("#rv-title").title = r.request.title;
   $("#rv-state").innerHTML = stateLabel(r) + (r.cleared ? ` <span class="lozenge cleared" title="${esc(clearedText(r))}">Cleared</span>` : "");
   $("#rv-cost").textContent = money(totalUsd(r));
   const { idx, name, cls } = stageInfo(r), done = r.state === "DELIVERED";
