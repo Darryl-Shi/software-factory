@@ -558,3 +558,34 @@ table.cost tr.total td { font-weight: 600; border-bottom: 0; }
   .rv-disc-actions .btn { padding: 3px 6px; }
   .rv-model { display: none; }
 }
+
+/* ---------- bundles: the Ready column's ticks, bundle cards in Deliver, the bundle view (the run view's sheet) ---------- */
+.toast-act { border: 0; background: none; padding: 0; color: inherit; font-weight: 600; text-decoration: underline; text-underline-offset: 2px; }
+.ship-wrap { position: relative; }
+.ship-wrap .card { padding-right: 34px; }
+.ship-wrap.ticked .card { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft), var(--shadow); }
+.ship-tick { position: absolute; top: 6px; right: 6px; z-index: 1; width: 26px; height: 26px; display: grid; place-items: center; cursor: pointer; border-radius: 6px; }
+.ship-tick:hover { background: var(--muted-soft); }
+.ship-tick input { width: 15px; height: 15px; margin: 0; cursor: pointer; accent-color: var(--accent); }
+.ship-tick.off, .ship-tick.off input { cursor: not-allowed; opacity: .55; }
+.ship-go { margin-left: auto; align-self: center; }
+.ship-note { font-size: 11.5px; color: var(--fg-3); padding: 0 12px 8px; line-height: 1.35; }
+.bchip { font: 500 11px/1 var(--f-mono); color: var(--accent); background: var(--accent-soft); border-radius: 3px; padding: 3px 5px; white-space: nowrap; }
+.bundle-card .bmembers { display: grid; gap: 3px; }
+.bmember { display: flex; gap: 6px; align-items: baseline; min-width: 0; font-size: 12.5px; }
+.bm-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; color: var(--fg-2); }
+.avatar.integrator { background: var(--r-help); }
+.rv-links { display: inline-flex; align-items: center; gap: 8px; font-size: 12.5px; white-space: nowrap; overflow: hidden; flex: none; max-width: 40%; }
+.rv-links a { color: var(--accent); }
+.rv-extra { display: inline-flex; gap: 6px; }
+.b-facts { gap: 6px; }
+.b-sub { font-size: 12px; font-weight: 600; color: var(--fg-2); margin: 12px 14px 0; }
+.dock .b-sub + .c-list { margin-top: 6px; }
+.b-note { margin: 10px 14px 0; }
+.b-drop { display: grid; gap: 6px; }
+.b-drop-row { display: flex; gap: 8px; align-items: baseline; font-size: 13px; padding: 6px 10px; border: 1px solid var(--hairline); border-radius: 10px; background: var(--rail); cursor: pointer; }
+.b-drop-hint { margin: 6px 0 0; }
+.tile.off { opacity: .5; cursor: not-allowed; }
+.b-members { display: grid; gap: 8px; }
+.b-member { display: grid; gap: 3px; font-size: 13px; padding: 8px 10px; border: 1px solid var(--hairline); border-radius: 10px; background: var(--rail); min-width: 0; }
+@media (max-width: 760px) { .rv-links { display: none; } }

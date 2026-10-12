@@ -5,7 +5,8 @@ import type { DiscussionView } from "../../src/core/types.ts";
 import { makeFactory, newControl } from "../helpers.ts";
 
 const dir = process.argv[2]!;
-const mode = process.argv[3]!; // "mid-build" | "approval" | "helper" | "qa" | "disc-say" | "disc-draft" | "disc-ticket"
+// "mid-build" | "approval" | "helper" | "qa" | "bundle-conflict" | "legacy-ci" | "disc-say" | "disc-draft" | "disc-ticket"
+const mode = process.argv[3]!;
 const control = newControl();
 control.reviews = mode === "mid-build" ? ["fail", "pass"] : ["pass"];
 const t = await makeFactory({ dir, storage: "sqlite", control, config: process.env.SF_CONFIG });
@@ -61,6 +62,64 @@ async function runModes() {
 	}
 }
 
+/**
+ * "bundle-conflict": two runs of an existing repo write conflicting shared.txt; both reach READY, then a bundle of both
+ * hangs in INTEGRATING with the integrator on the conflict. The bundle's id goes to "bundle-id" (the runs' ids, comma-
+ * separated, to "run-id"), its view to "ready".
+ */
+async function bundleConflict() {
+	control.sharedFile = true;
+	control.reviews = [];
+	await t.host.seedRepo("me/todo", { "README.md": "# todo\n", "AGENTS.md": "Test: true\n" });
+	await f.createProject("todo", "me/todo");
+	const a = await f.startRun("todo", { source: "test", title: "alpha", body: "make alpha" });
+	const b = await f.startRun("todo", { source: "test", title: "beta", body: "make beta" });
+	writeFileSync(join(dir, "run-id"), `${a},${b}`);
+	const end = (v: { state: string }) => ["READY", "FAILED", "CANCELLED"].includes(v.state);
+	const [ra, rb] = await Promise.all([f.waitForState(a, end, 60_000), f.waitForState(b, end, 60_000)]);
+	if (ra.state !== "READY" || rb.state !== "READY") throw new Error(`runs not READY: ${ra.state} ${rb.state}`);
+	control.integratorHang = true;
+	const id = await f.createBundle("todo", [a, b]);
+	writeFileSync(join(dir, "bundle-id"), id);
+	poll(
+		async () => {
+			const v = await f.getBundle(id);
+			return v.state === "INTEGRATING" && v.integration?.conflict && v.conversations.integrator && control.integratorInputs.length === 1 ? {} : undefined;
+		},
+		async (extra) => writeFileSync(join(dir, "ready"), JSON.stringify({ ...(await f.getBundle(id)), ...extra })),
+	);
+}
+
+/**
+ * "legacy-ci": a run of an existing repo, marked legacy while it waits at the delivery gate, delivers the old way (its
+ * own PR) and waits in AWAITING_CI: the delivered commit's checks are forced to stay in progress (the parent turns
+ * them green in the fake GitHub's state file after the kill).
+ */
+async function legacyCi() {
+	await t.host.seedRepo("me/todo", { "README.md": "# todo\n", "AGENTS.md": "Test: true\n" });
+	await f.createProject("todo", "me/todo");
+	await f.setSetting({ project: "todo" }, "policy.approvals", ["delivery"]);
+	const run = await f.startRun("todo", { source: "test", title: "todo", body: "CLI todo" });
+	writeFileSync(join(dir, "run-id"), run);
+	const v = await f.waitForState(run, (x) => x.state === "AWAITING_APPROVAL" || x.state === "FAILED", 60_000);
+	const q = v.pendingAsk?.question as { kind?: string; gate?: string } | undefined;
+	if (q?.kind !== "approval" || q.gate !== "delivery") throw new Error(`not at the delivery gate: ${v.state} ${JSON.stringify(q)}`);
+	await f.patchRunForTests(run, (d) => {
+		d.legacy = true;
+	});
+	// the only new commit checked in this repo is the delivered one: its checks stay in progress
+	t.host.forceChecks("me/todo", [{ name: "ci", status: "in_progress" }]);
+	await f.approve(run, "delivery");
+	poll(
+		async () => {
+			const x = await f.getRun(run);
+			const sha = x.artifacts.delivery?.sha;
+			return x.state === "AWAITING_CI" && sha && t.host.state().checks[`me/todo@${sha}`] ? {} : undefined;
+		},
+		async (extra) => writeFileSync(join(dir, "ready"), JSON.stringify({ ...(await f.getRun(run)), ...extra })),
+	);
+}
+
 /** Discussions: the discussion's id goes to "run-id", its view (and `extra`) to "ready". */
 async function discussionModes() {
 	await t.host.seedRepo("me/p", { "README.md": "# p\n" });
@@ -89,5 +148,5 @@ async function discussionModes() {
 	}
 }
 
-await (mode.startsWith("disc-") ? discussionModes() : runModes());
+await (mode.startsWith("disc-") ? discussionModes() : mode === "bundle-conflict" ? bundleConflict() : mode === "legacy-ci" ? legacyCi() : runModes());
 setInterval(() => {}, 1000);

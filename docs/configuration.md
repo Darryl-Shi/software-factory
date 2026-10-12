@@ -37,12 +37,14 @@ To inspect and change settings, open the web UI's **Settings** view (`factory we
   - a GitHub `app` identity needs `appId`, `installationId` and `privateKeyRef`;
   - `sandbox.extraWrite` must not make home or `/` writable, or overlap a denied path;
   - `ci.noChecksTimeout` must be a duration and `ci.fixRounds` a whole number;
+  - `bundle.mergeMethod` must be `merge`, `squash` or `rebase`;
   - no gate may appear twice.
 
 This check runs against the *effective* config of every affected scope: a global change is checked for every project.
 If any check fails, the change is rejected and the file is left unchanged.
 
-**Pinning.** Each run pins its effective config when it starts, so a settings change applies only to new runs.
+**Pinning.** Each run pins its effective config when it starts, and each bundle the project's effective config when
+it is created, so a settings change applies only to new runs and bundles.
 
 ## Settings
 
@@ -51,6 +53,7 @@ If any check fails, the change is rejected and the file is left unchanged.
 | `roles.architect` | `anthropic/claude-opus-5-5`, `high` | Discussion and spec |
 | `roles.builder` | `anthropic/claude-opus-5-5`, `high` | The single writer |
 | `roles.helper` | unset = the builder's model and thinking | Helpers the builder spawns; they write code in the builder's worktree |
+| `roles.integrator` | unset = the builder's model and thinking | A bundle's integrator: combines its tickets' branches, resolves conflicts, fixes the bundle's findings |
 | `roles.reviewer` | `openai/gpt-6-sol`, `high` | Product vs spec, runs the tests, reviews the diff and code for quality and security |
 | `roles.qa` | `anthropic/claude-sonnet-5-5`, `medium` | AQ testing in a boat.dev VM; the model must accept images |
 | `discussion.model` | unset = the architect's model and thinking | The model a new discussion starts with (see below) |
@@ -59,15 +62,16 @@ If any check fails, the change is rejected and the file is left unchanged.
 | `boat.size` | `default` | VM size: `small`, `default` or `large` |
 | `boat.ttl` | `1h` (10m–24h) | Idle time after which boat stops the VM (it is resumed on the next command) |
 | `boat.runScripts` | `[scripts/run.sh, bin/run]` | Repo-relative; the first that exists starts the product in the VM. None means QA is skipped |
-| `policy.approvals` | `[spec]` | Approval gates, any of `spec`, `delivery`, `merge` |
-| `policy.reviewRoundCap` | `3` (1–20) | Review rounds before escalation |
+| `policy.approvals` | `[spec]` | Approval gates, any of `spec`, `delivery`, `merge`. `merge` is legacy: it still validates but no new run stops at it (see [Bundles](#bundles)) |
+| `policy.reviewRoundCap` | `3` (1–20) | Review rounds before escalation, for a run and, separately, for a bundle's reviews |
 | `policy.escalateOnNoProgress` | `true` | Escalate when a fix round leaves the diff unchanged |
-| `policy.messages` | `[architect, builder, reviewer]` | Roles a human can message while a run is going (the web UI's chat box). Drop `reviewer` for a review no human can sway. `discussant` can't be listed: you talk to it in its discussion |
-| `workdir` | `~/factory/work` | Clones, per-run worktrees, discussions' read-only checkouts (`discussions/<id>`) and the roles' scratch dirs |
+| `policy.messages` | `[architect, builder, reviewer]` | Roles a human can message while a run is going (the web UI's chat box). Drop `reviewer` for a review no human can sway (it also covers a bundle's reviewer; a bundle's integrator always takes messages). `discussant` can't be listed: you talk to it in its discussion |
+| `workdir` | `~/factory/work` | Clones, per-run worktrees, bundles' worktrees (`bundles/<id>`), discussions' read-only checkouts (`discussions/<id>`) and the roles' scratch dirs |
 | `github.identity` | `{ kind: pat, tokenRef: env:GH_TOKEN }` | How the factory authenticates to GitHub (see below) |
 | `github.visibility` | `private` | Visibility of the repos the factory creates |
-| `ci.mode` | `if-present` | `off` / `if-present` / `required` (see below) |
-| `ci.fixRounds` | `2` (0–3) | CI fix rounds before escalation |
+| `bundle.mergeMethod` | `squash` | How **Merge** merges a bundle's PR: `merge`, `squash` or `rebase`. Global or per project |
+| `ci.mode` | `if-present` | `off` / `if-present` / `required` (see below); applies to bundles |
+| `ci.fixRounds` | `2` (0–3) | CI fix rounds of a bundle before escalation |
 | `ci.checks` | `[]` | Names of the checks that count; empty means all |
 | `ci.noChecksTimeout` | `2m` | No checks by then means the repo has no CI |
 | `sandbox.*` | see below | The sandbox every role's commands run in |
@@ -95,6 +99,7 @@ Each role's tools are fixed, not settings. The role's prompt (`role-<role>`) alw
 | architect | `coding-readonly`, `web-search` |
 | builder | `coding`, `subagent`, `test-runner`, `web-search` |
 | helper | `coding`, `test-runner`, `web-search` (no `subagent`, no bridge tools) |
+| integrator | `coding`, `test-runner`, `web-search` (no `subagent`; bridge tool: `report_done`) |
 | reviewer | `coding-readonly`, `test-runner`, `web-search` |
 | qa | `coding-readonly` (bash runs in the VM), `computer`, `web-search` |
 | discussant | `coding-readonly`, `web-search` (bridge tool: `submit_tickets`) |
@@ -120,6 +125,32 @@ discussion:
   model: { model: anthropic/claude-opus-5-5, thinking: high }
 ```
 
+### Bundles
+
+A run stops at **Ready** once its review passes (and the `delivery` gate, if on, is approved): its branch
+`factory/<run-id>` is pushed for an existing repo, and nothing more. Shipping one or more Ready tickets of a project
+makes a bundle, which delivers them as one PR (or, for a new repo, creates the repo and pushes to `main`), waits for
+CI and merges when you click **Merge**. A bundle pins the project's settings when it is created:
+
+- `bundle.mergeMethod` is how Merge merges the PR (`squash` by default). Merging the PR on GitHub yourself works too;
+  the factory notices.
+- `roles.integrator` is the integrator's model and thinking; each field left unset takes the builder's effective
+  value, as `roles.helper` does.
+- `policy.reviewRoundCap` caps the bundle's own review rounds (a bundle is reviewed only when the integrator changed
+  something), and `ci.*` applies to the bundle's PR as it used to apply to a run's.
+- `qa.*` and `boat.*` apply to the bundle's reviews; its QA VMs are named `factory-bundle-<n>-<seq>`.
+
+`policy.approvals: [merge]` is **legacy**. It still validates, so old configs keep loading, but no new run stops at
+the merge gate: merging is always the bundle's Merge. The `delivery` gate keeps working and sits before Ready. Runs
+that had already begun delivering when the factory was upgraded finish the old way, with their own PR, CI and merge
+gate.
+
+```yaml
+bundle: { mergeMethod: merge }   # keep each ticket's commits on the default branch
+roles:
+  integrator: { model: anthropic/claude-sonnet-5-5 }   # thinking still follows the builder
+```
+
 ### Web UI
 
 `web.host` and `web.port` apply when the factory starts; change them, then `factory stop` and `factory serve`.
@@ -132,13 +163,17 @@ restart to issue a new token.
 
 ### CI modes
 
-| Mode | What happens after delivery |
+CI runs on a bundle's delivered commit (its PR, or the push to `main` for a new repo); runs no longer wait for CI
+themselves.
+
+| Mode | What happens after a bundle's delivery |
 |---|---|
 | `off` | Don't wait for CI. |
 | `if-present` | Wait for the repo's checks. If none appear within `noChecksTimeout`, finish anyway and note in the PR description or `docs/delivery-notes.md` that there was no CI. |
 | `required` | Checks must pass. If none appear, escalate to the human. |
 
-When CI is red, the failure goes back to the builder. After `fixRounds` failed rounds, the run escalates.
+When CI is red, the failure goes back to the bundle's integrator. After `fixRounds` failed rounds, the bundle
+escalates. (Legacy runs still wait for CI themselves, and a red CI goes to their builder.)
 
 Delivery itself is not a setting: a new repo is always pushed to `main`, and an existing repo always gets a pull
 request.
@@ -159,7 +194,8 @@ All of these live under `sandbox`.
 
 ### GitHub identity
 
-`github.identity` sets how the factory authenticates to GitHub, for opening repos, delivery, CI and merges.
+`github.identity` sets how the factory authenticates to GitHub, for opening repos, pushing run branches, bundle
+delivery, CI, merges and closing a cancelled bundle's PR.
 - `kind: pat` or `kind: bot` takes a `tokenRef`.
 - `kind: app` takes `appId`, `installationId` and `privateKeyRef`.
 
@@ -223,7 +259,7 @@ searching off, leave the key unset.
 ### AQ testing
 
 Each review round, if `qa.enabled` and a run script exists, the core creates one boat.dev VM named
-`factory-<run>-<round>` with `noEnv` (no environment variables of yours), uploads the reviewed build as a git bundle,
+`factory-<run>-<round>` (`factory-bundle-<n>-<round>` for a bundle's review) with `noEnv` (no environment variables of yours), uploads the reviewed build as a git bundle,
 runs the setup script and starts the run script. The QA agent drives the VM's desktop and Chrome through the Cua
 Driver and must cite screenshots for its findings. The VM is deleted when the round ends, when the run is cancelled,
 and at startup if it is left over from a crash.
@@ -461,6 +497,7 @@ version: 1
 roles:
   reviewer: { model: openai/gpt-6-sol, thinking: high }
 policy: { approvals: [spec, delivery], reviewRoundCap: 3 }
+bundle: { mergeMethod: squash }
 github:
   identity: { kind: pat, tokenRef: env:GH_TOKEN }
 ci: { mode: if-present, fixRounds: 2 }
@@ -471,7 +508,7 @@ boat: { apiKey: env:BOAT_API_KEY, size: default, ttl: 1h }
 projects:
   todo:
     repo: me/todo
-    policy: { approvals: [spec, delivery, merge] }
+    bundle: { mergeMethod: rebase }
     ci: { mode: required }
   cli-tool:
     repo: me/cli-tool

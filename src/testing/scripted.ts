@@ -83,7 +83,9 @@ export function scriptedProvider(scripts: Record<string, Script>, providerId = "
 				const before = messages.slice(0, lastHuman).filter((m) => !isHuman(m)).at(-1) as any;
 				const since = messages.slice(lastHuman + 1);
 				// (a factory bridge tool that succeeded ends the agent's run, like a final text reply does)
+				// (a message to a Conversation that never had input of the core's starts a side turn too)
 				const sideStart =
+					before === undefined || before.role === "system" ||
 					(before?.role === "assistant" && !(before.content ?? []).some((p: any) => p.type === "toolCall")) ||
 					(before?.role === "toolResult" && BRIDGE_TOOLS.includes(before.toolName) && !before.isError);
 				if (sideStart) {

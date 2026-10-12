@@ -2,25 +2,34 @@
 
 A software factory built on **Pi Durable** (`@earendil-works/pi-durable@1.1.0`).
 You give it a software request for a project. It runs an architecture discussion with you, writes a spec, builds the
-product unattended, reviews the whole product against the spec, and delivers it to GitHub: a push to `main` for a new
-repo, a pull request for an existing one. It also waits for CI and can merge. You are needed only in the discussion
-and at the approval gates you turn on, but you can message the agent working on a run at any time. When a problem is
-too unclear to write as a ticket, you can first talk it through with a model in a discussion, which ends in draft
-tickets that you edit and turn into runs.
+product unattended and reviews the whole product against the spec. The reviewed ticket then waits in **Ready**. You
+ship one or more Ready tickets of a project together as a **bundle**: the factory combines their branches on the
+latest default branch, has an integrator agent resolve any conflict (and the combination reviewed again if it did),
+and delivers it to GitHub as one pull request (or, for a new repo, a push to `main`). It waits for CI and merges when
+you click **Merge**. You are needed only in the discussion, at the approval gates you turn on and when you ship and
+merge, but you can message the agent working on a run or bundle at any time. When a problem is too unclear to write
+as a ticket, you can first talk it through with a model in a discussion, which ends in draft tickets that you edit
+and turn into runs.
 
-- **The core is model-free and durable** (`src/core/`). It is a state machine that runs as a Pi Durable Task, plus the
-  agent bridge, projects, layered settings and durable pending asks. It never calls a model: it configures role
-  Conversations (architect, builder and the helpers it has write code, reviewer, QA) and reads what they submit
-  through the bridge.
+- **The core is model-free and durable** (`src/core/`). It is a set of state machines (runs, bundles, discussions)
+  that run as Pi Durable Tasks, plus the agent bridge, projects, layered settings and durable pending asks. It never
+  calls a model: it configures role Conversations (architect, builder and the helpers it has write code, reviewer, QA,
+  a bundle's integrator) and reads what they submit through the bridge.
   Its whole outside surface is a set of operations and an event stream (`FactoryCore` in `src/core/types.ts`).
+- **Runs stop at Ready; bundles deliver.** A run whose review passes commits what the builder left, pushes its branch
+  `factory/<run-id>` (existing repos) and waits in `READY`; it opens no PR and waits for no CI. Its spec is committed
+  at `docs/specs/<run-id>.md`, so parallel tickets never collide on it. A bundle (`bundle-<n>`) merges its tickets'
+  branches in order, opens one PR with a section per ticket, takes red CI back to the integrator, and merges with
+  `bundle.mergeMethod` (squash by default). If the default branch moved meanwhile, Merge updates the bundle first and
+  merges by itself when the update is clean and green. Shipping one ticket gives the familiar one-ticket PR.
 - **GitHub, a local sandbox and boat.dev are the backend.** The core calls them directly: `GitHub` (`src/github/`) opens
-  repos, delivers and waits for CI; `Sandbox` (`src/sandbox/`) gives each role a sandboxed environment in the run's
+  repos, combines bundles, delivers, waits for CI and merges; `Sandbox` (`src/sandbox/`) gives each role a sandboxed environment in the run's
   worktree; `Boat` (`src/boat/`) gives each review round's QA agent a fresh boat.dev VM running the product.
 - **Each review round is a code review plus AQ testing, in parallel.** The reviewer checks the product against the
   spec, runs the tests and reviews the diff for quality and security. The QA agent uses the product in the VM and
   backs every finding with a screenshot. QA is on by default (`qa.enabled`) and can be turned off per project.
 - **The web UI is the interface**, on `http://127.0.0.1:7317`: a ticket board where each run moves through the pipeline
-  stages on its own, a full-screen run view with the agents' conversations, a chat box, and approvals in a floating
+  stages on its own and Ready tickets are ticked and shipped, bundle cards and a bundle view, a full-screen run view with the agents' conversations, a chat box, and approvals in a floating
   card, a Discussions tab, and a Settings view. The `factory` command only starts, stops and checks the process.
 - **Discussions come before a ticket, when you want one.** A discussion is a chat with one model (the `discussant`
   role) about one project. It can read the repo, run commands in a read-only sandbox and search the web, but can't
@@ -52,6 +61,12 @@ code differs from them is listed in [`DEVIATIONS.md`](DEVIATIONS.md).
   discussant's prompt has not been tried with a real model.
 - **AQ testing and writing helpers** (design spec §9, §9.1) were added on 10 October 2026. They are verified with a
   disk-based fake boat.dev (`--fake-boat`) and a stub Cua Driver; nothing has run against the live boat.dev API yet.
+- **Bundles** were added on 12 October 2026. Runs now stop at Ready and are delivered by bundles. The test suite
+  covers every bundle state transition, conflicts, CI fixes, a moved default branch at Merge, an external merge and
+  close, drop and cancel, legacy runs finishing the old way, and `kill -9` while the integrator resolves a conflict,
+  all on the fake GitHub with scripted agents. The dry run builds two tickets of one project in parallel, ships them
+  as one bundle (their conflict resolved by the integrator, then reviewed) and merges it. The integrator's prompt has
+  not been tried with a real model.
 - **Not yet done:** a live trial against github.com with real models. The real-GitHub client (`GhApiHost`) has only
   been tested against a fake `gh` binary, `web_search` only against a fake Parallel endpoint, and the role prompts
   have not been tested with real models.
@@ -111,8 +126,10 @@ If setup installed the service, the service runs the factory: skip `bin/factory 
 link only if the web UI was already listening when setup finished; otherwise, with the service active, it says
 `the service is starting; factory web prints the link`. `bin/factory web` prints the link once the service is up.
 
-Open the link. **Create** a ticket with a project name, its repo (`owner/name`; created at the first delivery if it
-doesn't exist) and the request, then answer the architect's questions and the approvals in the run view.
+Open the link. **Create** a ticket with a project name, its repo (`owner/name`; created when its first bundle ships
+if it doesn't exist) and the request, then answer the architect's questions and the approvals in the run view. When
+the ticket reaches **Ready**, tick it (with any other Ready tickets of the project) and click **Ship N tickets**, or
+use **Ship this ticket** in its run view. Then click **Merge** on the bundle's card once CI is green.
 
 ## Commands
 
@@ -170,9 +187,19 @@ The factory keeps its files next to the config file (`~/.factory/` by default):
 ## Web UI
 
 `factory serve` prints a link like `http://127.0.0.1:7317/?token=…`; `bin/factory web` prints it again. Open it to get:
-- **Board:** one column per stage (Intake, Discussion, Spec approval, Build, Review, Deliver, Done). **Create** submits
-  a ticket (a run), and creates the project if it is new; cards move on their own and show "Your turn" when a run
-  waits for you.
+- **Board:** one column per stage (Intake, Discussion, Spec approval, Build, Review, Ready, Deliver, Done). **Create**
+  submits a ticket (a run), and creates the project if it is new; cards move on their own and show "Your turn" when a
+  run or bundle waits for you.
+  - **Ready:** each card has a checkbox. Ticking a card disables other projects' cards; **Ship N tickets** in the
+    column header creates a bundle of the ticked tickets, in the order ticked.
+  - **Deliver:** bundle cards (id, state, member ticket keys), with their member runs inside. Legacy runs still
+    delivering the old way show as ordinary cards. **Done** shows merged runs with a bundle chip.
+- **Bundle view:** click a bundle card. It reuses the run view: the integrator, reviewers and QA conversations and a
+  timeline on the left, the transcript and a chat box (to the integrator, or the reviewer while reviewing), and a
+  header with the member tickets and the PR. The merge card has **Merge**, **Request changes** and **Drop tickets…**;
+  an escalation has **More rounds**, **Drop tickets…** and **Abort**; a failed bundle has **Retry**; **Cancel bundle**
+  closes the PR and sends the tickets back to Ready. A run in a bundle shows "In bundle-N" and can't be messaged or
+  cancelled until the bundle is merged or cancelled.
 - **Run view:** click any card, at any stage, for a full-screen view. The left rail lists the run's conversations
   (architect, builder and its helpers, each reviewer and its round's QA agent) and a timeline; the centre is the transcript, with every tool
   call as one plain row you can expand. The chat box always goes to the agent the run is with: questions from the
@@ -205,23 +232,25 @@ bin/factory stop --config .dryrun/config.yaml        # when you are done
 ## Tests
 
 ```sh
-npm test            # vitest, 376 tests, a few minutes; no credentials or network needed
+npm test            # vitest, about 540 tests, a few minutes; no credentials or network needed
 npm run typecheck   # tsc (noEmit)
 ```
 
 | File | Covers |
 |---|---|
-| `test/machine.test.ts` | State transitions, gates, rejections, escalations, round and fix caps, CI modes, cancel/retry, events, pinning |
+| `test/machine.test.ts` | Run state transitions up to `READY`, gates, rejections, escalations, round caps, the spec at `docs/specs/<run-id>.md`, cancel/retry, events, pinning; legacy runs' CI modes, CI fix rounds and merge gate |
+| `test/bundle.test.ts` | Bundles: every state transition, a clean merge and a conflict the integrator resolves (then a review against every spec), CI red → fix → review and its cap, Ship this ticket, a moved default branch at Merge, Request changes, an external merge and close, drop and cancel releasing runs, membership refusals, messages to a Ready run and to a bundle, a new repo, failure and Retry |
+| `test/legacy.test.ts` | `isLegacyDelivery` and the upgrade migration: runs that had begun delivering finish with their own PR |
 | `test/settings.test.ts` | Layering and source attribution, unset, validate-on-save, the fixed schema and role tool sets, refusing a legacy `stages`/`workers` config or `roles.<role>.extensions` key, projects, `discussion.model` and its fallback to the architect |
 | `test/findings.test.ts` | Review and QA findings validation, builder responses, bridge enforcement, helpers that write |
 | `test/qa.test.ts` | AQ testing on the fake boat: QA pass/fail with screenshots, `submit_qa` rules, statuses ran/off/skipped/unavailable, missing key, cancel, ttl stop and resume, the startup sweep |
 | `test/discussion.test.ts` | Discussions: the checkout and its resync (diverged, force-pushed, deleted, remote gone, a reused id), start, close/reopen (the environment disposed and provisioned again, a factory note after the checkout changed), a failed start and retry, refusals and events; `say`, Stop (also a late one) and provider errors; no write tools; the pinned model; drafting with `submit_tickets` (invalid payloads, reminders, redrafts and what they are told about earlier drafts, Stop), draft edits and their refusals; `createTicket` (also on a `FAILED` discussion) and the architect's `# Prior discussion` |
-| `test/durability.test.ts` | `kill -9` mid-build, at a pending approval, mid-helper and mid-QA (and a VM deleted while down), then resume; a discussion killed mid-turn, mid-draft and right after `createTicket` |
+| `test/durability.test.ts` | `kill -9` mid-build, at a pending approval, mid-helper and mid-QA (and a VM deleted while down), while the integrator resolves a conflict, and while a legacy run waits for CI, then resume; a discussion killed mid-turn, mid-draft and right after `createTicket` |
 | `test/sandbox.test.ts` | The real bubblewrap sandbox: write rules (including the discussant's read-only worktree), denyRead, the factory home's secrets, no credential env vars, network allowlist |
 | `test/sandbox-write.test.ts` | A write root around the factory home: neither the home nor the storage is writable; the builder's worktree inside the home still is |
 | `test/github-api.test.ts` | `GhApiHost` request shapes, token handling, the GitHub App JWT exchange |
 | `test/messages.test.ts` | `message`: routing, refusals, side turns and their cost, spec revision at the gate, steering a busy builder, held messages, re-review of changes made at the delivery gate |
-| `test/web.test.ts` | The web server: token and cookie, Host/Origin/content-type checks, operations and error codes (discussion operations too), the event stream and its `discussion` filter, a busy port as an error, the static UI |
+| `test/web.test.ts` | The web server: token and cookie, Host/Origin/content-type checks, operations and error codes (discussion and bundle operations too), the event stream and its `discussion` and `bundle` filters, bundle screenshots, a busy port as an error, the static UI |
 | `test/web-search.test.ts` | `web_search` against a fake Parallel endpoint: request shape, result formatting, errors, a run using pinned `webSearch` settings |
 | `test/daemon.test.ts` | `serve`/`stop`/`status`/`web` as real processes: detaching, a second `serve`, a busy port, a bad or legacy config, unknown options, stale pid files, a fresh install |
 | `test/secrets.test.ts` | The secret store: file and directory modes, atomic writes, refusing a loose or unparseable file, `store:` refs |
@@ -239,15 +268,18 @@ Notes:
 ```
 src/core/          core.ts (Factory), run-task.ts (state machine), run-doc.ts, bridge.ts, findings.ts, settings.ts,
                    messages.ts (who gets a message, and when), usage.ts (cost records), types.ts, run-config.ts,
+                   bundle-task.ts (a bundle's state machine), bundle-doc.ts, task-kit.ts (what run and bundle Tasks
+                   share: role Conversations, agents, review rounds with QA, the CI wait),
                    discussion-task.ts (a discussion's state machine), discussion-doc.ts
-src/github/        github.ts (GitHub: open, create, diff, writeArtifact, deliver, checks, annotate, merge),
+src/github/        github.ts (GitHub: open, create, diff, writeArtifact, pushBranch, openBundle, mergeMember,
+                   deliverBundle, deliver, checks, annotate, merge, prState, closePr),
                    host.ts (GitHubHost: GhApiHost for github.com, LocalGitHubHost as a local fake), git.ts (git helpers)
 src/boat/          boat.ts (Boat: QA VMs per review round, BoatEnv), backend.ts (BoatApiBackend on @boatdev/sdk, LocalBoatBackend fake)
 src/sandbox/       sandbox.ts (Sandbox: per-role environments in the run's worktree, inside sandbox-runtime)
 src/web/           server.ts (HTTP + server-sent events) and ui/ (the static web UI, no build step;
-                   discussions.js is the Discussions tab and discussion view)
+                   discussions.js is the Discussions tab and discussion view, bundles.js the bundle cards and view)
 src/agents/        tools.ts (coding, coding-readonly, subagent, test-runner, computer, browser; each role's fixed set),
-                   web-search.ts, prompts.ts (role-* prompts)
+                   web-search.ts, prompts.ts (role-* prompts, role-integrator included)
 src/models/        host.ts (the model host: pi-coding-agent's ModelRuntime and package manager over <factoryHome>/pi)
 src/secrets/       store.ts (SecretStore over <factoryHome>/secrets.json; backs `store:` refs)
 src/setup/         ui.ts (SetupUi, ClackUi), context.ts (SetupContext), wizard.ts (runSetup),

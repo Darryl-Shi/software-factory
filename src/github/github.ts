@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { expandHome, type Obj } from "../core/settings.ts";
-import type { CiStatus, Delivery, DeliveryContext, Diff, Finding, PrRef, RepoRef, RunCtx, Workspace } from "../core/types.ts";
+import type { CiStatus, Delivery, DeliveryContext, Diff, Finding, PrRef, QaStatus, RepoRef, RunCtx, Workspace } from "../core/types.ts";
 import { git, gitOut } from "./git.ts";
 import type { GitHubHost, Identity } from "./host.ts";
 
@@ -67,7 +67,7 @@ export function report(ctx: Pick<DeliveryContext, "request" | "advisory" | "acce
 		"",
 		`**Request:** ${ctx.request.title}`,
 		"",
-		`The spec (v${ctx.spec.version ?? 1}) is in \`docs/spec.md\` and is the contract this change was built and reviewed against.`,
+		`The spec (v${ctx.spec.version ?? 1}) is in \`${ctx.spec.path ?? "docs/spec.md"}\` and is the contract this change was built and reviewed against.`,
 		"",
 		...findingLines("Advisory findings (non-blocking)", ctx.advisory),
 		...findingLines("Open blocking findings accepted as is by a human", ctx.acceptedBlocking),
@@ -77,11 +77,30 @@ export function report(ctx: Pick<DeliveryContext, "request" | "advisory" | "acce
 	].join("\n");
 }
 
+/**
+ * One git operation at a time on a project's shared clone: runs, discussions and bundles of one project clone, fetch,
+ * add worktrees and push from it in parallel, and git's ref and config locks don't wait.
+ */
+const cloneLocks = new Map<string, Promise<unknown>>();
+function withClone<T>(clone: string, f: () => Promise<T>): Promise<T> {
+	const prev = cloneLocks.get(clone) ?? Promise.resolve();
+	const next = prev.catch(() => undefined).then(f);
+	cloneLocks.set(clone, next);
+	void next.finally(() => {
+		if (cloneLocks.get(clone) === next) cloneLocks.delete(clone);
+	}).catch(() => undefined);
+	return next;
+}
+
 export class GitHub {
 	constructor(readonly host: GitHubHost) {}
 
 	/** A run's (or, with `area: "discussions"`, a discussion's) checkout under `<workdir>/<area>/<rc.runId>`. */
-	async open(ref: RepoRef, rc: RunCtx, area: "runs" | "discussions" = "runs"): Promise<Workspace> {
+	open(ref: RepoRef, rc: RunCtx, area: "runs" | "discussions" = "runs"): Promise<Workspace> {
+		return withClone(cloneOf(workdirOf(rc), ref), () => this.openLocked(ref, rc, area));
+	}
+
+	private async openLocked(ref: RepoRef, rc: RunCtx, area: "runs" | "discussions"): Promise<Workspace> {
 		const host = this.host;
 		const workdir = workdirOf(rc);
 		const m = join(workdir, area, `${rc.runId}.json`);
@@ -138,7 +157,11 @@ export class GitHub {
 	 * worktree git can't reset is made again with `open`; so is a new-repo workspace whose repo now exists (the empty
 	 * local workspace becomes a checkout of the repo). Fails only when git does (e.g. the remote is gone).
 	 */
-	async refresh(ws: Workspace, rc: RunCtx): Promise<Workspace> {
+	refresh(ws: Workspace, rc: RunCtx): Promise<Workspace> {
+		return withClone(cloneOf(workdirOf(rc), ws.repo), () => this.refreshLocked(ws, rc));
+	}
+
+	private async refreshLocked(ws: Workspace, rc: RunCtx): Promise<Workspace> {
 		const host = this.host;
 		const id = identityOf(rc);
 		const workdir = workdirOf(rc);
@@ -146,7 +169,7 @@ export class GitHub {
 		const manifest = join(workdir, "discussions", `${rc.runId}.json`);
 		const again = async () => {
 			await discard(ws, workdir, manifest);
-			return this.open(ws.repo, rc, "discussions");
+			return this.openLocked(ws.repo, rc, "discussions");
 		};
 		if (ws.newRepo) {
 			if (await host.repoExists(ws.repo, id)) return again();
@@ -310,4 +333,235 @@ export class GitHub {
 	async merge(pr: PrRef, how: "merge" | "squash" | "rebase", rc: RunCtx): Promise<void> {
 		await this.host.mergePr(pr.repo, pr.number, how, identityOf(rc));
 	}
+
+	// ------------------------------------------------------------------ Ready runs and bundles (bundles spec §1.1, §2)
+
+	/** Commit whatever is uncommitted in the worktree (untracked files included). Returns whether it committed. */
+	async commitAll(ws: Workspace, message: string): Promise<boolean> {
+		await git(ws.path, ["add", "-A"]);
+		if ((await git(ws.path, ["diff", "--cached", "--quiet"], { allowFail: true })).code === 0) return false;
+		await git(ws.path, ["commit", "-q", "-m", message]);
+		return true;
+	}
+
+	/** Push the workspace's branch (`factory/<id>`) to origin, replacing what is there. */
+	pushBranch(ws: Workspace, rc: RunCtx): Promise<string> {
+		return withClone(cloneOf(workdirOf(rc), ws.repo), () => this.pushBranchLocked(ws, rc));
+	}
+
+	private async pushBranchLocked(ws: Workspace, rc: RunCtx): Promise<string> {
+		const host = this.host;
+		const remotes = await gitOut(ws.path, ["remote"]);
+		if (!remotes.split("\n").includes("origin")) await git(ws.path, ["remote", "add", "origin", host.remoteUrl(ws.repo)]);
+		await git(ws.path, ["push", "-q", "--force", "origin", `HEAD:refs/heads/${ws.branch}`], await host.gitAuth(identityOf(rc)));
+		return gitOut(ws.path, ["rev-parse", "HEAD"]);
+	}
+
+	/**
+	 * A bundle's worktree `<workdir>/bundles/<bundle-id>` on branch `factory/<bundle-id>`, from the project's shared clone
+	 * (where the member runs' branches are local branches). Made at the clone's current HEAD; `integrateStart` resets it.
+	 */
+	openBundle(ref: RepoRef, rc: RunCtx): Promise<Workspace> {
+		return withClone(cloneOf(workdirOf(rc), ref), () => this.openBundleLocked(ref, rc));
+	}
+
+	private async openBundleLocked(ref: RepoRef, rc: RunCtx): Promise<Workspace> {
+		const workdir = workdirOf(rc);
+		const m = join(workdir, "bundles", `${rc.runId}.json`);
+		if (existsSync(m)) {
+			const ws = JSON.parse(readFileSync(m, "utf8")) as Workspace;
+			if (ws.repo === ref && existsSync(ws.path)) return ws;
+			if (ws.repo !== ref) await discard(ws, workdir, m);
+		}
+		const clone = cloneOf(workdir, ref);
+		if (!existsSync(join(clone, ".git"))) throw new Error(`the project's clone of ${ref} is missing (${clone}); its runs' branches live there`);
+		const worktree = join(workdir, "bundles", rc.runId);
+		const branch = `factory/${rc.runId}`;
+		const exists = await this.host.repoExists(ref, identityOf(rc));
+		const start = exists && (await git(clone, ["rev-parse", "--verify", "-q", "refs/remotes/origin/HEAD"], { allowFail: true })).code === 0 ? "origin/HEAD" : "HEAD";
+		if (!existsSync(worktree)) {
+			mkdirSync(dirname(worktree), { recursive: true });
+			await git(clone, ["worktree", "prune"]);
+			await git(clone, ["worktree", "add", "-q", "-B", branch, worktree, start]);
+		}
+		const ws: Workspace = { repo: ref, path: worktree, baseRef: await gitOut(worktree, ["rev-parse", "HEAD"]), branch, newRepo: !exists };
+		writeFileSync(m, JSON.stringify(ws, null, 2));
+		return ws;
+	}
+
+	/**
+	 * The commit a bundle integrates on: `origin/<default>` after a fetch, or, for a repo that doesn't exist yet, the
+	 * clone's local `main`. Also says whether the repo exists now.
+	 */
+	integrationBase(ws: Workspace, rc: RunCtx): Promise<{ base: string; newRepo: boolean }> {
+		return withClone(cloneOf(workdirOf(rc), ws.repo), () => this.integrationBaseLocked(ws, rc));
+	}
+
+	private async integrationBaseLocked(ws: Workspace, rc: RunCtx): Promise<{ base: string; newRepo: boolean }> {
+		const host = this.host;
+		const id = identityOf(rc);
+		const exists = await host.repoExists(ws.repo, id);
+		if (!exists) return { base: await gitOut(ws.path, ["rev-parse", "refs/heads/main"]), newRepo: true };
+		const remotes = await gitOut(ws.path, ["remote"]);
+		if (!remotes.split("\n").includes("origin")) await git(ws.path, ["remote", "add", "origin", host.remoteUrl(ws.repo)]);
+		const def = await host.defaultBranch(ws.repo, id);
+		const fetched = await git(ws.path, ["fetch", "-q", "origin", "--prune"], { ...(await host.gitAuth(id)), allowFail: true });
+		if (fetched.code !== 0) throw new Error(`could not fetch ${ws.repo}: ${gitReason(fetched)}`);
+		return { base: await gitOut(ws.path, ["rev-parse", `refs/remotes/origin/${def}`]), newRepo: false };
+	}
+
+	/** Reset the bundle's branch to `base` with a clean tree (an unfinished merge is aborted; earlier integration commits are discarded). */
+	async integrateStart(ws: Workspace, base: string): Promise<void> {
+		await git(ws.path, ["merge", "--abort"], { allowFail: true });
+		await git(ws.path, ["checkout", "-q", "-f", "-B", ws.branch, base]);
+		await git(ws.path, ["reset", "-q", "--hard", base]);
+		await git(ws.path, ["clean", "-q", "-f", "-d"]);
+	}
+
+	/** Whether `branch`'s tip is already in HEAD (merged before a crash). */
+	async contains(ws: Workspace, branch: string): Promise<boolean> {
+		return (await git(ws.path, ["merge-base", "--is-ancestor", `refs/heads/${branch}`, "HEAD"], { allowFail: true })).code === 0;
+	}
+
+	/** The merge in progress in the worktree, if any, and its conflicted (unmerged) files. */
+	async mergeState(ws: Workspace): Promise<{ inProgress: boolean; conflicted: string[] }> {
+		const inProgress = (await git(ws.path, ["rev-parse", "-q", "--verify", "MERGE_HEAD"], { allowFail: true })).code === 0;
+		const conflicted = (await gitOut(ws.path, ["diff", "--name-only", "--diff-filter=U"])).split("\n").filter(Boolean);
+		return { inProgress, conflicted };
+	}
+
+	/**
+	 * `git merge --no-ff` of a member's local branch into the bundle's branch. On a conflict the conflicted merge is left
+	 * in the worktree for the integrator; any other failure throws.
+	 */
+	async mergeMember(ws: Workspace, branch: string, message: string): Promise<{ clean: true } | { clean: false; files: string[] }> {
+		if ((await git(ws.path, ["rev-parse", "--verify", "-q", `refs/heads/${branch}`], { allowFail: true })).code !== 0)
+			throw new Error(`branch ${branch} does not exist in the project's clone`);
+		const r = await git(ws.path, ["merge", "--no-ff", "--no-edit", "-m", message, `refs/heads/${branch}`], { allowFail: true });
+		if (r.code === 0) return { clean: true };
+		const st = await this.mergeState(ws);
+		if (!st.inProgress || st.conflicted.length === 0) throw new Error(`merging ${branch} failed: ${gitReason(r)}`);
+		return { clean: false, files: st.conflicted };
+	}
+
+	/** Conclude a merge whose conflicts are all resolved (the integrator staged but did not commit). */
+	async concludeMerge(ws: Workspace): Promise<void> {
+		await git(ws.path, ["add", "-A"]);
+		await git(ws.path, ["commit", "-q", "--no-edit"]);
+	}
+
+	/** The head of the repo's default branch on the remote right now (after a fetch). */
+	async defaultHead(ws: Workspace, rc: RunCtx): Promise<string> {
+		return (await this.integrationBase(ws, rc)).base;
+	}
+
+	/**
+	 * Deliver a bundle (bundles spec §2.2 DELIVERING). Existing repo: push `factory/<bundle-id>` and open or update one PR
+	 * (title and description rewritten). New repo: create it, commit docs/delivery-notes.md and push to `main`.
+	 */
+	async deliverBundle(ws: Workspace, ctx: BundleDeliveryContext, rc: RunCtx): Promise<Delivery> {
+		const host = this.host;
+		const id = identityOf(rc);
+		await this.commitAll(ws, "factory: commit uncommitted integrator changes");
+		const body = bundleReport(ctx, rc.runId);
+		if (ctx.mode === "push-main") {
+			await host.createRepo(ws.repo, { private: (rc.config.github?.visibility ?? "private") === "private" }, id);
+			const remotes = await gitOut(ws.path, ["remote"]);
+			if (!remotes.split("\n").includes("origin")) await git(ws.path, ["remote", "add", "origin", host.remoteUrl(ws.repo)]);
+			const note = join(ws.path, "docs", "delivery-notes.md");
+			mkdirSync(dirname(note), { recursive: true });
+			writeFileSync(note, `# Delivery notes\n\n${body}\n`);
+			await git(ws.path, ["add", "docs/delivery-notes.md"]);
+			if ((await git(ws.path, ["diff", "--cached", "--quiet"], { allowFail: true })).code !== 0) await git(ws.path, ["commit", "-q", "-m", "docs: delivery notes"]);
+			await git(ws.path, ["push", "-q", "origin", "HEAD:refs/heads/main"], await host.gitAuth(id));
+			return { kind: "repo", url: host.webUrl(ws.repo), ref: "main", sha: await gitOut(ws.path, ["rev-parse", "HEAD"]) };
+		}
+		const sha = await this.pushBranch(ws, rc);
+		const base = await host.defaultBranch(ws.repo, id);
+		const title = bundleTitle(ctx.members);
+		let pr = ctx.pr ? await host.getPr(ctx.pr.repo, ctx.pr.number, id).catch(() => undefined) : await host.findPr(ws.repo, ws.branch, id);
+		if (pr && pr.state === "open") await host.updatePr(ws.repo, pr.number, body, id, title);
+		else pr = await host.createPr(ws.repo, { head: ws.branch, base, title, body }, id);
+		return { kind: "pr", url: pr.url, ref: ws.branch, sha, pr: { repo: ws.repo, number: pr.number, url: pr.url } };
+	}
+
+	/** Rewrite an open PR's description (bundle membership changed). */
+	async describe(pr: PrRef, ctx: BundleDeliveryContext, rc: RunCtx): Promise<void> {
+		await this.host.updatePr(pr.repo, pr.number, bundleReport(ctx, rc.runId), identityOf(rc), bundleTitle(ctx.members));
+	}
+
+	async prState(pr: PrRef, rc: RunCtx): Promise<"open" | "closed" | "merged"> {
+		return (await this.host.getPr(pr.repo, pr.number, identityOf(rc))).state;
+	}
+
+	async closePr(pr: PrRef, rc: RunCtx): Promise<void> {
+		await this.host.closePr(pr.repo, pr.number, identityOf(rc));
+	}
+}
+
+/** What a bundle's PR description (or delivery note) is written from. */
+export interface BundleDeliveryContext {
+	mode: "push-main" | "pull-request";
+	/** The open PR to update, if the bundle has one. */
+	pr?: PrRef;
+	members: {
+		run: string;
+		title: string;
+		specPath: string;
+		specVersion?: number;
+		advisory: Finding[];
+		acceptedBlocking: Finding[];
+		qaStatus?: QaStatus;
+	}[];
+	integration: {
+		resolved: { run: string; files: string[] }[];
+		reviewRounds: number;
+		advisory: Finding[];
+		acceptedBlocking: Finding[];
+		qaStatus?: QaStatus;
+	};
+	noCi?: boolean;
+}
+
+/** The ticket's title for one member; otherwise "<N> tickets: <title 1>, <title 2>, …" (truncated). */
+export function bundleTitle(members: { title: string }[]): string {
+	if (members.length === 1) return members[0]!.title;
+	const full = `${members.length} tickets: ${members.map((m) => m.title).join(", ")}`;
+	return full.length > 120 ? `${full.slice(0, 119).trimEnd()}…` : full;
+}
+
+export function bundleReport(ctx: BundleDeliveryContext, bundleId: string): string {
+	const shots = [...ctx.members.flatMap((m) => [...m.advisory, ...m.acceptedBlocking]), ...ctx.integration.advisory, ...ctx.integration.acceptedBlocking].some((f) => f.screenshots?.length);
+	const lines = [
+		`Delivered by the software factory (bundle \`${bundleId}\`, ${ctx.members.length} ticket${ctx.members.length === 1 ? "" : "s"}).`,
+		"",
+	];
+	for (const m of ctx.members) {
+		lines.push(
+			`## Ticket: ${m.title}`,
+			"",
+			`Run \`${m.run}\`. The spec (v${m.specVersion ?? 1}) is in \`${m.specPath}\` and is the contract this ticket was built and reviewed against.`,
+			"",
+			...findingLines("Advisory findings (non-blocking)", m.advisory).map((l) => l.replace(/^## /, "### ")),
+			...findingLines("Open blocking findings accepted as is by a human", m.acceptedBlocking).map((l) => l.replace(/^## /, "### ")),
+			...(m.qaStatus ? [`**AQ testing (QA status):** ${QA_STATUS_TEXT[m.qaStatus] ?? m.qaStatus}.`, ""] : []),
+		);
+	}
+	const it = ctx.integration;
+	lines.push(
+		"## Integration",
+		"",
+		it.resolved.length
+			? `The integrator resolved merge conflicts: ${it.resolved.map((r) => `${r.run} (${r.files.join(", ")})`).join("; ")}.`
+			: "The tickets' branches merged cleanly on the default branch; no conflicts were resolved.",
+		"",
+		it.reviewRounds > 0 ? `The combined result was reviewed in ${it.reviewRounds} review round${it.reviewRounds === 1 ? "" : "s"} against every ticket's spec.` : "The combined result had no review of its own: the merge was clean and each ticket was reviewed on its own branch.",
+		"",
+		...findingLines("Advisory findings of the combined review", it.advisory).map((l) => l.replace(/^## /, "### ")),
+		...findingLines("Open blocking findings of the combined result accepted as is by a human", it.acceptedBlocking).map((l) => l.replace(/^## /, "### ")),
+		...(it.qaStatus ? [`**AQ testing of the combined result (QA status):** ${QA_STATUS_TEXT[it.qaStatus] ?? it.qaStatus}.`, ""] : []),
+		...(shots ? ["Screenshots cited by QA findings are in the factory's view; they are not committed or uploaded.", ""] : []),
+		...(ctx.noCi ? ["> No CI checks appeared within ci.noChecksTimeout: the repo has no CI, so CI did not run."] : []),
+	);
+	return lines.join("\n");
 }

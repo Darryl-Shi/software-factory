@@ -117,7 +117,7 @@ describe("screenshots", () => {
 		await t.factory.createProject("p", "me/p");
 		await t.factory.setSetting({ project: "p" }, "qa.enabled", true);
 		const run = await t.factory.startRun("p", { source: "t", title: "x", body: "x" });
-		await until(t.factory, run, inState("DELIVERED"));
+		await until(t.factory, run, inState("READY"));
 		const { port, token } = await serve();
 		const ok = await http(port, "GET", `/api/runs/${run}/screenshots/r1-s1`, { headers: { authorization: `Bearer ${token}` } });
 		expect(ok.status).toBe(200);
@@ -182,13 +182,21 @@ describe("operations and events", () => {
 			}
 		});
 		await t!.factory.setSetting({ project: "p" }, "policy.approvals", ["spec"]);
+		await t!.host.seedRepo("me/p", { "README.md": "# p\n" }); // an existing repo: the bundle opens a PR and waits for Merge
 		const run = JSON.parse((await op(port, token, "startRun", ["p", { source: "web", title: "hello", body: "make hello" }])).body).result as string;
 		const v = await until(t!.factory, run, inState("AWAITING_APPROVAL"));
 		expect((await op(port, token, "approve", [run, "spec"])).status).toBe(200);
+		await until(t!.factory, run, inState("READY"));
+		// ship it over HTTP and merge it: bundle events reach a project-filtered stream
+		const bundle = JSON.parse((await op(port, token, "createBundle", ["p", [run]])).body).result as string;
+		await t!.factory.waitForBundle(bundle, (b) => b.state === "AWAITING_MERGE" && !!b.pendingAsk);
+		expect((await op(port, token, "mergeBundle", [bundle])).status).toBe(200);
 		await until(t!.factory, run, inState("DELIVERED"));
 		await new Promise((r) => setTimeout(r, 200));
 		stream.destroy();
-		expect(events.filter((e) => e.type === "run.state").map((e: any) => e.to)).toContain("DELIVERED");
+		expect(events.filter((e) => e.type === "run.state").map((e: any) => e.to)).toEqual(expect.arrayContaining(["READY", "DELIVERED"]));
+		expect(events.filter((e) => e.type === "bundle.state").map((e: any) => e.to)).toEqual(expect.arrayContaining(["DELIVERING", "AWAITING_MERGE", "MERGED"]));
+		expect(events).toContainEqual(expect.objectContaining({ type: "bundle.askResolved", bundle, by: "web" }));
 		expect(events).toContainEqual(expect.objectContaining({ type: "run.ask", run, ask: v.pendingAsk!.id }));
 		expect(events).toContainEqual(expect.objectContaining({ type: "run.askResolved", run, by: "web" }));
 	});
@@ -254,14 +262,15 @@ describe("static UI", () => {
 		const html = readFileSync(join(UI, "index.html"), "utf8");
 		expect(html).toContain('href="/app.css"');
 		const disc = readFileSync(join(UI, "discussions.js"), "utf8");
-		// a classic script after app.js: it shares app.js's globals and parses in the same global scope
-		expect(() => new Script(`${js}\n;${disc}`, { filename: "app.js+discussions.js" })).not.toThrow();
-		expect([...html.matchAll(/<script\b[^>]*>/g)].map((m) => m[0])).toEqual(['<script src="/app.js" defer>', '<script src="/discussions.js" defer>']);
+		const bundles = readFileSync(join(UI, "bundles.js"), "utf8");
+		// classic scripts after app.js: they share app.js's globals and parse in the same global scope
+		expect(() => new Script(`${js}\n;${disc}\n;${bundles}`, { filename: "app.js+discussions.js+bundles.js" })).not.toThrow();
+		expect([...html.matchAll(/<script\b[^>]*>/g)].map((m) => m[0])).toEqual(['<script src="/app.js" defer>', '<script src="/discussions.js" defer>', '<script src="/bundles.js" defer>']);
 		expect(html).toContain('data-view="discussions"');
 		expect(html).not.toMatch(/https?:\/\//);
 		expect(readFileSync(join(UI, "app.css"), "utf8")).not.toMatch(/@import|url\(https?:/);
 		// every operation the UI calls is one the server allows
-		const used = new Set([...`${js}\n${disc}`.matchAll(/core\.([a-zA-Z]+)\(/g)].map((m) => m[1]!));
+		const used = new Set([...`${js}\n${disc}\n${bundles}`.matchAll(/core\.([a-zA-Z]+)\(/g)].map((m) => m[1]!));
 		used.delete("subscribe");
 		const server = readFileSync(join(import.meta.dirname, "../src/core/types.ts"), "utf8");
 		for (const name of used) expect(server).toContain(`"${name}",`);
@@ -275,5 +284,84 @@ describe("static UI", () => {
 		expect(js.headers["content-type"]).toMatch(/^text\/javascript/);
 		expect(() => new Function(js.body)).not.toThrow();
 		expect((await get("/")).body).toMatch(/<script src="\/discussions\.js" defer><\/script>/);
+	});
+
+	test("bundles.js is served, parses, and is loaded by index.html", async () => {
+		const { port, token } = await serve();
+		const get = (path: string) => http(port, "GET", path, { headers: { authorization: `Bearer ${token}` } });
+		const js = await get("/bundles.js");
+		expect(js.status).toBe(200);
+		expect(js.headers["content-type"]).toMatch(/^text\/javascript/);
+		expect(() => new Function(js.body)).not.toThrow();
+		expect((await get("/")).body).toMatch(/<script src="\/bundles\.js" defer><\/script>/);
+		expect((await http(port, "GET", "/bundles.js")).status).toBe(401);
+	});
+
+	test("the board and the bundle view call the bundle operations", () => {
+		const ui = ["app.js", "bundles.js"].map((f) => readFileSync(join(UI, f), "utf8")).join("\n");
+		for (const name of ["createBundle", "getBundle", "listBundles", "getBundleConversation", "mergeBundle", "requestBundleChanges", "dropFromBundle", "resolveBundleEscalation", "cancelBundle", "retryBundle", "messageBundle"])
+			expect(ui).toContain(`core.${name}(`);
+		expect(ui).toContain("#bundle=");
+		expect(ui).not.toMatch(/\son[a-z]+="/); // no inline event handlers (CSP)
+	});
+});
+
+/** A core stub: only what the bundle routes use, recording the calls. */
+function fakeCore() {
+	const calls: { op: string; args: unknown[] }[] = [];
+	const subs: { filter: Record<string, string>; on: (e: FactoryEvent) => void }[] = [];
+	const core = {
+		async getBundleScreenshot(id: string, sid: string) {
+			calls.push({ op: "getBundleScreenshot", args: [id, sid] });
+			if (sid !== "r1-s1") throw Object.assign(new Error(`no screenshot ${sid}`), { code: "not_found" });
+			return { mime: "image/png", bytes: new Uint8Array([0x89, 0x50, 0x4e, 0x47]) };
+		},
+		async getScreenshot() {
+			throw new Error("not the run route");
+		},
+		subscribe(filter: Record<string, string>, on: (e: FactoryEvent) => void) {
+			const s = { filter, on };
+			subs.push(s);
+			return () => void subs.splice(subs.indexOf(s), 1);
+		},
+	};
+	return { core, calls, subs };
+}
+
+describe("bundles", () => {
+	test("a bundle's QA screenshot is served at /api/bundles/<id>/screenshots/<sid> behind the token", async () => {
+		const f = fakeCore();
+		const { url, stop } = await startWebServer(f.core as any, { host: "127.0.0.1", port: 0 });
+		stops.push(stop);
+		const u = new URL(url), port = Number(u.port), token = u.searchParams.get("token") ?? "";
+		const auth = { authorization: `Bearer ${token}` };
+		expect((await http(port, "GET", "/api/bundles/bundle-1/screenshots/r1-s1")).status).toBe(401);
+		expect(f.calls).toEqual([]);
+		const ok = await http(port, "GET", "/api/bundles/bundle-1/screenshots/r1-s1", { headers: auth });
+		expect(ok.status).toBe(200);
+		expect(ok.headers["content-type"]).toBe("image/png");
+		expect(ok.headers["x-content-type-options"]).toBe("nosniff");
+		expect(f.calls).toEqual([{ op: "getBundleScreenshot", args: ["bundle-1", "r1-s1"] }]);
+		const missing = await http(port, "GET", "/api/bundles/bundle-1/screenshots/r9-s9", { headers: auth });
+		expect(missing.status).toBe(404);
+		expect(JSON.parse(missing.body)).toMatchObject({ ok: false, code: "not_found" });
+		expect((await http(port, "GET", "/api/bundles/bundle-1/screenshots/..%2Fx", { headers: auth })).status).toBe(404);
+		expect(f.calls).toHaveLength(2);
+	});
+
+	test("the event stream passes a `bundle` filter to core.subscribe", async () => {
+		const f = fakeCore();
+		const { url, stop } = await startWebServer(f.core as any, { host: "127.0.0.1", port: 0 });
+		stops.push(stop);
+		const u = new URL(url), port = Number(u.port), token = u.searchParams.get("token") ?? "";
+		const es = await sse(port, token, "bundle=bundle-2&project=p");
+		await waitFor(() => f.subs.length === 1);
+		expect(f.subs[0]!.filter).toEqual({ bundle: "bundle-2", project: "p" });
+		const e: FactoryEvent = { type: "bundle.state", bundle: "bundle-2", project: "p", from: "INTEGRATING", to: "DELIVERING", round: 1 };
+		f.subs[0]!.on(e);
+		await waitFor(() => es.got.length === 1);
+		expect(es.got[0]).toEqual(e);
+		es.stream.destroy();
+		await waitFor(() => f.subs.length === 0);
 	});
 });

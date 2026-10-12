@@ -1,10 +1,10 @@
 // Messages to the agent a run is with (`message`, spec §3.6): routing, holds, steers, side turns, spec revision at
 // the gate, re-review of changes made after a message, cost of message turns, and the policy switch.
 import { afterEach, describe, expect, test } from "vitest";
-import { messageTarget } from "../src/core/messages.ts";
+import { messageContent, messageTarget } from "../src/core/messages.ts";
 import type { FactoryCore, FactoryEvent, RunView } from "../src/core/types.ts";
 import { git } from "../src/github/git.ts";
-import { inState, makeFactory, type TestEnv, until } from "./helpers.ts";
+import { inState, makeFactory, shipAndMerge, type TestEnv, until } from "./helpers.ts";
 
 let t: TestEnv | undefined;
 afterEach(async () => {
@@ -12,7 +12,8 @@ afterEach(async () => {
 	t = undefined;
 });
 
-const done = inState("DELIVERED", "FAILED", "CANCELLED");
+// a run that passes review stops at READY (bundles spec §1.1): the end of the line for a run on its own
+const done = inState("READY", "DELIVERED", "FAILED", "CANCELLED");
 const states = (v: RunView) => v.history.map((h) => h.to);
 
 async function setup(settings: [string, unknown][] = []) {
@@ -53,10 +54,11 @@ describe("routing and validation", () => {
 		expect(at("REVIEWING", undefined, 3)).toEqual({ role: "reviewer", conversationId: "r2" });
 		expect(at("AWAITING_APPROVAL", "delivery")).toEqual({ role: "builder", conversationId: "b" });
 		expect(at("ESCALATED")).toEqual({ role: "builder", conversationId: "b" });
+		expect(at("READY")).toEqual({ role: "builder", conversationId: "b" });
 		expect(messageTarget({ state: "PREPARING", conversations: { reviewers: [] }, counters: { reviewSeq: 0 } } as never)).toEqual({ role: "architect" });
 		// the QA agent and the builder's helpers never take messages: while reviewing, a message goes to the reviewer
 		const withQa = { ...conversations, qa: [{ id: "q1", seq: 1 }] };
-		for (const state of ["REVIEWING", "BUILDING", "AWAITING_APPROVAL", "ESCALATED", "DELIVERING", "AWAITING_CI"])
+		for (const state of ["REVIEWING", "BUILDING", "AWAITING_APPROVAL", "ESCALATED", "DELIVERING", "AWAITING_CI", "READY"])
 			expect(messageTarget({ state, gate: "delivery", conversations: withQa, counters: { reviewSeq: 1 } } as never).role).not.toMatch(/^(qa|helper)$/);
 		expect(messageTarget({ state: "REVIEWING", conversations: withQa, counters: { reviewSeq: 1 } } as never)).toEqual({ role: "reviewer", conversationId: "r1" });
 	});
@@ -108,7 +110,9 @@ describe("at the spec gate", () => {
 		expect(events.filter((e) => e.type === "run.message").map((e: any) => e.message.id)).toContain(out.message);
 		// the run still moves on the human's decision
 		await web.approve(run, "spec");
-		expect(states(await until(t!.factory, run, done))).toContain("DELIVERED");
+		const end = await until(t!.factory, run, done);
+		expect(end.state).toBe("READY");
+		expect(states(end)).toContain("BUILDING");
 	});
 
 	test("a change request makes the architect revise the spec: v2 replaces the pending version and needs approval", async () => {
@@ -127,7 +131,8 @@ describe("at the spec gate", () => {
 		// the old ask is closed: approving it is refused only by gate state, the new one approves
 		await web.approve(run, "spec");
 		const end = await until(t!.factory, run, done);
-		expect(end.state).toBe("DELIVERED");
+		expect(end.state).toBe("READY");
+		expect(end.artifacts.spec!.version).toBe(2);
 	});
 });
 
@@ -142,7 +147,7 @@ describe("while agents work", () => {
 		expect(out).toMatchObject({ to: "builder", conversationId: String(v.conversations.builder) });
 		t!.control.builderHang = false;
 		const end = await until(t!.factory, run, done);
-		expect(end.state).toBe("DELIVERED");
+		expect(end.state).toBe("READY");
 		const tv = await t!.factory.getConversation(run, v.conversations.builder!);
 		expect(tv.items.some((x) => x.author === "human" && x.text === "keep functions small")).toBe(true);
 		expect(t!.control.builderInputs).toHaveLength(1);
@@ -176,8 +181,37 @@ describe("while agents work", () => {
 		expect(again.notices.some((n) => /changed after the last review/.test(n.text))).toBe(true);
 		expect(states(again).slice(-3)).toEqual(["DELIVERING", "REVIEWING", "AWAITING_APPROVAL"]);
 		await web.approve(run, "delivery");
-		const end = await until(t!.factory, run, done);
+		const ready = await until(t!.factory, run, done);
+		expect(ready.state).toBe("READY");
+		expect(states(ready).slice(-2)).toEqual(["DELIVERING", "READY"]);
+		// the reviewed change is what ships
+		const end = await shipAndMerge(t!.factory, run);
 		expect(end.state).toBe("DELIVERED");
 		expect(await remoteFileText("me/p", "main", "CHANGELOG.md")).toBe("add a CHANGELOG\n");
+	});
+});
+
+describe("in Ready", () => {
+	test("a message to a Ready run (in no bundle) goes to its builder with a note that the work is Ready; a reply that changes nothing keeps it Ready", async () => {
+		const { web } = await setup();
+		const run = await start();
+		const ready = await until(t!.factory, run, done);
+		expect(ready.state).toBe("READY");
+		const out = await web.message(run, "what did you build?");
+		expect(out).toMatchObject({ to: "builder", conversationId: String(ready.conversations.builder) });
+		await transcript(run, ready.conversations.builder!, repliedAfter(out.message));
+		expect(t!.control.messagesSeen).toContain("builder:what did you build?");
+		// the builder's note on where the run is: Ready, waiting for a bundle
+		const v = await until(t!.factory, run, (x) => x.messages.some((m) => m.id === out.message && m.conversationId !== undefined));
+		const note = messageContent(v as never, v.messages.find((m) => m.id === out.message)!)[0]!.text;
+		expect(note).toMatch(/\[Message from the human via web · /);
+		expect(note).toMatch(/Ready: it waits to be shipped in a bundle/);
+		expect(note).toMatch(/do not call report_done/);
+		// no change: no review, the run stays Ready
+		await new Promise((r) => setTimeout(r, 1500));
+		const after = await t!.factory.getRun(run);
+		expect(after.state).toBe("READY");
+		expect(after.conversations.reviewers.length).toBe(ready.conversations.reviewers.length);
+		expect(states(after)).toEqual(states(ready));
 	});
 });

@@ -5,14 +5,15 @@ import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import { git } from "../src/github/git.ts";
 import type { RunView } from "../src/core/types.ts";
-import { inState, makeFactory, type TestEnv, until } from "./helpers.ts";
+import { inState, makeFactory, shipAndMerge, type TestEnv, until, untilBundle } from "./helpers.ts";
 
 let t: TestEnv | undefined;
 afterEach(async () => {
 	await t?.factory.close().catch(() => {});
 	t = undefined;
 });
-const done = inState("DELIVERED", "FAILED", "CANCELLED", "ESCALATED");
+// a run that passes review stops at READY (bundles spec §1.1); it is DELIVERED only once a bundle with it merges
+const done = inState("READY", "DELIVERED", "FAILED", "CANCELLED", "ESCALATED");
 const states = (v: RunView) => v.history.map((h) => h.to);
 
 async function setup(settings: [string, unknown][] = [], opts: { runScript?: boolean } = { runScript: true }) {
@@ -30,7 +31,11 @@ describe("AQ testing runs beside the review", () => {
 	test("QA ran: a VM per round with the product running, a screenshot as evidence, VM deleted after, status in the delivery note", async () => {
 		await setup();
 		const run = await start();
-		const v = await until(t!.factory, run, done);
+		const ready = await until(t!.factory, run, done);
+		expect(ready.state).toBe("READY");
+		expect(ready.qaStatus).toBe("ran");
+		// shipped alone (a bundle of one, new repo: pushed to main with the bundle's delivery notes)
+		const v = await shipAndMerge(t!.factory, run);
 		expect(v.state).toBe("DELIVERED");
 		expect(v.reviews).toHaveLength(1);
 		expect(v.reviews[0]).toMatchObject({ seq: 1, round: 1, qaStatus: "ran", submitted: { review: true, qa: true }, screenshots: ["r1-s1"] });
@@ -51,10 +56,16 @@ describe("AQ testing runs beside the review", () => {
 		expect(Buffer.from(shot.bytes).subarray(1, 4).toString()).toBe("PNG");
 		await expect(t!.factory.getScreenshot(run, "../x")).rejects.toThrow(/invalid screenshot id/);
 		await expect(t!.factory.getScreenshot(run, "r9-s9")).rejects.toThrow(/no screenshot/);
+		// the bundle's delivery notes: the run's ticket section carries its advisory QA finding and its QA status
 		const notes = (await git(t!.host.bare("me/p"), ["show", "main:docs/delivery-notes.md"])).stdout;
-		expect(notes).toMatch(/QA status.*ran/);
-		expect(notes).toContain("the font is small");
-		expect(notes).toMatch(/run view/);
+		const ticket = notes.slice(notes.indexOf("## Ticket: hello"), notes.indexOf("## Integration"));
+		expect(notes.indexOf("## Ticket: hello")).toBeGreaterThanOrEqual(0);
+		expect(notes.indexOf("## Integration")).toBeGreaterThan(notes.indexOf("## Ticket: hello"));
+		expect(ticket).toContain(run);
+		expect(ticket).toContain(v.specPath);
+		expect(ticket).toMatch(/QA status.*ran/);
+		expect(ticket).toContain("the font is small");
+		expect(ticket).toMatch(/r1-s1.*run view/);
 		const tree = (await git(t!.host.bare("me/p"), ["ls-tree", "-r", "--name-only", "main"])).stdout;
 		expect(tree).not.toMatch(/\.png/);
 		expect(v.notices.at(-1)).toMatchObject({ final: true, qaStatus: "ran" });
@@ -73,8 +84,8 @@ describe("AQ testing runs beside the review", () => {
 		t!.control.qa = ["fail", "pass"];
 		const run = await start();
 		const v = await until(t!.factory, run, done);
-		expect(v.state).toBe("DELIVERED");
-		expect(states(v)).toEqual(["RECEIVED", "PREPARING", "DISCUSSING", "SPEC_READY", "BUILDING", "REVIEWING", "BUILDING", "REVIEWING", "DELIVERING", "AWAITING_CI", "DELIVERED"]);
+		expect(v.state).toBe("READY");
+		expect(states(v)).toEqual(["RECEIVED", "PREPARING", "DISCUSSING", "SPEC_READY", "BUILDING", "REVIEWING", "BUILDING", "REVIEWING", "DELIVERING", "READY"]);
 		expect(v.reviewRound).toBe(2);
 		expect(v.findingsLog.map((e) => [e.kind, e.reviewSeq])).toEqual([["review", 1], ["qa", 1], ["review", 2], ["qa", 2]]);
 		const qaFinding = v.findingsLog[1]!.findings[0]!;
@@ -99,7 +110,7 @@ describe("AQ testing runs beside the review", () => {
 		t!.control.qa = ["no-screenshot-then-pass"];
 		const run = await start();
 		const v = await until(t!.factory, run, done);
-		expect(v.state).toBe("DELIVERED");
+		expect(v.state).toBe("READY");
 		const tr = await t!.factory.getConversation(run, v.conversations.qa[0]!.id);
 		const results = tr.items.filter((i) => i.toolResult?.name === "submit_qa").map((i) => i.toolResult!);
 		expect(results.map((r) => r.isError)).toEqual([true, false]);
@@ -111,7 +122,7 @@ describe("QA status", () => {
 	test("skipped: QA on but nothing to launch (no run script); the round is the review alone, no VM", async () => {
 		await setup([], { runScript: false });
 		const v = await until(t!.factory, await start(), done);
-		expect(v.state).toBe("DELIVERED");
+		expect(v.state).toBe("READY");
 		expect(v.reviews[0]!.qaStatus).toBe("skipped");
 		expect(v.conversations.qa).toEqual([]);
 		expect(t!.boat.state().calls).toEqual([]);
@@ -119,23 +130,29 @@ describe("QA status", () => {
 
 	test("off: qa.enabled false for the project; no VM, no QA Conversation, and no boat key needed", async () => {
 		await setup([["qa.enabled", false], ["boat.apiKey", "env:SF_NO_SUCH_KEY"]]);
-		const v = await until(t!.factory, await start(), done);
+		const run = await start();
+		expect((await until(t!.factory, run, done)).state).toBe("READY");
+		const v = await shipAndMerge(t!.factory, run);
 		expect(v.state).toBe("DELIVERED");
 		expect(v.reviews[0]!.qaStatus).toBe("off");
 		expect(t!.boat.state().calls).toEqual([]);
-		expect(v.notices.at(-1)!.qaStatus).toBe("off");
+		expect(v.notices.at(-1)).toMatchObject({ final: true, qaStatus: "off" });
+		const notes = (await git(t!.host.bare("me/p"), ["show", "main:docs/delivery-notes.md"])).stdout;
+		expect(notes.slice(notes.indexOf("## Ticket: hello"), notes.indexOf("## Integration"))).toMatch(/QA status.*off/);
 	});
 
 	test("unavailable: boat cannot provide a VM after retries; the run neither fails nor escalates and says so", async () => {
 		await setup();
 		const { writeFileSync } = await import("node:fs");
 		writeFileSync(join(t!.dir, "boat", "fail-create"), "");
-		const v = await until(t!.factory, await start(), done);
+		const run = await start();
+		expect((await until(t!.factory, run, done)).state).toBe("READY");
+		const v = await shipAndMerge(t!.factory, run);
 		expect(v.state).toBe("DELIVERED");
 		expect(v.reviews[0]!.qaStatus).toBe("unavailable");
 		expect(v.notices.some((n) => /AQ testing unavailable/.test(n.text))).toBe(true);
 		const notes = (await git(t!.host.bare("me/p"), ["show", "main:docs/delivery-notes.md"])).stdout;
-		expect(notes).toMatch(/QA status.*unavailable/);
+		expect(notes.slice(notes.indexOf("## Ticket: hello"), notes.indexOf("## Integration"))).toMatch(/QA status.*unavailable/);
 	});
 
 	test("QA on and the boat key does not resolve: the run fails at PREPARING, naming both fixes", async () => {
@@ -166,7 +183,7 @@ describe("VM lifecycle", () => {
 	test("startup sweep: VMs named for a run that is not in REVIEWING for that round are deleted", async () => {
 		await setup();
 		const run = await start();
-		await until(t!.factory, run, done);
+		expect((await until(t!.factory, run, done)).state).toBe("READY");
 		// an orphan of a crash: a VM named for that run's round 1, left behind
 		await t!.boat.create({ name: `factory-${run}-1`, idempotencyKey: "orphan", size: "default", ttlSeconds: 60 });
 		await t!.boat.create({ name: "someone-else", idempotencyKey: "other", size: "default", ttlSeconds: 60 });
@@ -191,7 +208,7 @@ describe("VM lifecycle", () => {
 		expect(out).toContain("still-here");
 		expect(t!.boat.state().calls.some((c) => c.op === "resume" && c.id === id)).toBe(true);
 		t!.control.qaHang = false;
-		expect((await until(t!.factory, run, done)).state).toBe("DELIVERED");
+		expect((await until(t!.factory, run, done)).state).toBe("READY");
 	});
 });
 
@@ -199,6 +216,63 @@ test("screenshots live under the artifacts dir, outside the worktree", async () 
 	await setup();
 	const run = await start();
 	const v = await until(t!.factory, run, done);
+	expect(v.state).toBe("READY");
 	expect(existsSync(join(t!.dir, "state", "artifacts", run, "screenshots", "r1-s1.png"))).toBe(true);
 	expect(existsSync(join(v.workspace!.path, "r1-s1.png"))).toBe(false);
+});
+
+describe("AQ testing of a bundle", () => {
+	test("an integration the integrator had to resolve gets a bundle review round with a QA agent in a VM named for the bundle; its screenshots are the bundle's; the VM is deleted after; qaStatus ran", async () => {
+		t = await makeFactory();
+		// two tickets writing shared.txt conflict when bundled. The run script comes with the repo (the scripted builder
+		// writes shared.txt or scripts/run.sh in its first round, not both), so AQ testing applies to the runs and the bundle.
+		t.control.sharedFile = true;
+		await t.host.seedRepo("me/p", { "README.md": "# p\n", "AGENTS.md": "Test: true\n", "scripts/run.sh": "echo product up\nsleep 60\n" });
+		await t.factory.createProject("p", "me/p");
+		await t.factory.setSetting({ project: "p" }, "qa.enabled", true);
+		const a = await t.factory.startRun("p", { source: "test", title: "alpha", body: "make alpha" });
+		const b = await t.factory.startRun("p", { source: "test", title: "beta", body: "make beta" });
+		const [ra, rb] = await Promise.all([until(t.factory, a, done), until(t.factory, b, done)]);
+		expect([ra.state, rb.state]).toEqual(["READY", "READY"]);
+		expect(ra.qaStatus).toBe("ran");
+		const qaBefore = t.control.qaInputs.length;
+		const id = await t.factory.createBundle("p", [a, b]);
+		expect(id).toBe("bundle-1");
+		const v = await untilBundle(t.factory, id, (x) => (x.state === "AWAITING_MERGE" && !!x.pendingAsk) || ["MERGED", "FAILED", "CANCELLED", "ESCALATED"].includes(x.state));
+		expect(v.state).toBe("AWAITING_MERGE");
+		expect(v.history.map((h) => h.to)).toEqual(["INTEGRATING", "REVIEWING", "DELIVERING", "AWAITING_CI", "AWAITING_MERGE"]);
+		expect(v.integration?.resolved).toEqual([{ run: b, files: ["shared.txt"] }]);
+		// one bundle review round, with a QA agent beside the reviewer
+		expect(v.reviews).toHaveLength(1);
+		expect(v.reviews[0]).toMatchObject({ seq: 1, round: 1, qaStatus: "ran", submitted: { review: true, qa: true } });
+		expect(v.qaStatus).toBe("ran");
+		expect(v.conversations.qa).toHaveLength(1);
+		expect(t.control.qaInputs.length).toBe(qaBefore + 1);
+		const qaInput = t.control.qaInputs.at(-1)!;
+		expect(qaInput).toContain(id);
+		expect(qaInput).toContain("product up");
+		// its VM: named for the bundle and the review, created with noEnv, deleted after
+		const created = t.boat.state().calls.filter((c) => c.op === "create").find((c) => /^factory-bundle-1-\d+$/.test(String((c.detail as any)?.name)))!;
+		expect(created).toBeDefined();
+		expect(created.detail).toMatchObject({ name: `factory-${id}-1`, noEnv: true });
+		expect(t.boat.state().calls.some((c) => c.op === "delete" && c.id === created.id)).toBe(true);
+		expect(liveVms()).toEqual([]);
+		expect(v.reviews[0]!.vm).toMatchObject({ name: `factory-${id}-1`, state: "disposed" });
+		// its screenshots are the bundle's artifacts
+		const shots = v.reviews[0]!.screenshots;
+		expect(shots).toEqual(["r1-s1"]);
+		const shot = await t.factory.getBundleScreenshot(id, shots[0]!);
+		expect(shot.mime).toBe("image/png");
+		expect(Buffer.from(shot.bytes).subarray(1, 4).toString()).toBe("PNG");
+		expect(existsSync(join(t.dir, "state", "artifacts", id, "screenshots", "r1-s1.png"))).toBe(true);
+		await expect(t.factory.getBundleScreenshot(id, "../x")).rejects.toThrow(/invalid screenshot id/);
+		await expect(t.factory.getBundleScreenshot(id, "r9-s9")).rejects.toThrow(/no screenshot/);
+		// the PR's integration section gives the bundle's QA status; each ticket section its run's
+		const body = t.host.state().prs[0]!.body;
+		const integration = body.slice(body.indexOf("## Integration"));
+		expect(integration).toMatch(/combined result \(QA status\):\*\* ran/);
+		expect(body.slice(body.indexOf("## Ticket: alpha"), body.indexOf("## Ticket: beta"))).toMatch(/QA status.*ran/);
+		const tree = (await git(t.host.bare("me/p"), ["ls-tree", "-r", "--name-only", `factory/${id}`])).stdout;
+		expect(tree).not.toMatch(/\.png/);
+	});
 });

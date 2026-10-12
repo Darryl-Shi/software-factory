@@ -4,7 +4,9 @@
 // helper that writes the QA run script); the reviewer really runs the test suite and the acceptance behaviours and
 // reports evidence it observed; the QA agent uses the product in the (fake) boat.dev VM and cites screenshots.
 // Round 1 of a new todo build deliberately ships without `remove`, so the first review fails for a real reason.
-// Before all that, the discussant talks the todo CLI through with the human and drafts the first ticket.
+// Before all that, the discussant talks the todo CLI through with the human and drafts the first ticket. When Ready
+// tickets ship as a bundle, the integrator resolves merge conflicts between them (keeping every ticket's lines) and
+// addresses findings on the combined result.
 import { call, calls, humanText, type Script, type ScriptContext, say } from "./scripted.ts";
 
 const delay = Number(process.env.DRYRUN_TURN_DELAY_MS ?? 0);
@@ -72,7 +74,7 @@ A small command-line tool to keep a todo list, stored in a JSON file (see AGENTS
 const GENERIC_SPEC = (title: string) => `# todo — change: ${title}
 
 ## Context
-The existing todo CLI (see docs/spec.md history and AGENTS.md) is unchanged except for this request.
+The existing todo CLI (see the earlier tickets' specs in docs/specs/ and AGENTS.md) is unchanged except for this request.
 
 ## Change
 ${title}. Documented in README.md and covered by a test.
@@ -108,7 +110,8 @@ export const architect: Script = async (ctx) => {
 	// incremental
 	const title = /Title: (.*)/.exec(req)?.[1] ?? "change";
 	if (/due date/i.test(req)) {
-		if (answers.length === 0) return slow(call("read", { path: "docs/spec.md" }));
+		// each ticket's spec is committed at docs/specs/<run-id>.md (there is no product docs/spec.md in this repo)
+		if (answers.length === 0) return slow(call("bash", { command: "ls docs/specs && cat docs/specs/*.md" }));
 		return slow(call("submit_spec", { markdown: DUE_SPEC }));
 	}
 	return slow(call("submit_spec", { markdown: GENERIC_SPEC(title) }));
@@ -347,7 +350,7 @@ ${extra.map((e) => `\n${e}\n`).join("")}`;
 
 const AGENTS = (ci: boolean) => `# AGENTS.md — repo map
 
-- Spec (the contract): docs/spec.md
+- Specs (each ticket's contract): docs/specs/<run-id>.md
 - Setup: scripts/setup.sh
 - Test: npm test
 - Run: node bin/todo.js <add|list|done|remove> ...
@@ -356,7 +359,7 @@ const AGENTS = (ci: boolean) => `# AGENTS.md — repo map
 - bin/todo.js — CLI entry point (argument parsing, output, exit codes)
 - src/todo.js — list logic, JSON load/save (atomic write)
 - test/ — node:test suites (unit + CLI)
-- docs/ — spec and delivery notes
+- docs/ — the tickets' specs (docs/specs/) and delivery notes
 - PROGRESS.md — builder's notes
 ${ci ? "- .github/workflows/ci.yml — CI: runs npm test on push and PRs\n" : ""}`;
 
@@ -502,7 +505,8 @@ export const qa: Script = async (ctx) => {
 function reviewer(strict: boolean): Script {
 	return async (ctx) => {
 		const spec = first(ctx);
-		const base = /Diff against base ([0-9a-f]{7,40})/.exec(spec)?.[1] ?? "HEAD~1";
+		// a run's review names its base; a bundle's review names the integration base (the default branch)
+		const base = /(?:Diff against base|Combined diff against the integration base) ([0-9a-f]{7,40})/.exec(spec)?.[1] ?? "HEAD~1";
 		const due = /--overdue/.test(spec) && /due/.test(spec);
 		const t = ctx.turn;
 		const acceptance = due
@@ -595,11 +599,45 @@ discussant.onMessage = (ctx) => {
 	return slow(say(side.turn === 0 ? `Noted: ${text.split("\n")[0]}` : "Done."));
 };
 
+// ------------------------------------------------------------------ integrator (bundles)
+// On "# Merge conflict" it resolves every conflicted file by keeping both sides' lines (the tickets in this trial
+// append to the same files: README's change log, PROGRESS.md), runs the tests, concludes the merge with
+// `git commit --no-edit` and reports. On findings (a human's Request changes, a review, CI) it writes what was asked
+// (AGENTS.md when the finding names it, else CHANGELOG.md), runs the tests, commits and answers every blocking one.
+const RESOLVE = [
+	'files=$(git diff --name-only --diff-filter=U); echo "conflicted: $(echo $files)"',
+	'for f in $files; do sed -i.orig -e "/^<<<<<<< /d" -e "/^=======$/d" -e "/^>>>>>>> /d" "$f" && rm -f "$f.orig"; done',
+	'echo "markers left: $(grep -l "^<<<<<<<" $files 2>/dev/null | wc -l | tr -d " ")"',
+].join("; ");
+
+export const integrator: Script = async (ctx) => {
+	const t = ctx.turn;
+	if (ctx.input.includes("# Merge conflict")) {
+		if (t === 0) return slow(call("bash", { command: RESOLVE }));
+		if (t === 1) return slow(call("bash", { command: "npm test 2>&1 | tail -5; echo TEST-EXIT=${PIPESTATUS[0]}" }));
+		if (t === 2) return slow(call("bash", { command: "git add -A && git commit -q --no-edit && git log --oneline -1 && git status --short | wc -l" }));
+		const files = /conflicted: (.*)/.exec(ctx.results[0]?.text ?? "")?.[1]?.trim() ?? "the conflicted files";
+		const tests = /TEST-EXIT=0/.test(ctx.results[1]?.text ?? "") ? "npm test passes on the combined result" : "npm test FAILS on the combined result";
+		return slow(call("report_done", { summary: `Resolved the conflict in ${files} by keeping both tickets' lines; concluded the merge. ${tests}.`, responses: [] }));
+	}
+	const ids = [...ctx.input.matchAll(/\[(F\d+)\] \([a-z]+, BLOCKING/g)].map((m) => m[1]!);
+	if (t === 0) {
+		const asked = [...ctx.input.matchAll(/^- \[F\d+\] \([a-z]+, BLOCKING[^\n]*\n {2}(.+)$/gm)].map((m) => m[1]!);
+		const agents = asked.some((a) => /AGENTS\.md/.test(a));
+		const line = agents && asked.some((a) => /--version/.test(a)) ? "- --version: prints the package version (node bin/todo.js --version)" : asked.map((a) => `- ${a}`).join("\n");
+		return slow(call("bash", { command: `printf '%s\\n' ${JSON.stringify(line)} >> ${agents ? "AGENTS.md" : "CHANGELOG.md"} && echo ok` }));
+	}
+	if (t === 1) return slow(call("bash", { command: "npm test 2>&1 | tail -5" }));
+	if (t === 2) return slow(call("bash", { command: `git add -A && git commit -qm ${JSON.stringify(`fix: address findings on the bundle (${ids.join(", ")})`)} && git log --oneline -1` }));
+	return slow(call("report_done", { summary: `Addressed ${ids.length} finding(s) on the combined result.`, responses: ids.map((findingId) => ({ findingId, status: "fixed" })) }));
+};
+
 export const DRY_RUN_SCRIPTS: Record<string, Script> = {
 	architect,
 	discussant,
 	builder,
 	helper,
+	integrator,
 	qa,
 	reviewer: reviewer(false),
 	"reviewer-strict": reviewer(true),

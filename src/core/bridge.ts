@@ -48,6 +48,7 @@ export const ScreenshotsDoc = defineDoc<{ ids: string[] }>({
 export const ROLE_TOOLS: Record<Role, BridgeTool[]> = {
 	architect: ["ask_human", "submit_spec"],
 	builder: ["report_done"],
+	integrator: ["report_done"],
 	reviewer: ["submit_review"],
 	qa: ["submit_qa"],
 	helper: [],
