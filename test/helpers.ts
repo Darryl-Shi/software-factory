@@ -251,6 +251,12 @@ export function scripts(control: Control): Record<string, Script> {
 		while (control.discussantHang) await new Promise((r) => setTimeout(r, 50));
 		if (control.discussantFail) return fail(control.discussantFail);
 		if (ctx.side!.turn === 0 && text.startsWith("WRITE:")) return call("write", { path: "x.txt", content: "x" });
+		// "READ: path" reads a file of the checkout and replies with what it got
+		if (text.startsWith("READ:")) {
+			if (ctx.side!.turn === 0) return call("read", { path: text.slice(5).trim() });
+			const r = ctx.side!.results.find((x) => x.name === "read");
+			return say(`read ${r && !r.isError ? "ok" : "error"}: ${r?.text ?? ""}`);
+		}
 		return say(`re: ${text}`);
 	};
 	// The integrator: on a conflict it resolves shared.txt and concludes the merge (or aborts it, or leaves it, per
@@ -333,7 +339,7 @@ export interface TestEnv {
 	reopen(): Promise<Factory>;
 }
 
-export async function makeFactory(opts: { config?: string; storage?: "memory" | "sqlite"; control?: Control; dir?: string } = {}): Promise<TestEnv> {
+export async function makeFactory(opts: { config?: string; storage?: "memory" | "sqlite"; control?: Control; dir?: string; log?: (msg: string) => void } = {}): Promise<TestEnv> {
 	const dir = opts.dir ?? mkdtempSync(join(tmpdir(), "sf-test-"));
 	mkdirSync(dir, { recursive: true });
 	const host = new LocalGitHubHost(join(dir, "github"));
@@ -375,7 +381,10 @@ policy:
 			artifactsDir: join(dir, "state", "artifacts"),
 			storage: opts.storage === "sqlite" ? { sqlite: join(dir, "factory.sqlite") } : "memory",
 			ciPollMs: 50,
-			log: (m) => process.env.SF_DEBUG && console.error(m),
+			log: (m) => {
+				opts.log?.(m);
+				if (process.env.SF_DEBUG) console.error(m);
+			},
 		});
 		await f.start();
 		return f;

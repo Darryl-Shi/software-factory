@@ -36,6 +36,8 @@ it. [`design-spec.md`](design-spec.md) is the design the code implements, as ame
 - `discussion-task.ts` is the discussion's state machine, another kind of Pi Durable Task beside the run's, and
   `discussion-doc.ts` defines its `factory.discussion` Document: state, the turn in progress, drafts, summary,
   notices, turn costs and pinned config (see [Discussions](#discussions)).
+- `cleanup.ts` is the disk cleanup (see [Disk cleanup](#disk-cleanup)): the rule `cleanupScope`, the `Cleaner` that
+  deletes an owner's things, and the startup sweep / `gc`.
 - `bridge.ts` holds the tools agents use to hand results to the core: `ask_human`, `submit_spec`, `report_done`,
   `submit_review`, `submit_qa` and `submit_tickets`. `findings.ts` validates what agents submit through them.
 - `messages.ts` decides who a human message goes to and when (`message`), and builds what the agent sees.
@@ -49,9 +51,9 @@ it. [`design-spec.md`](design-spec.md) is the design the code implements, as ame
 
 | Module | File | Does |
 |---|---|---|
-| `GitHub` | `src/github/github.ts` | Runs: `open`, `diff`, `writeArtifact`, `commitAll`, `pushBranch` (and, for legacy runs, `create`, `deliver`). Bundles: `openBundle` (a worktree at `<workdir>/bundles/<id>`), `integrationBase`, `integrateStart`, `mergeMember`, `mergeState`, `concludeMerge`, `contains`, `defaultHead`, `deliverBundle` (description from `bundleReport`, title from `bundleTitle`), `describe`, `prState`, `closePr`. Both: `checks`, `annotate`, `merge`. Git work on a project's shared clone is serialised by a per-clone lock. Reads `workdir` and `github.*` |
-| `GitHubHost` | `src/github/host.ts` | The GitHub API seam: `GhApiHost` uses `gh api`; `LocalGitHubHost` is a fake that keeps bare remotes on disk and runs workflow steps in a local CI runner (tests and the dry run use it). `closePr`, and `updatePr` with an optional title, serve bundles; `LocalGitHubHost.pushCommit` is a test control for a default branch that moved |
-| `Sandbox` | `src/sandbox/sandbox.ts` | `provision`, `env`, `dispose`: per-role environments in the run's worktree, inside sandbox-runtime; reads `workdir` and `sandbox.*` |
+| `GitHub` | `src/github/github.ts` | Runs: `open`, `diff`, `writeArtifact`, `commitAll`, `pushBranch` (and, for legacy runs, `create`, `deliver`). Bundles: `openBundle` (a worktree at `<workdir>/bundles/<id>`), `integrationBase`, `integrateStart`, `mergeMember`, `mergeState`, `concludeMerge`, `contains`, `defaultHead`, `deliverBundle` (description from `bundleReport`, title from `bundleTitle`), `describe`, `prState`, `closePr`. Both: `checks`, `annotate`, `merge`. Cleanup: `discard` (an owner's worktree, `git worktree prune`, local branch and manifest, derived from area, id and repo so it works without the manifest), `deleteRemoteBranch` (only `factory/<owner-id>`, never the default branch, skipped when the repo doesn't exist on the host), `removeOrphanWorktree`, `sweepClone`, `clones`. Git work on a project's shared clone is serialised by a per-clone lock. Reads `workdir` and `github.*` |
+| `GitHubHost` | `src/github/host.ts` | The GitHub API seam: `GhApiHost` uses `gh api`; `LocalGitHubHost` is a fake that keeps bare remotes on disk and runs workflow steps in a local CI runner (tests and the dry run use it). `closePr`, and `updatePr` with an optional title, serve bundles; `deleteBranch(repo, branch, identity)` deletes a remote branch for the cleanup (`GhApiHost`: `DELETE /repos/{owner}/{repo}/git/refs/heads/{branch}`, 404/422 = already gone; `LocalGitHubHost`: deletes the ref in its bare remote, no-op when absent); `LocalGitHubHost.pushCommit` is a test control for a default branch that moved |
+| `Sandbox` | `src/sandbox/sandbox.ts` | `provision`, `env`, `dispose`: per-role environments in the run's worktree, inside sandbox-runtime; `removeScratch` (an owner's `scratch/<id>-<role>` dirs, exact names; records kept), `destroy` (an environment record file and its in-memory state), `recordIds`; reads `workdir` and `sandbox.*` |
 | web server | `src/web/server.ts` (UI: `src/web/ui/`) | HTTP and server-sent events over the core's operations |
 | agent tools | `src/agents/` | The role Conversations' tools and prompts (below) |
 
@@ -178,7 +180,8 @@ Legacy runs only (had begun delivering before bundles existed):
    spec: the builder updates it only when the repo already has one. If the `spec` gate is on (the default), the run
    waits for approval. A rejection sends it back to the discussion.
 4. **Build.** One builder Conversation does the build and is accountable for it. It may have helpers write code in
-   parallel through `subagent` (in its own worktree; helpers use `roles.helper`, else the builder's model). It
+   parallel through `subagent` (in the builder's worktree and environment; helpers use `roles.helper`, else the
+   builder's model). It
    finishes with `report_done`, which must answer every blocking finding it was given.
 5. **Review and AQ testing, in parallel.** A fresh reviewer Conversation with read-only tools reviews the whole
    product against the spec, runs the tests, and reviews the round's diff for quality and security; it submits
@@ -199,7 +202,8 @@ Legacy runs only (had begun delivering before bundles existed):
      and returns to `READY`. A run in an active bundle (`RunView.bundle`) refuses messages and cancel with
      `conflict`, naming the bundle.
    - **Delivered.** When its bundle merges, the run goes `READY` → `DELIVERED`: `artifacts.delivery` is the bundle's
-     PR (or push to `main`), the final notice reads "Merged in bundle-N: <url>", and its environments are disposed.
+     PR (or push to `main`), the final notice reads "Merged in bundle-N: <url>", its environments are disposed, and
+     its Task deletes its worktree, branches, scratch and environment records (full cleanup).
    - **Gate rejections.** Rejecting the delivery gate sends the human's feedback to the builder as blocking findings
      with `source: "human"`. This doesn't use up a review round.
    - **The `merge` gate is legacy.** `approvals: merge` still validates but no new run stops at it; a bundle's Merge
@@ -240,9 +244,9 @@ PR merged on GitHub → MERGED;  PR closed → CANCELLED;  cancel → CANCELLED;
 | `AWAITING_CI` | The run's old CI wait (`ci.mode`, `ci.checks`, `ci.noChecksTimeout`) on the delivered SHA; the PR is polled too. | green / no CI → `AWAITING_MERGE` (PR) or `MERGED` (new repo) · red under `ci.fixRounds` → `FIXING` · red at the cap, or no checks under `required` → `ESCALATED` |
 | `AWAITING_MERGE` | Pending ask: Merge / Request changes / Drop tickets; the PR is polled. Merge with an unmoved default branch merges with `bundle.mergeMethod`. A moved default branch, or GitHub refusing the merge, re-integrates from scratch and merges by itself once CI is green if no fix was needed (a clean 2+ ticket update is reviewed first and keeps `mergeRequested` while that review passes); an update the integrator had to change, or any `FIXING` (review, CI or Request changes, which clears `mergeRequested`), comes back for a fresh click. GitHub refusing 3 times fails the bundle. Request changes is one blocking `source: human` finding, no round added. | see the diagram |
 | `ESCALATED` | Pending ask: more rounds (N) / drop tickets / abort. | → `FIXING` · `INTEGRATING` · `CANCELLED` |
-| `MERGED` | Terminal. Each member run is marked merged (`bundleMerged`) and goes `READY` → `DELIVERED`. Environments and VMs are disposed. | — |
-| `FAILED` | Ends the Task. The members stay in the bundle until `retryBundle` (resumes at the failed state) or `cancelBundle`. | — |
-| `CANCELLED` | Terminal. Closes an open PR; members go back to plain `READY`, their branches untouched. | — |
+| `MERGED` | Terminal. Each member run is marked merged (`bundleMerged`) and goes `READY` → `DELIVERED`. Environments and VMs are disposed; the bundle's own things are deleted (full cleanup). | — |
+| `FAILED` | Ends the Task. The members stay in the bundle until `retryBundle` (resumes at the failed state) or `cancelBundle`. Only the bundle's scratch dirs are deleted. | — |
+| `CANCELLED` | Terminal. Closes an open PR; members go back to plain `READY`, their branches and worktrees untouched; the bundle's own things are deleted (full cleanup; `cancelBundle` of a `FAILED` bundle starts it in the background). | — |
 
 - **Dropping tickets** (`dropFromBundle`, or the escalation's drop) returns the dropped runs to `READY` and restarts
   integration on the latest default branch; earlier integration commits are discarded and conflicts are resolved
@@ -270,7 +274,9 @@ PREPARING ──ok──► OPEN ──closeDiscussion──► CLOSED ──reo
    workspace if the repo doesn't exist yet), and `Sandbox.provision` gives the `discussant` role the architect's
    rules: the worktree is read-only, its scratch dir is writable, setup scripts don't run. The first time, the core
    creates the discussion's one Conversation with the pinned model and submits the project context followed by the
-   human's first message. A reopen or retry keeps the Conversation and resyncs the checkout (`GitHub.refresh`):
+   human's first message. Leaving `OPEN` deletes the checkout, its manifest, local branch, scratch and environment
+   record (full cleanup), so a reopen or retry normally re-creates them: `refresh` finds no checkout and makes a fresh
+   one with `GitHub.open`, and `provision` makes a new record. A reopen or retry keeps the Conversation and resyncs any checkout that is still there (`GitHub.refresh`):
    the checkout is read-only, so it is reset to `origin/<default>` and cleaned rather than merged, which survives a
    force-pushed default branch or stray local changes. A missing checkout, manifest or clone is made again with
    `GitHub.open`, as is a new-repo workspace whose repo now exists. Only a git failure (e.g. the remote is gone)
@@ -339,6 +345,35 @@ only during a `draft` turn. It can't be messaged through `message`: the human ta
 - **Storage** is SQLite by default (`storage.kind: sqlite`); `jsonl` is the alternative. Tests use in-memory storage
   or SQLite.
 
+## Disk cleanup
+
+`src/core/cleanup.ts` (spec `docs/specs/run-mv58bn4q-q2zs.md`, rules in `docs/spec.md` §8.1). Each run, bundle and
+discussion is an owner; its things live under its pinned workdir.
+- **`cleanupScope(owner)`** is the one pure rule: `none`, `scratch` (only the scratch dirs; environment records stay
+  so a retry resumes without provisioning) or `full` (remote branch, worktree, `git worktree prune`, local branch,
+  manifest, scratch dirs, environment records, in that order). Every caller uses it.
+- **`Cleaner.cleanup(owner, scope)`** never throws and returns `{ removed, failures }`. Each step is idempotent and
+  attempted even if an earlier one failed; failures are logged with the owner and step. Git steps go through
+  `GitHub.discard` / `deleteRemoteBranch` under the per-clone lock; scratch and records through
+  `Sandbox.removeScratch` / `destroy`. The `cleanedUp: { at, scope }` marker is committed only when every step
+  succeeded (Tasks in their terminal commit, the core and sweep with `root.commit`); `scratch` can become `full`,
+  `full` is final, and a retry or reopen deletes it.
+- **Where it is called:** the run and bundle Tasks' `finalize` and `abort` (`cleanAtEnd`, after the environments
+  are disposed and before the terminal commit); the discussion Task wherever it leaves `OPEN` (closed, failed, or
+  aborted); `clearRuns` and `cancelBundle` of a `FAILED` bundle (in the background, after their commit); the startup
+  sweep; `gc`.
+- **Per-owner serialisation:** `Cleaner.exclusive(id, …)` chains work per owner id, so two cleanups of an owner never
+  overlap, and `retryRun`, `retryBundle` and discussion reopen/retry commit through it (after any in-flight
+  cleanup). `cleanupsSettledForTests()` awaits background cleanups and a running sweep.
+- **The sweep** (`Cleaner.sweep`, single flight) starts from `Factory.start()` after `harness.resume()`, in the
+  background. Records pass: every owner whose scope isn't covered by its marker and whose Task isn't live is
+  re-read and cleaned. Orphans pass: in the global and every pinned workdir, factory-named entries
+  (`runs/run-*`, `bundles/bundle-*`, `discussions/disc-*`, their `.json`, `scratch/<id>-<role>`) whose id matches no
+  record are removed (`GitHub.removeOrphanWorktree` for worktrees), and so are environment records without an owner.
+  Clone sweep: `GitHub.sweepClone` prunes worktrees and deletes local `factory/*` branches not checked out whose owner
+  is unknown or fully cleaned. It logs one summary line (`disk sweep: removed N items (…), K failures`) and one line
+  per failure. `gc` (a core operation) runs it on demand and returns `{ removed, failures, summary }`.
+
 ## Operations and events
 
 `FactoryCore` (`src/core/types.ts`) is the core's whole outside surface. It has no transport of its own; the web
@@ -356,8 +391,9 @@ server is its transport.
     then aborts each run's task (`harness.abortTask`). Each run then reaches `CANCELLED` through the run task's own
     cancellation path, exactly as with `cancelRun`. Returns `{ cancelled }`.
   - `clearRuns(runs)` archives terminal runs (`DELIVERED`, `FAILED`, `CANCELLED`) so they leave the board: it sets
-    `cleared: { at, by }` on each run's `RunDoc` and deletes nothing (record, conversations, screenshots, worktree and
-    delivery stay; `RunIndex` is unchanged). The whole call is checked first and applied in one commit: an empty list
+    `cleared: { at, by }` on each run's `RunDoc`, then starts a full cleanup of each cleared run in the background
+    without waiting for it (worktree, manifest, branches, scratch, environment records; the record, conversations,
+    screenshots and delivery stay; `RunIndex` is unchanged). The whole call is checked first and applied in one commit: an empty list
     is `invalid`, an unknown id `not_found`, a run that isn't terminal `conflict`. Runs already cleared are skipped and
     left out of the result `{ cleared }`, so the call is idempotent. `listRuns` leaves cleared runs out unless
     `includeCleared: true`; `getRun`, `getConversation`, `getScreenshot` and discussions' run links still work, and
@@ -374,6 +410,7 @@ server is its transport.
     approval. If the builder changes files after the review, delivery first sends the run back through review.
   - A run in `READY` and in no active bundle takes messages (to its builder); a run in an active bundle refuses them
     with `conflict`.
+- **Maintenance:** `gc()` runs the disk sweep now (see [Disk cleanup](#disk-cleanup)); `factory gc` calls it.
 - **Bundles:** `createBundle`, `getBundle` (a `BundleView`), `listBundles`, `getBundleConversation`, `mergeBundle`,
   `requestBundleChanges`, `dropFromBundle`, `resolveBundleEscalation`, `cancelBundle`, `retryBundle`,
   `messageBundle`, `getBundleScreenshot`. `cancelBundle` works on any bundle not yet `MERGED` or `CANCELLED`,
@@ -431,7 +468,9 @@ server is its transport.
   can't be loaded, or the config still has a `stages` or `workers` section or a `roles.<role>.extensions` key (also under `projects.<name>`). The port is checked before any run resumes. Unknown options are refused.
 - A pid file that names no running factory (a dead process, or a reused pid) is removed.
 - `stop` sends SIGTERM and waits for the process to exit; `status` prints the pid and the link; `web` prints the
-  link from `web-url`; `doctor` (`src/doctor.ts`) checks the config, extensions, models, sandbox, GitHub identity,
+  link from `web-url`; `gc` (`src/gc.ts`) POSTs `/api/op/gc` to the running factory through `web-url`, prints the
+  summary line, the removed items or "Nothing was removed." and any failures, and exits 1 when no factory is running
+  or there were failures; `doctor` (`src/doctor.ts`) checks the config, extensions, models, sandbox, GitHub identity,
   boat.dev and Parallel keys and `gh`; `setup` runs the wizard above.
 - `factory update` and the web UI's Update fast-forward the checkout and restart the process the way it was started
   (see Updates below).

@@ -252,7 +252,7 @@ describe("life cycle", () => {
 		expect(t!.control.discussantInputs.at(-1)).toContain(head);
 	});
 
-	test("close disposes the discussant's environment; reopen provisions it again", async () => {
+	test("close disposes the discussant's environment and deletes it (disk cleanup); reopen provisions it again", async () => {
 		const dispose = vi.spyOn(Sandbox.prototype, "dispose");
 		const id = await t!.factory.startDiscussion("p", { title: "t", message: "m" });
 		await t!.factory.waitForDiscussion(id, open);
@@ -260,7 +260,8 @@ describe("life cycle", () => {
 		await t!.factory.waitForDiscussion(id, (v) => v.state === "CLOSED");
 		expect(dispose).toHaveBeenCalledWith(`${id}-discussant`);
 		const record = join(t!.dir, "state", "environments", `${id}-discussant.json`);
-		expect(JSON.parse(readFileSync(record, "utf8")).disposed).toBe(true);
+		// A CLOSED discussion is cleaned in full: its environment record goes (docs/specs/run-mv58bn4q-q2zs.md).
+		expect(existsSync(record)).toBe(false);
 		await t!.factory.reopenDiscussion(id);
 		await t!.factory.waitForDiscussion(id, open);
 		expect(JSON.parse(readFileSync(record, "utf8")).disposed).toBeUndefined();

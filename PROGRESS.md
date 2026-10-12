@@ -172,3 +172,31 @@ Decisions:
 - Decision: ship ticks (ui.ship) are kept untouched during select mode, so leaving it restores them as they were.
 - Decision: the UI passes reason "cancelled from the web UI" (same as the run view's Cancel run).
 - [x] Tests: test/cancel-runs.test.ts, web.test.ts "bulk cancel", web-board.test.ts select mode. Docs updated.
+
+## Disk cleanup (run run-mv58bn4q-q2zs; spec docs/specs/run-mv58bn4q-q2zs.md)
+
+- [x] host: `GitHubHost.deleteBranch` (gh: DELETE refs, 404/422 = gone; fake: update-ref -d; `failDeleteBranch` test control)
+- [x] github: public `discard(area,id,repo,workdir)` (withClone, per-step results), `deleteRemoteBranch`, `sweepClone`,
+      `removeOrphanWorktree`, `clones`
+- [x] sandbox: `removeScratch`, `destroy`, `recordIds`
+- [x] core/cleanup.ts: `cleanupScope`, `Cleaner` (per-owner lock, background + settled, cleanup steps, sweep)
+- [x] Tasks: run/bundle finalize+abort, discussion CLOSED/FAILED/abort; marker in the terminal commit
+- [x] core: clearRuns + cancelBundle(FAILED) background cleanup; retries under `cleaner.exclusive` delete the marker;
+      startup sweep; `gc` op (CORE_OPS); test hook `cleanupsSettledForTests`
+- [x] CLI `factory gc` (src/gc.ts: web-url → POST /api/op/gc; exit 1 when not running or on failures)
+- [x] tests: test/cleanup.test.ts (acceptance 1-15 + rules, deleteRemoteBranch, removeScratch), github-api
+      (GhApiHost.deleteBranch), discussion.test (CLOSED now deletes the env record); helpers: makeFactory `log`,
+      discussant "READ: path"
+- [x] docs: spec.md §8.1 + rows, architecture, configuration, README, AGENTS, DEVIATIONS 9/49, old clear spec note
+- [x] dry run 104/104; full suite: only the 8 bubblewrap sandbox tests fail (no user namespaces here), as on the base
+
+Decisions:
+- The scope a core-started cleanup uses is recomputed inside the per-owner lock from the record as committed then.
+- Retries run their commit inside the owner's cleanup lock (not just "wait, then commit") so no cleanup can start in between.
+- Sweep counts: runs/bundles/discussions = worktrees + manifests removed in that area; scratch dirs; env records;
+  local/remote branches.
+- `factory gc` exits 1 when the sweep reported failures too (scriptable); "no factory is running" when web-url is
+  missing or the connection is refused.
+- Round 2: F1 fixed — `LocalGitHubHost.save` is atomic (temp + rename) and `deleteBranch` no longer logs to the state
+  file (the dry-run driver read a half-written github-state.json); dry run 104/104 three times in a row. F4: docs warn
+  not to share a workdir between factories. F5 left as is (indexing the cache outside onChange would skew event diffs).

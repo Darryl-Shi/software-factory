@@ -1,5 +1,6 @@
 // The `factory.run` Document (spec §4): state, round counters, conversation IDs, artifacts, pending ask,
 // cost per role per round, pinned config hash and Pi version. One session-scoped family member per run.
+import type { CleanedUp } from "./cleanup.ts";
 import { defineDoc, defineDocFamily } from "@earendil-works/pi-durable";
 import type {
 	ArtifactRef,
@@ -96,8 +97,10 @@ export type RunDocState = {
 	bundleMerged?: { bundle: string; delivery: Delivery };
 	/** READY: how many messages to the builder were already checked for a workspace change. */
 	readyChecked?: number;
-	/** Set by `clearRuns`: the run is archived (off the board and default listings); nothing is deleted. */
+	/** Set by `clearRuns`: the run is archived (off the board and default listings) and its files and branches are deleted (src/core/cleanup.ts); the record stays. */
 	cleared?: { at: number; by: string };
+	/** Disk cleanup done (src/core/cleanup.ts): set when every step of that scope succeeded; deleted by a retry. */
+	cleanedUp?: CleanedUp;
 };
 
 /** Where a run's spec is committed: docs/specs/<run-id>.md, or the path its spec already has (docs/spec.md for older runs). */
