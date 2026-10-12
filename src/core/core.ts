@@ -1051,6 +1051,8 @@ export class Factory implements FactoryCore {
 			const d = (await tx.doc(BundleDoc, id, null as never)) as unknown as BundleDocState;
 			if (BUNDLE_TERMINAL_STATES.includes(d.state)) throw new FactoryError("conflict", `bundle ${id} is ${d.state}; it takes no messages`);
 			const target = bundleMessageTarget(d);
+			const allowed = (d.pinned.config.policy?.messages ?? DEFAULT_MESSAGE_ROLES) as Role[];
+			if (target.role === "reviewer" && !allowed.includes("reviewer")) throw new FactoryError("conflict", `messages to the reviewer are turned off for this project (policy.messages); ${id} is being reviewed`);
 			d.counters.msgSeq = (d.counters.msgSeq ?? 0) + 1;
 			msg = { id: `${id}-msg${d.counters.msgSeq}`, text: text.trim(), by, to: target.role, at: this.now() };
 			if (!d.messages) d.messages = [];

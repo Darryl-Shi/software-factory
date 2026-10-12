@@ -497,16 +497,6 @@ export class GitHub {
 	async closePr(pr: PrRef, rc: RunCtx): Promise<void> {
 		await this.host.closePr(pr.repo, pr.number, identityOf(rc));
 	}
-
-	/** Remove a bundle's worktree (its branch stays in the clone). */
-	async disposeBundle(ws: Workspace, rc: RunCtx): Promise<void> {
-		const workdir = workdirOf(rc);
-		const clone = cloneOf(workdir, ws.repo);
-		if (existsSync(join(clone, ".git"))) await git(clone, ["worktree", "remove", "--force", ws.path], { allowFail: true });
-		rmSync(ws.path, { recursive: true, force: true });
-		if (existsSync(join(clone, ".git"))) await git(clone, ["worktree", "prune"], { allowFail: true });
-		rmSync(join(workdir, "bundles", `${rc.runId}.json`), { force: true });
-	}
 }
 
 /** What a bundle's PR description (or delivery note) is written from. */

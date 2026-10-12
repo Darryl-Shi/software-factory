@@ -7,7 +7,7 @@ entries name the code as it is now.
 
 ## Contracts (§3)
 
-1. **`GitHub.writeArtifact(ws, path, content, message)` was added.** The core must commit the spec into the workspace as `docs/spec.md` (§4 `SPEC_READY`). The core doesn't touch git itself, and the spec's repo contract has no write operation, so `GitHub` got one small, idempotent method.
+1. **`GitHub.writeArtifact(ws, path, content, message)` was added.** The core must commit the spec into the workspace as `docs/spec.md` (§4 `SPEC_READY`; since bundles, `docs/specs/<run-id>.md`, see 62). The core doesn't touch git itself, and the spec's repo contract has no write operation, so `GitHub` got one small, idempotent method.
 2. **`GitHub.annotate(d, ws, note)` was added.**
    - **Spec:** when `if-present` finds no CI, "the delivery note and final report say that there was no CI" (§2). That is only known *after* `deliver` returns and `ci.noChecksTimeout` passes.
    - **Built:** `annotate` appends that note to the PR description. For push-main it commits the note to `docs/delivery-notes.md` as a follow-up commit on `main`. That happens only when no CI exists, and the run's recorded delivery SHA stays the delivered commit.
@@ -43,7 +43,7 @@ entries name the code as it is now.
 9. **Worktrees are kept after `dispose`.**
    - **Spec:** `DELIVERED` disposes the environment, and only `FAILED`/`CANCELLED` keep the "workspace for inspection".
    - **Built:** `Sandbox.dispose` retires the environment record, but the git worktree, which `GitHub` made, stays on disk in every terminal state.
-   - **Why:** the spec defines no workspace-removal operation, and deleting work is the riskier default. Clean up `workdir` manually.
+   - **Why:** the spec defines no workspace-removal operation, and deleting work is the riskier default. Clean up `workdir` manually. Bundles' worktrees (`<workdir>/bundles/<id>`) are kept the same way.
 10. **Credential hiding is done twice.** Besides the runtime's `credentials` deny list (env-var names), sandboxed commands start from an empty environment (`inheritEnv: false`) plus a safe allowlist. A credential env var under any name never reaches an agent.
 
 ## Settings and config (§5, §6)
@@ -176,3 +176,29 @@ because of it.
     - **Spec:** the sandbox always denies the factory home (`dirname(configPath)`) (§2.3).
     - **Built:** it still denies the whole home, but re-exposes the environment's own worktree, git directory, scratch dir and `extraWrite` paths when they lie inside it. `secrets.json`, `pi/`, `web-token`, `web-url`, `factory.log`, `factory.sqlite*`, `environments/` and `qa-vms/` are denied regardless, as is the `storage.path` database. A write root at, inside or around the home (or around the database) is dropped, and `extraWrite` rejects one at config time.
     - **Why:** a `workdir` inside the factory home (a custom `--config` layout, or the dry run) otherwise hid the agents' own worktrees from them.
+
+## Bundles (added after setup; [bundles spec](docs/specs/run-mv4ghzj2-allm.md))
+
+The bundles spec splits "done building" from "delivered": a run stops at `READY`, and a bundle of one or more Ready
+runs of a project delivers them as one PR. Entries 59–63 are where the design spec's single-run delivery no longer
+holds; 64–72 are choices the bundles spec left open.
+
+59. **Runs no longer deliver.**
+    - **Spec:** `REVIEWING` pass → delivery gate → `DELIVERING` (repo creation, push to `main` or a PR) → `AWAITING_CI` → merge gate → `DELIVERED` (§4).
+    - **Built:** `DELIVERING` keeps the no-unreviewed-delivery check (25), commits what the builder left uncommitted and, for an existing repo, pushes `factory/<run-id>`. The run then waits in `READY`, which is not terminal: a message to a run in no bundle goes to its builder (a change goes back through `REVIEWING`, no round added); a run in an active bundle refuses messages and cancel with `conflict`. A run becomes `DELIVERED` when its bundle merges, with the bundle's PR as `artifacts.delivery`. Repo creation, PRs and merging belong to the bundle (`src/core/bundle-task.ts`, `GitHub.openBundle`, `integrationBase`, `mergeMember`, `deliverBundle`, `prState`, `closePr`; `GitHubHost.closePr`, and `updatePr` with a title).
+    - **Why:** parallel tickets of one project otherwise competed with each other, and there was no way to ship several together.
+60. **CI runs per bundle, not per run.** `ci.mode`, `ci.checks`, `ci.noChecksTimeout` and `ci.fixRounds` (§2, §4 `AWAITING_CI`) now apply to a bundle's delivered commit; a red CI goes to the bundle's integrator, and a review after a CI fix counts toward `ci.fixRounds`. A new run never waits for CI.
+61. **The merge gate is legacy; Merge belongs to the bundle.**
+    - **Spec:** the optional `merge` gate squash-merges the run's PR; without it the PR is left open (§4, §6).
+    - **Built:** `policy.approvals: merge` still validates but no new run stops at it. The bundle's **Merge** (`mergeBundle`) merges its PR with `bundle.mergeMethod` (`merge`, `squash` or `rebase`, default `squash`); merging the PR on GitHub also counts. Until then the PR stays open.
+62. **The run's spec is committed at `docs/specs/<run-id>.md`, not `docs/spec.md`** (§4 `SPEC_READY`), so two tickets never collide on it; `RunView.specPath` names it. Runs already past `SPEC_READY` when bundles arrived keep `docs/spec.md`. `docs/spec.md` is now the product spec, which the builder updates only when the repo already has one.
+63. **Legacy runs finish the old way.** A run that had begun delivering before the upgrade (`isLegacyDelivery` in `src/core/run-doc.ts`: `DELIVERING`, `AWAITING_CI`, `AWAITING_APPROVAL(merge)`, an escalation from `AWAITING_CI`, or a recorded delivery) is marked `legacy` by `Factory.migrateRuns` at startup and keeps its own PR, CI and merge gate. Every other unfinished run takes the new flow (`flowVersion: 2`).
+64. **A `FAILED` bundle keeps its members until it is retried or cancelled.** The spec makes `FAILED` terminal until Retry and says members stay, but not how to free them otherwise. **Cancel bundle** also works on a `FAILED` bundle: it closes the PR and releases the members to plain `READY`. Until then they can't be shipped elsewhere, messaged or cancelled.
+65. **The integrator has the builder's write tools but no helpers.** Its tool set is `coding`, `test-runner` and `web-search`, without `subagent`, in a write sandbox on the bundle's worktree (`WRITE_ROLES` in `src/sandbox/sandbox.ts`); its only bridge tool is `report_done`. Conflict resolution is narrow, sequential work on one worktree, where parallel writers would only collide.
+66. **The note listing the remaining tickets after a drop goes with the integrator's next task** (a conflict or a findings input), as a `[factory]` line at its top. The spec says the Conversation "gets a note" but not when; sending it on its own would start an idle turn. If the remaining tickets merge cleanly and the integrator has nothing more to do, it never sees the note.
+67. **A moved default branch, a refused merge or a drop re-integrates from scratch.** The bundle's branch is reset to the latest default branch and every member merged again; earlier integration commits are discarded and conflicts are resolved again (with the integrator's Conversation carrying its earlier resolutions in context). Rebasing the old integration was the alternative, but it would carry stale conflict resolutions onto a base they were not reviewed against.
+68. **Limits that fail a bundle.** GitHub refusing the merge 3 times over the bundle's life (each refusal followed by an update onto the latest default branch) fails the bundle, as does an integrator that has not concluded a conflicted merge after 3 attempts. Both go to `FAILED`, where Retry or Cancel applies (64).
+69. **There is no intake in the code, so `intake.writeBack(done, url)` is the run's final notice.** The spec's §1.1 step for merged members becomes the `DELIVERED` run's final notice, "Merged in bundle-N: <url>", which the web UI shows and the event stream carries.
+70. **Ticket keys (`PROJECT-N`) are computed by the core the same way as the web UI**: the project name's first segment, upper-cased and cut to 6 characters, and N counting the project's runs by creation. `BundleView.members[].key` uses it, and so do the bundle's notices and the integrator's inputs.
+71. **QA VMs of a bundle are named `factory-bundle-<n>-<seq>`** (entry 30's `factory-<id>-<seq>` with the bundle id), and the startup sweep keeps a bundle's VM only while that bundle is in `REVIEWING` at that seq.
+72. **The PR's title and description are rewritten at the next delivery.** After a drop, the bundle re-integrates and goes through `DELIVERING` again, which updates the open PR's title and description to the remaining tickets; it is not rewritten at the moment of the drop.
