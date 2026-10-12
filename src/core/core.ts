@@ -342,8 +342,8 @@ export class Factory implements FactoryCore {
 
 	/** Start a cleanup of an owner in the background; the scope comes from its state when the cleanup starts. */
 	private cleanInBackground(kind: Owner["kind"], id: string): void {
-		const o = this.ownerOf(kind, id);
-		if (!o) return;
+		// The owner (and so the scope) is read again from storage inside the owner's lock, just before acting.
+		const o: Owner = this.ownerOf(kind, id) ?? { kind, id, repo: "", state: "", config: {} };
 		this.cleaner.background(
 			this.cleaner.cleanup(o, "full", {
 				recheck: () => this.rereadOwner(kind, id),
@@ -815,12 +815,9 @@ export class Factory implements FactoryCore {
 				cleared.push(d.id);
 			}
 		}, this.ctx);
-		// A cleared run's files and branches go now, in the background (the call does not wait for the deletion).
-		await new Promise((r) => setImmediate(r)); // the cache follows the commit
-		for (const id of ids) {
-			const d = this.cache.get(id);
-			if (d?.cleared && d.cleanedUp?.scope !== "full") this.cleanInBackground("run", id);
-		}
+		// A cleared run's files and branches go now, in the background (the call does not wait for the deletion). Each
+		// cleanup re-reads the run: one already fully cleaned is skipped.
+		for (const id of ids) this.cleanInBackground("run", id);
 		return { cleared };
 	}
 
@@ -1165,7 +1162,6 @@ export class Factory implements FactoryCore {
 			doc.updatedAt = now;
 		}, this.ctx);
 		// No Task cleans it: delete the bundle's own things in the background (members' branches are theirs).
-		await new Promise((r) => setImmediate(r));
 		this.cleanInBackground("bundle", id);
 	}
 
