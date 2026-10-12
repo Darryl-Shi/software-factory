@@ -142,7 +142,7 @@ export function createRunTask(svc: CoreServices) {
 				? `Delivered${url ? `: ${url}` : ""}${d.artifacts.delivery?.kind === "pr" && !gates(d).includes("merge") ? " (PR left open, no auto-merge)" : ""}${d.noCi ? " — the repo has no CI checks; CI did not run" : ""}`
 				: `${state === "FAILED" ? "Failed" : "Cancelled"} in ${d.state}: ${reason ?? ""}`;
 		const qa = lastQaStatus(d);
-		const textQa = state === "DELIVERED" && qa ? `${text} · QA status: ${qa}` : text;
+		const textQa = state === "DELIVERED" && qa && !deliveredText ? `${text} · QA status: ${qa}` : text;
 		notice(d, {
 			level: state === "DELIVERED" ? "info" : state === "FAILED" ? "error" : "warn",
 			text: textQa,

@@ -5,7 +5,7 @@ import { createModels } from "@earendil-works/pi-ai/models";
 import { Boat } from "../src/boat/boat.ts";
 import { LocalBoatBackend } from "../src/boat/backend.ts";
 import { Factory } from "../src/core/core.ts";
-import type { DiscussionView, RunView } from "../src/core/types.ts";
+import type { BundleView, DiscussionView, RunView } from "../src/core/types.ts";
 import { GitHub } from "../src/github/github.ts";
 import { LocalGitHubHost } from "../src/github/host.ts";
 import { Sandbox } from "../src/sandbox/sandbox.ts";
@@ -66,6 +66,14 @@ export interface Control {
 	 * next step (crash tests).
 	 */
 	draftPlan: string[];
+	/** Each builder also writes shared.txt with content of its own (two runs then conflict when bundled). */
+	sharedFile?: boolean;
+	/** The integrator's factory inputs. */
+	integratorInputs: string[];
+	/** Per integrator conflict task: resolve | abort | leave (default resolve). */
+	integratorPlan: string[];
+	/** Hang the integrator on its next conflict task (crash tests). */
+	integratorHang?: boolean;
 }
 
 export function newControl(): Control {
@@ -91,8 +99,12 @@ export function newControl(): Control {
 		discussantMessages: [],
 		discussantModels: [],
 		draftPlan: [],
+		integratorInputs: [],
+		integratorPlan: [],
 	};
 }
+
+let sharedSeq = 0;
 
 const SPEC = (v: number) => `# Spec v${v}\n\nA tiny product.\n\n## Acceptance behaviours\n\n- running it prints hello\n`;
 
@@ -160,6 +172,8 @@ export function scripts(control: Control): Record<string, Script> {
 			const noProgress = control.builderNoProgress || (control.noProgressFromInput !== undefined && ctx.inputs.length >= control.noProgressFromInput);
 			if (!noProgress && control.runScript && ctx.inputs.length === 1)
 				return calls(["write", { path: `round-${ctx.inputs.length}.txt`, content: `round ${ctx.inputs.length}\n` }], ["write", { path: "scripts/run.sh", content: "echo product up\nsleep 60\n" }]);
+			if (!noProgress && control.sharedFile && ctx.inputs.length === 1)
+				return calls(["write", { path: `round-${ctx.inputs.length}.txt`, content: `round ${ctx.inputs.length}\n` }], ["write", { path: "shared.txt", content: `builder ${++sharedSeq}\n` }]);
 			if (!noProgress) return call("write", { path: `round-${ctx.inputs.length}.txt`, content: `round ${ctx.inputs.length}\n` });
 		}
 		const ids = [...ctx.inputs.at(-1)!.matchAll(/\[(F\d+)\] \([a-z]+, BLOCKING/g)].map((m) => m[1]!);
@@ -224,9 +238,37 @@ export function scripts(control: Control): Record<string, Script> {
 		if (ctx.side!.turn === 0 && text.startsWith("WRITE:")) return call("write", { path: "x.txt", content: "x" });
 		return say(`re: ${text}`);
 	};
+	// The integrator: on a conflict it resolves shared.txt and concludes the merge (or aborts it, or leaves it, per
+	// `integratorPlan`); on findings it changes integrated.txt and answers every blocking finding "fixed".
+	let integratorMode = "resolve";
+	const integrator: Script = async (ctx) => {
+		if (ctx.turn === 0) {
+			control.integratorInputs.push(ctx.input);
+			while (control.integratorHang) await new Promise((r) => setTimeout(r, 50));
+		}
+		if (ctx.input.includes("# Merge conflict")) {
+			if (ctx.turn === 0) {
+				integratorMode = control.integratorPlan.shift() ?? "resolve";
+				if (integratorMode === "abort") return call("bash", { command: "git merge --abort" });
+				if (integratorMode === "leave") return call("bash", { command: "true" });
+				return call("bash", { command: "printf 'resolved by the integrator\\n' > shared.txt && git add -A && git commit -q --no-edit && echo RESOLVED" });
+			}
+			return call("report_done", { summary: `conflict ${integratorMode}`, responses: [] });
+		}
+		if (ctx.turn === 0) return call("write", { path: "integrated.txt", content: `fix ${ctx.inputs.length}\n` });
+		const ids = [...ctx.input.matchAll(/\[(F\d+)\] \([a-z]+, BLOCKING/g)].map((m) => m[1]!);
+		return call("report_done", { summary: `fixed ${ids.length}`, responses: ids.map((findingId) => ({ findingId, status: "fixed" })) });
+	};
+	integrator.onMessage = (ctx) => {
+		const text = humanText(ctx.side!.message);
+		control.messagesSeen.push(`integrator:${text}`);
+		if (ctx.side!.turn === 0 && text.startsWith("EDIT:")) return call("write", { path: "INTEGRATOR.md", content: `${text.slice(5).trim()}\n` });
+		return say(ctx.side!.turn === 0 ? `re: ${text}` : "changed INTEGRATOR.md");
+	};
 	return {
 		architect,
 		builder,
+		integrator,
 		"builder-textonly": builder,
 		helper: async (ctx) => {
 			if (!control.builderSubagent) return say("helper");
@@ -293,6 +335,7 @@ roles:
   helper: { model: scripted/helper }
   reviewer: { model: scripted/reviewer }
   qa: { model: scripted/qa }
+  integrator: { model: scripted/integrator }
 discussion: { model: { model: scripted/discussant } }
 qa: { enabled: false }
 boat: { apiKey: env:SF_TEST_BOAT_KEY }
@@ -338,5 +381,21 @@ policy:
 }
 
 export const until = (f: Factory, run: string, pred: (v: RunView) => boolean, ms = 30_000) => f.waitForState(run, pred, ms);
+export const untilBundle = (f: Factory, id: string, pred: (v: BundleView) => boolean, ms = 30_000) => f.waitForBundle(id, pred, ms);
+export const bundleIn = (...s: string[]) => (v: BundleView) => s.includes(v.state);
+
+/**
+ * Ship a run on its own (a bundle of one) once it is READY and merge it: what "delivered" means since bundles. Returns
+ * the run once it is DELIVERED (or the bundle's end state if it never merges).
+ */
+export async function shipAndMerge(f: Factory, run: string, ms = 30_000): Promise<RunView> {
+	const r = await f.waitForState(run, (v) => ["READY", "FAILED", "CANCELLED", "DELIVERED"].includes(v.state), ms);
+	if (r.state !== "READY") return r;
+	const id = await f.createBundle(r.project, [run]);
+	const b = await f.waitForBundle(id, (v) => v.state === "MERGED" || v.state === "FAILED" || v.state === "CANCELLED" || v.state === "ESCALATED" || (v.state === "AWAITING_MERGE" && !!v.pendingAsk), ms);
+	if (b.state === "AWAITING_MERGE") await f.mergeBundle(id);
+	if (b.state === "AWAITING_MERGE" || b.state === "MERGED") return f.waitForState(run, (v) => v.state === "DELIVERED", ms);
+	return f.getRun(run);
+}
 export const inState = (...s: string[]) => (v: RunView) => s.includes(v.state);
 export const untilDiscussion = (f: Factory, id: string, pred: (v: DiscussionView) => boolean, ms = 30_000) => f.waitForDiscussion(id, pred, ms);

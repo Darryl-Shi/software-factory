@@ -77,11 +77,30 @@ export function report(ctx: Pick<DeliveryContext, "request" | "advisory" | "acce
 	].join("\n");
 }
 
+/**
+ * One git operation at a time on a project's shared clone: runs, discussions and bundles of one project clone, fetch,
+ * add worktrees and push from it in parallel, and git's ref and config locks don't wait.
+ */
+const cloneLocks = new Map<string, Promise<unknown>>();
+function withClone<T>(clone: string, f: () => Promise<T>): Promise<T> {
+	const prev = cloneLocks.get(clone) ?? Promise.resolve();
+	const next = prev.catch(() => undefined).then(f);
+	cloneLocks.set(clone, next);
+	void next.finally(() => {
+		if (cloneLocks.get(clone) === next) cloneLocks.delete(clone);
+	}).catch(() => undefined);
+	return next;
+}
+
 export class GitHub {
 	constructor(readonly host: GitHubHost) {}
 
 	/** A run's (or, with `area: "discussions"`, a discussion's) checkout under `<workdir>/<area>/<rc.runId>`. */
-	async open(ref: RepoRef, rc: RunCtx, area: "runs" | "discussions" = "runs"): Promise<Workspace> {
+	open(ref: RepoRef, rc: RunCtx, area: "runs" | "discussions" = "runs"): Promise<Workspace> {
+		return withClone(cloneOf(workdirOf(rc), ref), () => this.openLocked(ref, rc, area));
+	}
+
+	private async openLocked(ref: RepoRef, rc: RunCtx, area: "runs" | "discussions"): Promise<Workspace> {
 		const host = this.host;
 		const workdir = workdirOf(rc);
 		const m = join(workdir, area, `${rc.runId}.json`);
@@ -138,7 +157,11 @@ export class GitHub {
 	 * worktree git can't reset is made again with `open`; so is a new-repo workspace whose repo now exists (the empty
 	 * local workspace becomes a checkout of the repo). Fails only when git does (e.g. the remote is gone).
 	 */
-	async refresh(ws: Workspace, rc: RunCtx): Promise<Workspace> {
+	refresh(ws: Workspace, rc: RunCtx): Promise<Workspace> {
+		return withClone(cloneOf(workdirOf(rc), ws.repo), () => this.refreshLocked(ws, rc));
+	}
+
+	private async refreshLocked(ws: Workspace, rc: RunCtx): Promise<Workspace> {
 		const host = this.host;
 		const id = identityOf(rc);
 		const workdir = workdirOf(rc);
@@ -146,7 +169,7 @@ export class GitHub {
 		const manifest = join(workdir, "discussions", `${rc.runId}.json`);
 		const again = async () => {
 			await discard(ws, workdir, manifest);
-			return this.open(ws.repo, rc, "discussions");
+			return this.openLocked(ws.repo, rc, "discussions");
 		};
 		if (ws.newRepo) {
 			if (await host.repoExists(ws.repo, id)) return again();
@@ -322,7 +345,11 @@ export class GitHub {
 	}
 
 	/** Push the workspace's branch (`factory/<id>`) to origin, replacing what is there. */
-	async pushBranch(ws: Workspace, rc: RunCtx): Promise<string> {
+	pushBranch(ws: Workspace, rc: RunCtx): Promise<string> {
+		return withClone(cloneOf(workdirOf(rc), ws.repo), () => this.pushBranchLocked(ws, rc));
+	}
+
+	private async pushBranchLocked(ws: Workspace, rc: RunCtx): Promise<string> {
 		const host = this.host;
 		const remotes = await gitOut(ws.path, ["remote"]);
 		if (!remotes.split("\n").includes("origin")) await git(ws.path, ["remote", "add", "origin", host.remoteUrl(ws.repo)]);
@@ -334,7 +361,11 @@ export class GitHub {
 	 * A bundle's worktree `<workdir>/bundles/<bundle-id>` on branch `factory/<bundle-id>`, from the project's shared clone
 	 * (where the member runs' branches are local branches). Made at the clone's current HEAD; `integrateStart` resets it.
 	 */
-	async openBundle(ref: RepoRef, rc: RunCtx): Promise<Workspace> {
+	openBundle(ref: RepoRef, rc: RunCtx): Promise<Workspace> {
+		return withClone(cloneOf(workdirOf(rc), ref), () => this.openBundleLocked(ref, rc));
+	}
+
+	private async openBundleLocked(ref: RepoRef, rc: RunCtx): Promise<Workspace> {
 		const workdir = workdirOf(rc);
 		const m = join(workdir, "bundles", `${rc.runId}.json`);
 		if (existsSync(m)) {
@@ -362,7 +393,11 @@ export class GitHub {
 	 * The commit a bundle integrates on: `origin/<default>` after a fetch, or, for a repo that doesn't exist yet, the
 	 * clone's local `main`. Also says whether the repo exists now.
 	 */
-	async integrationBase(ws: Workspace, rc: RunCtx): Promise<{ base: string; newRepo: boolean }> {
+	integrationBase(ws: Workspace, rc: RunCtx): Promise<{ base: string; newRepo: boolean }> {
+		return withClone(cloneOf(workdirOf(rc), ws.repo), () => this.integrationBaseLocked(ws, rc));
+	}
+
+	private async integrationBaseLocked(ws: Workspace, rc: RunCtx): Promise<{ base: string; newRepo: boolean }> {
 		const host = this.host;
 		const id = identityOf(rc);
 		const exists = await host.repoExists(ws.repo, id);
