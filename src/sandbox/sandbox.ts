@@ -52,6 +52,8 @@ type EnvRecord = {
  */
 export const FACTORY_HOME_PRIVATE = ["secrets.json", "pi", "web-token", "web-url", "factory.log", "factory.sqlite", "factory.sqlite-wal", "factory.sqlite-shm", "factory.sqlite-journal", "environments", "qa-vms"];
 
+/** Roles that write the worktree: the builder (and its helpers, in its environment) and a bundle's integrator. */
+export const WRITE_ROLES: readonly string[] = ["builder", "integrator"];
 const shellQuote = (argv: readonly string[]) => argv.map((a) => `'${a.replace(/'/g, `'\\''`)}'`).join(" ");
 const within = (p: string, root: string) => p === root || p.startsWith(root.endsWith(sep) ? root : root + sep);
 /** Length of the longest root that contains p (-1: none); the roots that contain p are nested, so longest = most specific. */
@@ -113,7 +115,7 @@ class SandboxedEnv implements ExecutionEnv {
 		if (!allowed)
 			return {
 				ok: false,
-				error: new FileError("permission_denied" as any, `sandbox: writing ${path} is denied for the ${this.rec.role} role${this.rec.role === "builder" ? "" : " (read-only role)"}`, path),
+				error: new FileError("permission_denied" as any, `sandbox: writing ${path} is denied for the ${this.rec.role} role${WRITE_ROLES.includes(this.rec.role) ? "" : " (read-only role)"}`, path),
 			};
 		return undefined;
 	}
@@ -267,7 +269,7 @@ export class Sandbox {
 		const roots = [rec.worktree, ...(rec.gitCommonDir ? [rec.gitCommonDir] : []), ...rec.sandbox.extraWrite.map(expandHome)].map(real).filter((r) => !exposes(r));
 		const scratch = [real(rec.scratch)].filter((r) => !exposes(r));
 		const allowRead = [...new Set([...roots, ...scratch])].filter((r) => within(r, home));
-		const builder = rec.role === "builder";
+		const builder = WRITE_ROLES.includes(rec.role);
 		const writeRoots = [...scratch, ...(builder ? roots : [])];
 		// The private entries and the storage are write-denied too (deny wins, nothing is allowed inside them); the home itself
 		// only for the file tools, with the env's roots inside it as the more specific rule (homeDeny): the runtime cannot

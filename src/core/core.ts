@@ -27,8 +27,10 @@ import { Bridge, BridgeDoc, bridgeToolsNotFor, EnvDoc } from "./bridge.ts";
 import { DiscussionDoc, type DiscussionDocState, DiscussionIndex, toDiscussionView } from "./discussion-doc.ts";
 import { createDiscussionTask, draftInstructions, takeCheckoutNote } from "./discussion-task.ts";
 import { humanFindings } from "./findings.ts";
-import { DEFAULT_MESSAGE_ROLES, holdMessage, messageContent, messageTarget, parseMessage } from "./messages.ts";
-import { RunDoc, type RunDocState, RunIndex, toView } from "./run-doc.ts";
+import { BundleDoc, type BundleDocState, BundleIndex, toBundleView } from "./bundle-doc.ts";
+import { bundleRoleConfig, createBundleTask } from "./bundle-task.ts";
+import { bundleHoldMessage, bundleMessageContent, bundleMessageTarget, DEFAULT_MESSAGE_ROLES, holdMessage, messageContent, messageTarget, parseMessage } from "./messages.ts";
+import { isLegacyDelivery, RunDoc, type RunDocState, RunIndex, specPathOf, toView } from "./run-doc.ts";
 import { RunConfigDoc } from "./run-config.ts";
 import { createRunTask } from "./run-task.ts";
 import { assertNoLegacySections, ConfigStore, coreSchema, expandHome, hashConfig, isObj, type Obj, parseDuration, THINKING_LEVELS } from "./settings.ts";
@@ -36,6 +38,14 @@ import { addCost, sumUsage, type UsageSum } from "./usage.ts";
 import {
 	type AskId,
 	type AskResponse,
+	BUNDLE_RELEASED_STATES,
+	BUNDLE_STATES,
+	BUNDLE_TERMINAL_STATES,
+	type BundleAskResponse,
+	type BundleId,
+	type BundleMember,
+	type BundleState,
+	type BundleView,
 	type DiscussionId,
 	type DiscussionLink,
 	type DiscussionState,
@@ -70,6 +80,9 @@ function checkStates(states: unknown, known: readonly string[]): void {
 		throw new FactoryError("invalid", `states must be an array of: ${known.join(", ")}`);
 }
 
+/** What a subscriber filters on: a `project` matches run, discussion and bundle events; the others only their own. */
+type EventFilter = { project?: string; run?: RunId; discussion?: DiscussionId; bundle?: BundleId };
+
 const require = createRequire(import.meta.url);
 export const PI_DURABLE_VERSION: string = require("@earendil-works/pi-durable/package.json").version;
 
@@ -102,7 +115,10 @@ export class Factory implements FactoryCore {
 	private registry: Registry;
 	private runTask!: ReturnType<typeof createRunTask>;
 	private discussionTask!: ReturnType<typeof createDiscussionTask>;
-	private listeners = new Set<{ filter: { project?: string; run?: RunId; discussion?: DiscussionId }; on: (e: FactoryEvent) => void }>();
+	private bundleTask!: ReturnType<typeof createBundleTask>;
+	private listeners = new Set<{ filter: EventFilter; on: (e: FactoryEvent) => void }>();
+	/** Bundle documents, as last committed (keys are bundle ids). */
+	private bundles = new Map<string, BundleDocState>();
 	/** Keyed by document id: run ids and discussion ids never collide. */
 	private waiters = new Map<string, Set<Waiter>>();
 	private cache = new Map<string, RunDocState>();
@@ -148,7 +164,19 @@ export class Factory implements FactoryCore {
 			now: this.now,
 			log: this.log,
 		});
-		this.registry.install(defineExtension({ name: "factory.core", tasks: [this.runTask, this.discussionTask] }));
+		this.bundleTask = createBundleTask({
+			github: this.opts.github,
+			sandbox: this.opts.sandbox,
+			boat: this.opts.boat,
+			artifactsDir: this.artifactsDir,
+			acceptsImages: (ref) => this.acceptsImages(ref),
+			bridge: Bridge,
+			changed: (id, ms) => this.changed(id, ms),
+			now: this.now,
+			ciPollMs: this.opts.ciPollMs ?? 15_000,
+			log: this.log,
+		});
+		this.registry.install(defineExtension({ name: "factory.core", tasks: [this.runTask, this.discussionTask, this.bundleTask] }));
 
 		const storage = await this.openStorage();
 		this.harness = await Harness.open(
@@ -196,12 +224,16 @@ export class Factory implements FactoryCore {
 			this.ctx,
 		);
 		this.root = await this.harness.root(this.ctx);
+		await this.migrateRuns();
 		await this.loadCache();
 		this.harness.subscribeCommits((pub) => {
 			for (const ch of pub.changes) {
 				if (ch.type === "document" && ch.record.kind === "factory.run" && ch.record.key && ch.value) {
 					const v = ch.value as unknown as RunDocState;
 					setImmediate(() => this.onRunChange(v));
+				} else if (ch.type === "document" && ch.record.kind === "factory.bundle" && ch.record.key && ch.value) {
+					const v = ch.value as unknown as BundleDocState;
+					setImmediate(() => this.onBundleChange(v));
 				} else if (ch.type === "document" && ch.record.kind === "factory.discussion" && ch.record.key && ch.value) {
 					const v = ch.value as unknown as DiscussionDocState;
 					setImmediate(() => this.onDiscussionChange(v));
@@ -245,10 +277,10 @@ export class Factory implements FactoryCore {
 				const eff = this.config.effective(scope);
 				if (eff.qa?.enabled) refs.add(String(eff.boat?.apiKey ?? "env:BOAT_API_KEY"));
 			}
-			for (const run of this.cache.values()) if (run.pinned.config.boat?.apiKey) refs.add(String(run.pinned.config.boat.apiKey));
-			const keep = (runId: string, seq: number) => {
-				const run = this.cache.get(runId);
-				return !!run && run.state === "REVIEWING" && run.counters.reviewSeq === seq;
+			for (const run of [...this.cache.values(), ...this.bundles.values()]) if (run.pinned.config.boat?.apiKey) refs.add(String(run.pinned.config.boat.apiKey));
+			const keep = (id: string, seq: number) => {
+				const owner = this.cache.get(id) ?? this.bundles.get(id);
+				return !!owner && owner.state === "REVIEWING" && owner.counters.reviewSeq === seq;
 			};
 			return await this.opts.boat.sweep([...refs], keep, this.log);
 		} catch (e) {
@@ -314,6 +346,11 @@ export class Factory implements FactoryCore {
 		for (const id of idx?.runs ?? []) {
 			const d = (await this.harness.snapshot(RunDoc, id, this.ctx)) as RunDocState | undefined;
 			if (d) this.indexRun(d);
+		}
+		const bidx = await this.harness.snapshot(BundleIndex, this.ctx);
+		for (const id of bidx?.ids ?? []) {
+			const d = (await this.harness.snapshot(BundleDoc, id, this.ctx)) as BundleDocState | undefined;
+			if (d) this.indexBundle(d);
 		}
 		const didx = await this.harness.snapshot(DiscussionIndex, this.ctx);
 		for (const id of didx?.ids ?? []) {
@@ -390,17 +427,23 @@ export class Factory implements FactoryCore {
 				}
 				const m = this.convIndex.get(id);
 				if (!m) return;
+				const bundle = this.bundles.get(m.run);
+				if (bundle) {
+					this.emit({ type: "bundle.conversation.updated", bundle: bundle.id, conversationId: id, role: m.role }, { project: bundle.project, bundle: bundle.id });
+					return;
+				}
 				const run = this.cache.get(m.run);
 				if (run) this.emit({ type: "conversation.updated", run: m.run, conversationId: id, role: m.role }, { project: run.project, run: run.id });
 			}, 150),
 		);
 	}
 
-	/** `scope`: whose event it is. A `run` or `discussion` filter only matches events of that run or discussion. */
-	private emit(e: FactoryEvent, scope?: { project: string; run?: string; discussion?: string }) {
+	/** `scope`: whose event it is. A `run`, `discussion` or `bundle` filter only matches events of that one. */
+	private emit(e: FactoryEvent, scope?: { project: string; run?: string; discussion?: string; bundle?: string }) {
 		for (const l of [...this.listeners]) {
 			if (l.filter.run && l.filter.run !== scope?.run) continue;
 			if (l.filter.discussion && l.filter.discussion !== scope?.discussion) continue;
+			if (l.filter.bundle && l.filter.bundle !== scope?.bundle) continue;
 			if (l.filter.project && l.filter.project !== scope?.project) continue;
 			try {
 				l.on(e);
@@ -424,7 +467,7 @@ export class Factory implements FactoryCore {
 		});
 	}
 
-	subscribe(filter: { project?: string; run?: RunId; discussion?: DiscussionId }, on: (e: FactoryEvent) => void): Unsubscribe {
+	subscribe(filter: EventFilter, on: (e: FactoryEvent) => void): Unsubscribe {
 		const l = { filter, on };
 		this.listeners.add(l);
 		return () => this.listeners.delete(l);
@@ -484,6 +527,7 @@ export class Factory implements FactoryCore {
 			cost: [],
 			notices: [],
 			history: [{ from: null, to: "RECEIVED", at: now, round: 1 }],
+			flowVersion: 2,
 		};
 		(await tx.doc(RunIndex)).runs.push(runId);
 		const d = (await tx.doc(RunDoc, runId, seed as never)) as unknown as RunDocState;
@@ -600,6 +644,8 @@ export class Factory implements FactoryCore {
 		const by = this.by;
 		const d = await this.doc(run);
 		if (TERMINAL_STATES.includes(d.state)) throw new FactoryError("conflict", `run ${run} is already ${d.state}`);
+		const held = this.activeBundleOf(d);
+		if (held) throw new FactoryError("conflict", `run ${run} is in ${held}; drop it from the bundle or cancel the bundle first`);
 		await this.root.commit(async (tx) => {
 			const doc = (await tx.doc(RunDoc, run, null as never)) as unknown as RunDocState;
 			doc.cancelReason = reason ?? `cancelled by ${by}`;
@@ -702,6 +748,8 @@ export class Factory implements FactoryCore {
 			const d = (await tx.doc(RunDoc, run, null as never)) as unknown as RunDocState;
 			if (!d?.id) throw new FactoryError("not_found", `run ${run} does not exist`);
 			if (TERMINAL_STATES.includes(d.state)) throw new FactoryError("conflict", `run ${run} is ${d.state}; start a new run for follow-up work`);
+			const held = this.activeBundleOf(d);
+			if (held) throw new FactoryError("conflict", `run ${run} is in ${held}; message the bundle instead (it goes to the agent the bundle is with)`);
 			if (d.pendingAsk && !d.pendingAsk.response && d.pendingAsk.question.kind === "discussion")
 				throw new FactoryError("conflict", "the architect is waiting for an answer to its question; send it with answer");
 			const target = messageTarget(d);
@@ -723,7 +771,7 @@ export class Factory implements FactoryCore {
 		return { message: msg.id, to: msg.to, ...(now?.conversationId !== undefined ? { conversationId: String(now.conversationId) } : {}) };
 	}
 
-	private async deliver(d: RunDocState, msg: HumanMessage, conversationId: string) {
+	private async deliver(d: RunDocState, msg: HumanMessage, conversationId: string, family: { Doc: unknown; content: { type: "text"; text: string }[] } = { Doc: RunDoc, content: messageContent(d, msg) }) {
 		const id = (/^\d+$/.test(String(conversationId)) ? Number(conversationId) : conversationId) as never;
 		const conv = await this.harness.conversation(id, this.ctx);
 		if (!conv) return;
@@ -733,22 +781,22 @@ export class Factory implements FactoryCore {
 		const idle = !live || (live.generation === undefined && Object.keys(live.tools ?? {}).length === 0 && !live.run);
 		const before = sumUsage((await this.harness.snapshot(UsageDoc, id, this.ctx)) as any);
 		const started = this.now();
-		const sub = await conv.submit({ type: "input", content: messageContent(d, msg), requestId: msg.id, whenBusy: "steer" }, this.ctx);
+		const sub = await conv.submit({ type: "input", content: family.content, requestId: msg.id, whenBusy: "steer" }, this.ctx);
 		await this.root.commit(async (tx) => {
-			const doc = (await tx.doc(RunDoc, d.id, null as never)) as unknown as RunDocState;
+			const doc = (await tx.doc(family.Doc as typeof RunDoc, d.id, null as never)) as unknown as RunDocState;
 			const m = doc.messages?.find((x) => x.id === msg.id);
 			if (m && m.conversationId === undefined) m.conversationId = String(conversationId);
 		}, this.ctx);
 		// An idle agent answers in a turn of its own; the core records that turn's usage when it ends.
-		if (idle) void this.recordMessageTurn(d.id, msg.to, conversationId, sub, before, started).catch((e) => this.log(`message turn usage: ${e}`));
+		if (idle) void this.recordMessageTurn(d.id, msg.to, conversationId, sub, before, started, family.Doc).catch((e) => this.log(`message turn usage: ${e}`));
 	}
 
-	private async recordMessageTurn(run: RunId, role: Role, conversationId: string, sub: Submission, before: UsageSum, started: number) {
+	private async recordMessageTurn(run: RunId, role: Role, conversationId: string, sub: Submission, before: UsageSum, started: number, Doc: unknown = RunDoc) {
 		await sub.wait(this.ctx);
 		const id = (/^\d+$/.test(String(conversationId)) ? Number(conversationId) : conversationId) as never;
 		const after = sumUsage((await this.harness.snapshot(UsageDoc, id, this.ctx)) as any);
 		await this.root.commit(async (tx) => {
-			const doc = (await tx.doc(RunDoc, run, null as never)) as unknown as RunDocState;
+			const doc = (await tx.doc(Doc as typeof RunDoc, run, null as never)) as unknown as RunDocState;
 			if (doc?.id) addCost(doc, role, conversationId, before, after, this.now() - started, { trigger: "message" });
 		}, this.ctx);
 	}
@@ -759,6 +807,328 @@ export class Factory implements FactoryCore {
 		const file = join(this.artifactsDir, run, "screenshots", `${id}.png`);
 		if (!existsSync(file)) throw new FactoryError("not_found", `run ${run} has no screenshot ${id}`);
 		return { mime: "image/png", bytes: readFileSync(file) };
+	}
+
+	// ------------------------------------------------------------------ bundles (Ready runs shipped as one PR)
+	/** The active bundle (not MERGED or CANCELLED) a run is in, if any. */
+	private activeBundleOf(d: Pick<RunDocState, "bundle" | "bundleMerged">): string | undefined {
+		if (!d.bundle || d.bundleMerged) return undefined;
+		const b = this.bundles.get(d.bundle);
+		return b && BUNDLE_RELEASED_STATES.includes(b.state) ? undefined : d.bundle;
+	}
+
+	/** The board's ticket key of a run (PROJECT-N, N counting the project's runs by creation), as the web UI shows it. */
+	private ticketKey(run: RunDocState): string {
+		const runs = [...this.cache.values()].filter((r) => r.project === run.project).sort((a, b) => a.createdAt - b.createdAt);
+		const n = runs.findIndex((r) => r.id === run.id) + 1 || runs.length + 1;
+		const prefix = run.project.split(/[-_.]/)[0]!.replace(/[^A-Za-z0-9]/g, "").toUpperCase().slice(0, 6) || "RUN";
+		return `${prefix}-${n}`;
+	}
+
+	async createBundle(project: string, runs: RunId[]): Promise<BundleId> {
+		const by = this.by;
+		if (!Array.isArray(runs) || runs.length === 0 || !runs.every((r) => typeof r === "string")) throw new FactoryError("invalid", "a bundle needs at least one run");
+		if (new Set(runs).size !== runs.length) throw new FactoryError("invalid", "a run is listed twice");
+		this.config.project(project); // not_found
+		const eff = this.config.effective({ project });
+		// The integrator's model and thinking default to the builder's (pinned resolved, so its cost records name them).
+		const config = { ...eff, roles: { ...(eff.roles ?? {}), integrator: bundleRoleConfig(eff, "integrator") } };
+		let id!: BundleId;
+		await this.root.commit(async (tx) => {
+			const members: BundleMember[] = [];
+			for (const run of runs) {
+				const d = (await tx.doc(RunDoc, run, null as never)) as unknown as RunDocState;
+				if (!d?.id) throw new FactoryError("invalid", `run ${run} does not exist`);
+				if (d.project !== project) throw new FactoryError("invalid", `run ${run} belongs to project ${d.project}, not ${project}; a bundle holds tickets of one project`);
+				if (d.bundle && !d.bundleMerged) {
+					const b = (await tx.doc(BundleDoc, d.bundle, null as never)) as unknown as BundleDocState;
+					if (b?.id && !BUNDLE_RELEASED_STATES.includes(b.state)) throw new FactoryError("conflict", `run ${run} is already in ${d.bundle} (${b.state}); a run is in at most one active bundle`);
+				}
+				if (d.state !== "READY") throw new FactoryError("invalid", `run ${run} is ${d.state}; only READY runs can be shipped`);
+				members.push({ run, title: d.request.title, key: this.ticketKey(d), specPath: specPathOf(d), branch: d.workspace?.branch ?? `factory/${run}` });
+			}
+			const idx = await tx.doc(BundleIndex);
+			id = `bundle-${idx.ids.length + 1}`;
+			idx.ids.push(id);
+			const now = this.now();
+			const seed: BundleDocState = {
+				id,
+				project,
+				repo: this.config.project(project).repo,
+				state: "INTEGRATING",
+				createdAt: now,
+				updatedAt: now,
+				pinned: { config, configHash: hashConfig(config) },
+				members,
+				dropped: [],
+				counters: { reviewRound: 1, ciFixes: 0, buildSeq: 0, reviewSeq: 0, askSeq: 0, findingSeq: 0, discussionSeq: 0, integration: 1 },
+				caps: { review: Number(eff.policy?.reviewRoundCap ?? 3), ciFix: Number(eff.ci?.fixRounds ?? 2) },
+				loop: "review",
+				envs: {},
+				conversations: { reviewers: [], qa: [] },
+				pending: {},
+				humanFindingsForReview: [],
+				findingsLog: [],
+				advisory: [],
+				acceptedBlocking: [],
+				cost: [],
+				notices: [{ at: now, level: "info", text: `Shipped by ${by}: ${members.map((m) => m.key).join(", ")}` }],
+				messages: [],
+				history: [{ from: null, to: "INTEGRATING", at: now, round: 1 }],
+			};
+			const doc = (await tx.doc(BundleDoc, id, seed as never)) as unknown as BundleDocState;
+			for (const m of members) {
+				const d = (await tx.doc(RunDoc, m.run, null as never)) as unknown as RunDocState;
+				d.bundle = id;
+				d.notices.push({ at: now, level: "info", text: `Shipping in ${id}` });
+				d.updatedAt = now;
+			}
+			doc.taskId = (await tx.createTask(this.bundleTask, { bundleId: id, start: "INTEGRATING" as BundleState }, { ownership: { kind: "conversation" }, background: true })) as unknown as string;
+		}, this.ctx);
+		this.harness.resume();
+		return id;
+	}
+
+	private async bundleDoc(id: BundleId): Promise<BundleDocState> {
+		const d = typeof id === "string" ? ((await this.harness.snapshot(BundleDoc, id, this.ctx)) as BundleDocState | undefined) : undefined;
+		if (!d) throw new FactoryError("not_found", `bundle ${id} does not exist`);
+		return d;
+	}
+
+	async getBundle(id: BundleId): Promise<BundleView> {
+		return toBundleView(await this.bundleDoc(id));
+	}
+
+	/** Internal document (tests, diagnostics). */
+	async bundleDocument(id: BundleId): Promise<BundleDocState> {
+		return this.bundleDoc(id);
+	}
+
+	async listBundles(filter?: { project?: string; states?: BundleState[] }): Promise<BundleView[]> {
+		checkStates(filter?.states, BUNDLE_STATES);
+		const idx = await this.harness.snapshot(BundleIndex, this.ctx);
+		const out: BundleView[] = [];
+		for (const id of idx?.ids ?? []) {
+			const d = await this.bundleDoc(id);
+			if (filter?.project && d.project !== filter.project) continue;
+			if (filter?.states && !filter.states.includes(d.state)) continue;
+			out.push(toBundleView(d));
+		}
+		return out;
+	}
+
+	async getBundleConversation(id: BundleId, conversationIdIn: string | number): Promise<TranscriptView> {
+		const d = await this.bundleDoc(id);
+		const conversationId = (/^\d+$/.test(String(conversationIdIn)) ? Number(conversationIdIn) : conversationIdIn) as unknown as string;
+		const known = new Set([d.conversations.integrator, ...d.conversations.reviewers.map((r) => r.id), ...(d.conversations.qa ?? []).map((r) => r.id)].filter((x) => x !== undefined).map(String));
+		if (!known.has(String(conversationId))) {
+			const env = await this.harness.snapshot(EnvDoc, conversationId as never, this.ctx);
+			if (env?.runId !== id) throw new FactoryError("not_found", `conversation ${conversationId} does not belong to bundle ${id}`);
+		}
+		return this.transcript(conversationId, this.convIndex.get(conversationId)?.role);
+	}
+
+	/** Answer a bundle's pending ask (one commit; `check` refuses with a reason). */
+	private async respondBundle(id: BundleId, check: (d: BundleDocState) => string | undefined, response: BundleAskResponse): Promise<void> {
+		await this.bundleDoc(id); // not_found
+		await this.root.commit(async (tx) => {
+			const d = (await tx.doc(BundleDoc, id, null as never)) as unknown as BundleDocState;
+			const problem = !d.pendingAsk ? `bundle ${id} is ${d.state} and waits for nothing` : d.pendingAsk.response ? "that ask was already answered" : check(d);
+			if (problem) throw new FactoryError("not_pending", problem);
+			d.pendingAsk!.response = response as any;
+			d.updatedAt = this.now();
+		}, this.ctx);
+	}
+
+	private mergeAsk = (d: BundleDocState) => (d.pendingAsk!.question.kind !== "merge" ? `bundle ${d.id} is not waiting for Merge (${d.state})` : undefined);
+
+	async mergeBundle(id: BundleId): Promise<void> {
+		await this.respondBundle(id, this.mergeAsk, { type: "merge", by: this.by });
+	}
+
+	async requestBundleChanges(id: BundleId, feedback: string): Promise<void> {
+		if (typeof feedback !== "string" || !feedback.trim()) throw new FactoryError("invalid", "requesting changes needs feedback");
+		await this.respondBundle(id, this.mergeAsk, { type: "changes", feedback: feedback.trim(), by: this.by });
+	}
+
+	/** Runs to drop: listed, members, and at least one member left (`all` when every member is listed). */
+	private dropCheck(d: BundleDocState, runs: unknown): { all: boolean } {
+		if (!Array.isArray(runs) || runs.length === 0 || !runs.every((r) => typeof r === "string")) throw new FactoryError("invalid", "choose the runs to drop");
+		for (const r of runs) if (!d.members.some((m) => m.run === r)) throw new FactoryError("invalid", `run ${r} is not a member of ${d.id}`);
+		return { all: d.members.every((m) => runs.includes(m.run)) };
+	}
+
+	async dropFromBundle(id: BundleId, runs: RunId[]): Promise<void> {
+		const by = this.by;
+		const d = await this.bundleDoc(id);
+		const q = d.pendingAsk && !d.pendingAsk.response ? d.pendingAsk.question.kind : undefined;
+		if (q !== "merge" && q !== "escalation") throw new FactoryError("conflict", `tickets can be dropped at the merge card or an escalation; ${id} is ${d.state}`);
+		// Dropping every member is the same as cancelling.
+		if (this.dropCheck(d, runs).all) return this.as(by).cancelBundle(id, `every ticket was dropped by ${by}`);
+		await this.respondBundle(id, (x) => (x.pendingAsk!.question.kind !== q ? `bundle ${id} moved on` : undefined), { type: "drop", runs: [...runs], by });
+	}
+
+	async resolveBundleEscalation(id: BundleId, ask: AskId, choice: { moreRounds: number } | { drop: RunId[] } | { abort: true }): Promise<void> {
+		const by = this.by;
+		if (!choice || typeof choice !== "object") throw new FactoryError("invalid", "choose moreRounds, drop or abort");
+		if ("moreRounds" in choice && (!Number.isInteger(choice.moreRounds) || choice.moreRounds < 1 || choice.moreRounds > 10))
+			throw new FactoryError("invalid", "moreRounds must be an integer from 1 to 10");
+		if (!("moreRounds" in choice) && !("drop" in choice) && !("abort" in choice)) throw new FactoryError("invalid", "choose moreRounds, drop or abort");
+		const d = await this.bundleDoc(id);
+		let c = choice;
+		if ("drop" in choice && this.dropCheck(d, choice.drop).all) c = { abort: true };
+		await this.respondBundle(id, (x) => (x.pendingAsk!.id !== ask ? `ask ${ask} is not pending` : x.pendingAsk!.question.kind !== "escalation" ? "the pending ask is not an escalation" : undefined), {
+			type: "escalation",
+			choice: c,
+			by,
+		});
+	}
+
+	async cancelBundle(id: BundleId, reason?: string): Promise<void> {
+		const by = this.by;
+		const d = await this.bundleDoc(id);
+		if (d.state === "MERGED" || d.state === "CANCELLED") throw new FactoryError("conflict", `bundle ${id} is already ${d.state}`);
+		const why = reason ?? `cancelled by ${by}`;
+		const task = d.taskId !== undefined ? await this.harness.getTask(d.taskId as never, this.ctx) : undefined;
+		if (task && task.state.status !== "terminal") {
+			await this.root.commit(async (tx) => {
+				const doc = (await tx.doc(BundleDoc, id, null as never)) as unknown as BundleDocState;
+				doc.cancelReason = why;
+			}, this.ctx);
+			await this.harness.abortTask(d.taskId as never, this.ctx);
+			return;
+		}
+		// A FAILED bundle (its Task has ended): close its PR and release its members here.
+		if (d.delivery?.pr) await this.opts.github.closePr(d.delivery.pr, { runId: id, config: d.pinned.config }).catch((e) => this.log(`bundle ${id}: closing the PR failed: ${e}`));
+		await this.root.commit(async (tx) => {
+			const doc = (await tx.doc(BundleDoc, id, null as never)) as unknown as BundleDocState;
+			if (doc.state === "MERGED" || doc.state === "CANCELLED") throw new FactoryError("conflict", `bundle ${id} is already ${doc.state}`);
+			const now = this.now();
+			for (const m of doc.members) {
+				const r = (await tx.doc(RunDoc, m.run, null as never)) as unknown as RunDocState;
+				if (r?.id && r.bundle === id) {
+					delete r.bundle;
+					r.notices.push({ at: now, level: "info", text: `Released from ${id} (${why}); back in Ready` });
+					r.updatedAt = now;
+				}
+			}
+			delete doc.pendingAsk;
+			doc.notices.push({ at: now, level: "warn", text: `Cancelled in ${doc.state}: ${why}`, final: true });
+			doc.history.push({ from: doc.state, to: "CANCELLED", at: now, round: doc.counters.reviewRound });
+			doc.state = "CANCELLED";
+			doc.updatedAt = now;
+		}, this.ctx);
+	}
+
+	async retryBundle(id: BundleId): Promise<void> {
+		const by = this.by;
+		const d = await this.bundleDoc(id);
+		if (d.state !== "FAILED") throw new FactoryError("conflict", `bundle ${id} is ${d.state}; only a FAILED bundle can be retried`);
+		const old = d.taskId !== undefined ? await this.harness.getTask(d.taskId as never, this.ctx) : undefined;
+		if (old && old.state.status !== "terminal") throw new FactoryError("conflict", `bundle ${id} is still finishing; retry in a moment`);
+		await this.root.commit(async (tx) => {
+			const doc = (await tx.doc(BundleDoc, id, null as never)) as unknown as BundleDocState;
+			const f = doc.failure!;
+			const to: BundleState = BUNDLE_TERMINAL_STATES.includes(f.state) ? "INTEGRATING" : f.state;
+			doc.history.push({ from: doc.state, to, at: this.now(), round: doc.counters.reviewRound });
+			doc.state = to;
+			if (f.pendingAsk) doc.pendingAsk = f.pendingAsk;
+			delete doc.failure;
+			delete doc.driving;
+			doc.counters.attempt = (doc.counters.attempt ?? 0) + 1;
+			doc.notices.push({ at: this.now(), level: "info", text: `Retried by ${by}; resuming at ${to}` });
+			doc.taskId = (await tx.createTask(this.bundleTask, { bundleId: id, start: to }, { ownership: { kind: "conversation" }, background: true })) as unknown as string;
+		}, this.ctx);
+		this.harness.resume();
+	}
+
+	async messageBundle(id: BundleId, text: string): Promise<{ message: string; to: Role; conversationId?: string }> {
+		const by = this.by;
+		if (typeof text !== "string" || !text.trim()) throw new FactoryError("invalid", "a message needs text");
+		await this.bundleDoc(id); // not_found
+		let msg!: HumanMessage;
+		await this.root.commit(async (tx) => {
+			const d = (await tx.doc(BundleDoc, id, null as never)) as unknown as BundleDocState;
+			if (BUNDLE_TERMINAL_STATES.includes(d.state)) throw new FactoryError("conflict", `bundle ${id} is ${d.state}; it takes no messages`);
+			const target = bundleMessageTarget(d);
+			d.counters.msgSeq = (d.counters.msgSeq ?? 0) + 1;
+			msg = { id: `${id}-msg${d.counters.msgSeq}`, text: text.trim(), by, to: target.role, at: this.now() };
+			if (!d.messages) d.messages = [];
+			d.messages.push(msg);
+			d.updatedAt = this.now();
+		}, this.ctx);
+		const d = await this.bundleDoc(id);
+		const target = bundleMessageTarget(d);
+		if (target.role === msg.to && target.conversationId !== undefined && !bundleHoldMessage(d, target))
+			await this.deliver(d as unknown as RunDocState, msg, target.conversationId, { Doc: BundleDoc, content: bundleMessageContent(d, msg) });
+		const now = (await this.bundleDoc(id)).messages?.find((m) => m.id === msg.id);
+		return { message: msg.id, to: msg.to, ...(now?.conversationId !== undefined ? { conversationId: String(now.conversationId) } : {}) };
+	}
+
+	async getBundleScreenshot(id: BundleId, screenshotId: string): Promise<{ mime: string; bytes: Uint8Array }> {
+		await this.bundleDoc(id); // not_found
+		if (typeof screenshotId !== "string" || !/^r\d+-s\d+$/.test(screenshotId)) throw new FactoryError("invalid", `invalid screenshot id ${String(screenshotId)}`);
+		const file = join(this.artifactsDir, id, "screenshots", `${screenshotId}.png`);
+		if (!existsSync(file)) throw new FactoryError("not_found", `bundle ${id} has no screenshot ${screenshotId}`);
+		return { mime: "image/png", bytes: readFileSync(file) };
+	}
+
+	private indexBundle(d: BundleDocState) {
+		this.bundles.set(d.id, structuredClone(d));
+		if (d.conversations.integrator !== undefined) this.convIndex.set(d.conversations.integrator, { run: d.id, role: "integrator" });
+		for (const r of d.conversations.reviewers) this.convIndex.set(r.id, { run: d.id, role: "reviewer" });
+		for (const r of d.conversations.qa ?? []) this.convIndex.set(r.id, { run: d.id, role: "qa" });
+	}
+
+	private onBundleChange(v: BundleDocState) {
+		const prev = this.bundles.get(v.id);
+		this.indexBundle(v);
+		const ws = this.waiters.get(v.id);
+		if (ws) for (const w of [...ws]) w();
+		const scope = { project: v.project, bundle: v.id };
+		for (const h of v.history.slice(prev?.history.length ?? 0)) this.emit({ type: "bundle.state", bundle: v.id, project: v.project, from: h.from, to: h.to, round: h.round }, scope);
+		const prevAsk = prev?.pendingAsk;
+		if (prevAsk && !prevAsk.response && (v.pendingAsk?.id !== prevAsk.id || v.pendingAsk.response)) {
+			const by = v.pendingAsk?.id === prevAsk.id ? v.pendingAsk.response!.by : "core";
+			this.emit({ type: "bundle.askResolved", bundle: v.id, ask: prevAsk.id, by }, scope);
+		}
+		if (v.pendingAsk && !v.pendingAsk.response && v.pendingAsk.id !== prevAsk?.id) this.emit({ type: "bundle.ask", bundle: v.id, ask: v.pendingAsk.id, question: v.pendingAsk.question }, scope);
+		for (const n of v.notices.slice(prev?.notices.length ?? 0)) this.emit({ type: "bundle.notice", bundle: v.id, notice: n }, scope);
+	}
+
+	/**
+	 * Runs started before bundles existed (no `flowVersion`): those that had begun delivering the old way are marked
+	 * `legacy` and finish with their own PR, CI and merge gate; the others take the new flow (spec §1.1). Once, before
+	 * any Task resumes.
+	 */
+	private async migrateRuns() {
+		const idx = await this.harness.snapshot(RunIndex, this.ctx);
+		const old: string[] = [];
+		for (const id of idx?.runs ?? []) {
+			const d = (await this.harness.snapshot(RunDoc, id, this.ctx)) as RunDocState | undefined;
+			if (d && d.flowVersion === undefined && !TERMINAL_STATES.includes(d.state)) old.push(id);
+		}
+		if (!old.length) return;
+		await this.root.commit(async (tx) => {
+			for (const id of old) {
+				const d = (await tx.doc(RunDoc, id, null as never)) as unknown as RunDocState;
+				if (isLegacyDelivery(d)) {
+					d.legacy = true;
+					d.notices.push({ at: this.now(), level: "info", text: "This run began delivering before bundles existed: it finishes with its own PR, CI and merge gate" });
+				}
+				d.flowVersion = 2;
+			}
+		}, this.ctx);
+	}
+
+	async waitForBundle(id: BundleId, pred: (v: BundleView) => boolean, timeoutMs = 30_000): Promise<BundleView> {
+		const deadline = Date.now() + timeoutMs;
+		for (;;) {
+			const v = await this.getBundle(id);
+			if (pred(v)) return v;
+			if (Date.now() > deadline) throw new Error(`timeout waiting on bundle ${id}; state ${v.state}${v.failure ? ` (${v.failure.reason})` : ""}`);
+			await this.changed(id, 200);
+		}
 	}
 
 	// ------------------------------------------------------------------ discussions (a pre-ticket chat per project)
@@ -1015,7 +1385,7 @@ export class Factory implements FactoryCore {
 
 	private coreRules(eff: Obj, _scope: Scope): string[] {
 		const problems: string[] = [];
-		for (const role of ["architect", "builder", "helper", "reviewer", "qa"] as Role[]) {
+		for (const role of ["architect", "builder", "helper", "reviewer", "qa", "integrator"] as Role[]) {
 			const r = eff.roles?.[role];
 			if (!isObj(r) || r.model === undefined) continue;
 			const p = this.modelProblem(`roles.${role}.model`, r.model);

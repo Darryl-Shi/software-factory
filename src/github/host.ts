@@ -45,7 +45,10 @@ export interface GitHubHost {
 	gitAuth(id: Identity): Promise<{ extraArgs: string[]; env: Record<string, string> }>;
 	findPr(repo: string, head: string, id: Identity): Promise<PrInfo | undefined>;
 	createPr(repo: string, pr: { head: string; base: string; title: string; body: string }, id: Identity): Promise<PrInfo>;
-	updatePr(repo: string, number: number, body: string, id: Identity): Promise<void>;
+	/** Rewrite a PR's description (and its title, when given). */
+	updatePr(repo: string, number: number, body: string, id: Identity, title?: string): Promise<void>;
+	/** Close a PR without merging it. */
+	closePr(repo: string, number: number, id: Identity): Promise<void>;
 	getPr(repo: string, number: number, id: Identity): Promise<PrInfo>;
 	mergePr(repo: string, number: number, how: "merge" | "squash" | "rebase", id: Identity): Promise<void>;
 	checks(repo: string, sha: string, id: Identity): Promise<CheckRun[]>;
@@ -174,8 +177,14 @@ export class GhApiHost implements GitHubHost {
 		return this.pr(await this.ok(id, "POST", `/repos/${repo}/pulls`, pr));
 	}
 
-	async updatePr(repo: string, number: number, body: string, id: Identity) {
-		await this.ok(id, "PATCH", `/repos/${repo}/pulls/${number}`, { body });
+	async updatePr(repo: string, number: number, body: string, id: Identity, title?: string) {
+		await this.ok(id, "PATCH", `/repos/${repo}/pulls/${number}`, { body, ...(title !== undefined ? { title } : {}) });
+	}
+
+	async closePr(repo: string, number: number, id: Identity) {
+		const pr = await this.getPr(repo, number, id);
+		if (pr.state !== "open") return;
+		await this.ok(id, "PATCH", `/repos/${repo}/pulls/${number}`, { state: "closed" });
 	}
 
 	async getPr(repo: string, number: number, id: Identity) {
@@ -312,11 +321,40 @@ export class LocalGitHubHost implements GitHubHost {
 		this.log("createPr", repo, { number: created.number });
 		return this.toPr(created);
 	}
-	async updatePr(repo: string, number: number, body: string) {
+	async updatePr(repo: string, number: number, body: string, _id?: Identity, title?: string) {
 		this.mutate((s) => {
 			const p = s.prs.find((x) => x.repo === repo && x.number === number);
-			if (p) p.body = body;
+			if (p) {
+				p.body = body;
+				if (title !== undefined) p.title = title;
+			}
 		});
+	}
+	async closePr(repo: string, number: number) {
+		const closed = this.mutate((s) => {
+			const p = s.prs.find((x) => x.repo === repo && x.number === number);
+			if (!p || p.state !== "open") return false;
+			p.state = "closed";
+			return true;
+		});
+		if (closed) this.log("closePr", repo, { number });
+	}
+	/** Test control: a commit pushed straight to `branch` (another bundle or a human merged meanwhile). */
+	async pushCommit(repo: string, files: Record<string, string>, message = "external change", branch = "main") {
+		const work = mkdtempSync(join(tmpdir(), "push-"));
+		try {
+			await git(work, ["clone", "-q", this.bare(repo), "."]);
+			await git(work, ["checkout", "-q", branch]);
+			for (const [p, c] of Object.entries(files)) {
+				mkdirSync(join(work, p, ".."), { recursive: true });
+				writeFileSync(join(work, p), c);
+			}
+			await git(work, ["add", "-A"]);
+			await git(work, ["commit", "-q", "-m", message]);
+			await git(work, ["push", "-q", "origin", `HEAD:${branch}`]);
+		} finally {
+			rmSync(work, { recursive: true, force: true });
+		}
 	}
 	async getPr(repo: string, number: number) {
 		const p = this.state().prs.find((x) => x.repo === repo && x.number === number);
@@ -330,10 +368,12 @@ export class LocalGitHubHost implements GitHubHost {
 		try {
 			await git(work, ["clone", "-q", this.bare(repo), "."]);
 			await git(work, ["fetch", "-q", "origin", pr.head]);
-			if (how === "squash") {
-				await git(work, ["merge", "-q", "--squash", "FETCH_HEAD"]);
-				await git(work, ["commit", "-q", "-m", `Merge PR #${number} (squash)`]);
-			} else await git(work, ["merge", "-q", "--no-ff", "-m", `Merge PR #${number}`, "FETCH_HEAD"]);
+			const merged =
+				how === "squash"
+					? await git(work, ["merge", "-q", "--squash", "FETCH_HEAD"], { allowFail: true })
+					: await git(work, ["merge", "-q", "--no-ff", "-m", `Merge PR #${number}${how === "rebase" ? " (rebase)" : ""}`, "FETCH_HEAD"], { allowFail: true });
+			if (merged.code !== 0) throw new Error(`PR #${number} is not mergeable (merge conflict with ${pr.base})`);
+			if (how === "squash") await git(work, ["commit", "-q", "-m", `Merge PR #${number} (squash)`]);
 			await git(work, ["push", "-q", "origin", `HEAD:${pr.base}`]);
 		} finally {
 			rmSync(work, { recursive: true, force: true });

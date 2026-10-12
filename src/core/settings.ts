@@ -78,6 +78,14 @@ export function coreSchema(): Record<string, SettingField> {
 				helper: roleField(undefined, undefined, "Helpers the builder spawns; they write code (unset = the builder's)"),
 				reviewer: roleField("openai/gpt-6-sol", "high", "Reviewer: whole product vs spec, tests, code quality and security"),
 				qa: roleField("anthropic/claude-sonnet-5-5", "medium", "QA agent: uses the product in a boat.dev VM (AQ testing); the model must accept images"),
+				integrator: roleField(undefined, undefined, "Integrator: combines a bundle's tickets and fixes its findings (unset = the builder's)"),
+			},
+		},
+		bundle: {
+			type: "object",
+			description: "Bundles: Ready tickets shipped together as one PR",
+			fields: {
+				mergeMethod: { type: "enum", values: ["merge", "squash", "rebase"], default: "squash", description: "How Merge merges a bundle's PR: merge, squash or rebase" },
 			},
 		},
 		discussion: {
@@ -95,7 +103,7 @@ export function coreSchema(): Record<string, SettingField> {
 					type: "list",
 					of: { type: "enum", values: ["spec", "delivery", "merge"], description: "gate" },
 					default: ["spec"],
-					description: "Approval gates",
+					description: "Approval gates (merge is legacy: it still validates but no longer affects new runs; a bundle's Merge merges)",
 				},
 				reviewRoundCap: { type: "number", default: 3, min: 1, max: 20, description: "Review rounds before escalation" },
 				escalateOnNoProgress: { type: "boolean", default: true, description: "Escalate when a fix round leaves an empty diff" },

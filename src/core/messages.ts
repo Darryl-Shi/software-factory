@@ -1,6 +1,7 @@
 // Human messages to a running agent (`FactoryCore.message`). The core routes a message to the agent the run is with and
 // hands it to that Conversation as a Pi steer: placed after the agent's current tool round, or as a short turn of its
 // own when the agent is idle. A message never moves the run; gates and escalations stay explicit operations.
+import type { BundleDocState } from "./bundle-doc.ts";
 import type { RunDocState } from "./run-doc.ts";
 import type { HumanMessage, Role, RunState } from "./types.ts";
 
@@ -83,10 +84,55 @@ function situation(d: RunDocState, role: Role): string {
 				: "Your reviewed work is waiting for the human's delivery approval. Reply in text and do not call report_done. If you change files now, the change goes back through review before delivery.";
 		case "ESCALATED":
 			return `The run is escalated to the human (${d.escalation?.reason ?? "needs a decision"}). Reply in text and do not call report_done; the human decides how the run continues. If they grant more rounds, the findings come back to you.`;
+		case "READY":
+			return "Your reviewed work is Ready: it waits to be shipped in a bundle with other tickets. Reply in text and do not call report_done. If you change files now, the change goes back through review before it can ship.";
 		case "DELIVERING":
 		case "AWAITING_CI":
 			return "Your work is being delivered and checked by CI. Reply in text and do not call report_done. If CI fails, the failure comes back to you as a finding.";
 		default:
 			return "Reply in text and do not call report_done.";
+	}
+}
+
+// ---------------------------------------------------------------- bundles (bundles spec §2.5)
+
+/** States where the bundle Task drives the integrator or a reviewer itself. */
+const BUNDLE_AGENT_STATES = ["INTEGRATING", "FIXING", "REVIEWING"];
+
+/** Who receives a message to a bundle: the current reviewer while REVIEWING, otherwise the integrator. */
+export function bundleMessageTarget(d: Pick<BundleDocState, "state" | "conversations" | "counters">): { role: Role; conversationId?: string } {
+	if (d.state === "REVIEWING") {
+		const r = d.conversations.reviewers.find((x) => x.seq === d.counters.reviewSeq) ?? d.conversations.reviewers.at(-1);
+		return { role: "reviewer", ...(r ? { conversationId: r.id } : {}) };
+	}
+	return { role: "integrator", ...(d.conversations.integrator !== undefined ? { conversationId: d.conversations.integrator } : {}) };
+}
+
+/** As `holdMessage`: wait for the bundle Task to drive the role (it delivers held messages as steers). */
+export function bundleHoldMessage(d: Pick<BundleDocState, "state" | "driving">, target: { conversationId?: string }): boolean {
+	if (target.conversationId === undefined) return true;
+	return BUNDLE_AGENT_STATES.includes(d.state) && String(d.driving?.conversationId) !== String(target.conversationId);
+}
+
+/** What the bundle's agent receives: the header, a note on where the bundle is, then the human's text. */
+export function bundleMessageContent(d: BundleDocState, msg: HumanMessage): { type: "text"; text: string }[] {
+	const [head, body] = humanContent(msg.by, msg.id, msg.text) as [{ type: "text"; text: string }, { type: "text"; text: string }];
+	return [{ type: "text", text: `${head.text.slice(0, -1)}${bundleSituation(d, msg.to)}\n\n` }, body];
+}
+
+function bundleSituation(d: BundleDocState, role: Role): string {
+	if (role === "reviewer")
+		return `You are reviewing ${d.id} (review #${d.counters.reviewSeq}). Take this into account, but your verdict rests on the specs and on evidence you observe yourself. You still finish with submit_review.`;
+	switch (d.state) {
+		case "INTEGRATING":
+			return `You are integrating ${d.id}${d.integration?.conflict ? ` (resolving a conflict with ${d.integration.conflict.run})` : ""}. Take this into account and carry on; you still finish with report_done.`;
+		case "FIXING":
+			return `You are fixing findings on ${d.id} (round ${d.counters.reviewRound}). Take this into account and carry on; you still finish with report_done.`;
+		case "AWAITING_MERGE":
+			return `${d.id} is delivered${d.delivery?.url ? ` (${d.delivery.url})` : ""} and waiting for the human to merge it. Reply in text and do not call report_done. If you change files now, the change goes back through review and CI before it can merge.`;
+		case "ESCALATED":
+			return `${d.id} is escalated to the human (${d.escalation?.reason ?? "needs a decision"}). Reply in text and do not call report_done; the human decides how the bundle continues.`;
+		default:
+			return `${d.id} is ${d.state}. Reply in text and do not call report_done. If you change files now, the change goes back through review before it is delivered.`;
 	}
 }

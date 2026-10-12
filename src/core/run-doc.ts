@@ -86,7 +86,35 @@ export type RunDocState = {
 	usage?: Record<string, { input: number; output: number; cacheRead: number; cacheWrite: number; totalTokens: number; usd: number }>;
 	/** The last ask the core closed without a human response, and who closed it (a superseded spec approval). */
 	closedAsk?: { id: string; by: string };
+	/** 2: created (or migrated) by a factory with bundles. Runs without it were started before bundles existed. */
+	flowVersion?: number;
+	/** A run that had begun delivering under the old flow when the factory upgraded: it finishes with its own PR, CI and merge gate. */
+	legacy?: boolean;
+	/** The active or merged bundle the run belongs to (cleared when the bundle releases it). */
+	bundle?: string;
+	/** Set by the bundle when it merged: the run goes READY → DELIVERED. */
+	bundleMerged?: { bundle: string; delivery: Delivery };
+	/** READY: how many messages to the builder were already checked for a workspace change. */
+	readyChecked?: number;
 };
+
+/** Where a run's spec is committed: docs/specs/<run-id>.md, or the path its spec already has (docs/spec.md for older runs). */
+export function specPathOf(d: Pick<RunDocState, "id" | "artifacts">): string {
+	return d.artifacts.spec?.path ?? `docs/specs/${d.id}.md`;
+}
+
+/**
+ * Whether a run started before bundles existed had already begun delivering the old way: it then finishes with its own
+ * PR, CI and merge gate (spec §1.1 "Legacy runs").
+ */
+export function isLegacyDelivery(d: RunDocState): boolean {
+	if (d.flowVersion !== undefined) return false;
+	if (["DELIVERED", "FAILED", "CANCELLED"].includes(d.state)) return false;
+	if (d.state === "DELIVERING" || d.state === "AWAITING_CI") return true;
+	if (d.state === "AWAITING_APPROVAL" && d.gate === "merge") return true;
+	if (d.state === "ESCALATED" && d.escalation?.from === "AWAITING_CI") return true;
+	return d.artifacts.delivery !== undefined;
+}
 
 // Typed loosely for Chord's JSON constraint; use `as RunDocState` at read sites.
 export const RunDoc = defineDocFamily<Record<string, any>, any>({
@@ -145,6 +173,8 @@ export function toView(d: RunDocState): RunView {
 		messages: d.messages ?? [],
 		history: d.history,
 		...(d.workspace ? { workspace: d.workspace } : {}),
+		specPath: specPathOf(d),
+		...(d.bundle ? { bundle: d.bundle } : {}),
 		createdAt: d.createdAt,
 		updatedAt: d.updatedAt,
 	};

@@ -291,7 +291,7 @@ export class Boat {
 	}
 
 	/**
-	 * Startup sweep: delete every VM named `factory-<runId>-<seq>` that `keep` does not claim (orphans of a crash or of a
+	 * Startup sweep: delete every VM named `factory-<runId>-<seq>` (or `factory-<bundleId>-<seq>`) that `keep` does not claim (orphans of a crash or of a
 	 * factory that was down while the ttl ran out). One pass per distinct key reference.
 	 */
 	async sweep(apiKeyRefs: string[], keep: (runId: string, seq: number) => boolean, log: (m: string) => void = () => {}): Promise<string[]> {
@@ -300,7 +300,7 @@ export class Boat {
 			if (!resolveSecret(ref)) continue;
 			const api = this.backend(ref);
 			for (const vm of await api.list()) {
-				const m = /^factory-(run-[a-z0-9]+-[a-z0-9]+)-(\d+)$/.exec(vm.name ?? "");
+				const m = /^factory-(run-[a-z0-9]+-[a-z0-9]+|bundle-\d+)-(\d+)$/.exec(vm.name ?? "");
 				if (!m || keep(m[1]!, Number(m[2]))) continue;
 				await api.delete(vm.id).catch((e) => log(`sweep: deleting ${vm.name} failed: ${e}`));
 				deleted.push(vm.name!);
