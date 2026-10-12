@@ -1,12 +1,12 @@
 // Crash/resume durability (spec §4, §8.3): kill -9 the process mid-build and at a pending approval; reopening the
 // storage resumes the run from its last committed step, at the same round, with the same builder Conversation.
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
-import type { DiscussionView, FactoryEvent, RunView } from "../src/core/types.ts";
-import { makeFactory, newControl, type TestEnv } from "./helpers.ts";
+import type { BundleView, DiscussionView, FactoryEvent, RunView } from "../src/core/types.ts";
+import { bundleIn, makeFactory, newControl, shipAndMerge, type TestEnv, untilBundle } from "./helpers.ts";
 
 let t: TestEnv | undefined;
 afterEach(async () => {
@@ -15,7 +15,7 @@ afterEach(async () => {
 });
 
 /** `run`: the id the child wrote (a discussion's for the "disc-" modes); `before`: its view when it was killed. */
-async function crashChild<V = RunView>(dir: string, mode: string): Promise<{ run: string; before: V }> {
+async function crashChild<V = RunView>(dir: string, mode: string): Promise<{ run: string; before: V; bundle?: string }> {
 	const child = spawn(process.execPath, ["--import", "tsx", join(__dirname, "fixtures/crash-child.ts"), dir, mode], { stdio: "pipe", cwd: join(__dirname, "..") });
 	let err = "";
 	child.stderr.on("data", (d) => (err += d));
@@ -29,7 +29,8 @@ async function crashChild<V = RunView>(dir: string, mode: string): Promise<{ run
 	}
 	child.kill("SIGKILL");
 	await new Promise((r) => child.once("exit", r));
-	return { run: readFileSync(join(dir, "run-id"), "utf8"), before: JSON.parse(readFileSync(join(dir, "ready"), "utf8")) };
+	const bundle = existsSync(join(dir, "bundle-id")) ? readFileSync(join(dir, "bundle-id"), "utf8") : undefined;
+	return { run: readFileSync(join(dir, "run-id"), "utf8"), before: JSON.parse(readFileSync(join(dir, "ready"), "utf8")), ...(bundle ? { bundle } : {}) };
 }
 
 test("kill -9 mid-build: the run resumes at the same round with the same builder conversation", async () => {
@@ -44,12 +45,15 @@ test("kill -9 mid-build: the run resumes at the same round with the same builder
 	expect(resumed.state).toBe("BUILDING");
 	expect(resumed.reviewRound).toBe(2);
 	expect(resumed.conversations.builder).toBe(before.conversations.builder);
-	const v = await t.factory.waitForState(run, (x) => ["DELIVERED", "FAILED"].includes(x.state));
+	const r = await t.factory.waitForState(run, (x) => ["READY", "FAILED"].includes(x.state));
+	expect(r.state).toBe("READY");
+	await t.factory.createProject("todo", "me/todo"); // makeFactory rewrote config.yaml: add the project back
+	const v = await shipAndMerge(t.factory, run);
 	expect(v.state).toBe("DELIVERED");
 	expect(v.reviewRound).toBe(2);
 	expect(v.conversations.builder).toBe(before.conversations.builder);
 	// nothing before the crash was redone: one discussion, one spec, two builds, two reviews
-	expect(v.history.map((h) => h.to)).toEqual(["RECEIVED", "PREPARING", "DISCUSSING", "SPEC_READY", "BUILDING", "REVIEWING", "BUILDING", "REVIEWING", "DELIVERING", "AWAITING_CI", "DELIVERED"]);
+	expect(v.history.map((h) => h.to)).toEqual(["RECEIVED", "PREPARING", "DISCUSSING", "SPEC_READY", "BUILDING", "REVIEWING", "BUILDING", "REVIEWING", "DELIVERING", "READY", "DELIVERED"]);
 	// the builder's round-2 input was admitted once (idempotent submission), and the resumed generation answered it
 	const tr = await t.factory.getConversation(run, v.conversations.builder!);
 	expect(tr.items.filter((i) => i.role === "user").length).toBe(2);
@@ -66,8 +70,12 @@ test("kill -9 at a pending approval: the pending ask survives the restart and ca
 	expect(v0.state).toBe("AWAITING_APPROVAL");
 	expect(v0.pendingAsk?.id).toBe(before.pendingAsk!.id);
 	await t.factory.approve(run, "spec");
-	const v = await t.factory.waitForState(run, (x) => ["DELIVERED", "FAILED"].includes(x.state));
+	const r = await t.factory.waitForState(run, (x) => ["READY", "FAILED"].includes(x.state));
+	expect(r.state).toBe("READY");
+	await t.factory.createProject("todo", "me/todo"); // makeFactory rewrote config.yaml: add the project back
+	const v = await shipAndMerge(t.factory, run);
 	expect(v.state).toBe("DELIVERED");
+	expect(v.history.map((h) => h.to).slice(-4)).toEqual(["REVIEWING", "DELIVERING", "READY", "DELIVERED"]);
 });
 
 test("graceful close and reopen mid-discussion keeps the pending discussion question", async () => {
@@ -83,7 +91,10 @@ test("graceful close and reopen mid-discussion keeps the pending discussion ques
 	const v2 = await t.factory.getRun(run);
 	expect(v2.pendingAsk).toEqual(v1.pendingAsk);
 	await t.factory.answer(run, v2.pendingAsk!.id, "TypeScript");
-	expect((await t.factory.waitForState(run, (x) => x.state === "DELIVERED")).conversations.architect).toBe(v1.conversations.architect);
+	expect((await t.factory.waitForState(run, (x) => x.state === "READY")).conversations.architect).toBe(v1.conversations.architect);
+	const v = await shipAndMerge(t.factory, run);
+	expect(v.state).toBe("DELIVERED");
+	expect(v.conversations.architect).toBe(v1.conversations.architect);
 });
 
 test("kill -9 while a helper is mid-task, after its write landed: the file survives, the same helper Conversation carries on, the run goes on to review", async () => {
@@ -96,9 +107,12 @@ test("kill -9 while a helper is mid-task, after its write landed: the file survi
 	control.builderSubagent = true;
 	control.reviews = ["pass"];
 	t = await makeFactory({ dir, storage: "sqlite", control });
-	const v = await t.factory.waitForState(run, (x) => ["DELIVERED", "FAILED"].includes(x.state));
+	const r = await t.factory.waitForState(run, (x) => ["READY", "FAILED"].includes(x.state));
+	expect(r.state).toBe("READY");
+	await t.factory.createProject("todo", "me/todo"); // makeFactory rewrote config.yaml: add the project back
+	const v = await shipAndMerge(t.factory, run);
 	expect(v.state).toBe("DELIVERED");
-	expect(v.history.map((h) => h.to)).toEqual(["RECEIVED", "PREPARING", "DISCUSSING", "SPEC_READY", "BUILDING", "REVIEWING", "DELIVERING", "AWAITING_CI", "DELIVERED"]);
+	expect(v.history.map((h) => h.to)).toEqual(["RECEIVED", "PREPARING", "DISCUSSING", "SPEC_READY", "BUILDING", "REVIEWING", "DELIVERING", "READY", "DELIVERED"]);
 	// the same helper Conversation resumed from its transcript: it did not start over (no new first turn)
 	const tr = await t.factory.getConversation(run, v.conversations.builder!);
 	expect(tr.helpers.map(String)).toEqual([helper]);
@@ -117,8 +131,12 @@ test("kill -9 while the QA agent works: the run resumes in REVIEWING with the sa
 	const control = newControl();
 	control.runScript = true;
 	t = await makeFactory({ dir, storage: "sqlite", control });
-	const v = await t.factory.waitForState(run, (x) => ["DELIVERED", "FAILED"].includes(x.state));
+	const r = await t.factory.waitForState(run, (x) => ["READY", "FAILED"].includes(x.state));
+	expect(r.state).toBe("READY");
+	await t.factory.createProject("todo", "me/todo"); // makeFactory rewrote config.yaml: add the project back
+	const v = await shipAndMerge(t.factory, run);
 	expect(v.state).toBe("DELIVERED");
+	expect(v.history.map((h) => h.to).slice(-4)).toEqual(["REVIEWING", "DELIVERING", "READY", "DELIVERED"]);
 	expect(v.conversations.qa.map((x) => x.id)).toEqual(before.conversations.qa.map((x) => x.id));
 	expect(control.reviewerInputs).toEqual([]); // the review submitted before the crash was kept
 	expect(control.qaInputs).toEqual([]); // the QA agent carried on from its transcript
@@ -138,14 +156,80 @@ test("a QA VM deleted by hand while the factory is down is replaced on resume, a
 	const control = newControl();
 	control.runScript = true;
 	t = await makeFactory({ dir, storage: "sqlite", control });
-	const v = await t.factory.waitForState(run, (x) => ["DELIVERED", "FAILED"].includes(x.state));
+	const r = await t.factory.waitForState(run, (x) => ["READY", "FAILED"].includes(x.state));
+	expect(r.state).toBe("READY");
+	await t.factory.createProject("todo", "me/todo"); // makeFactory rewrote config.yaml: add the project back
+	const v = await shipAndMerge(t.factory, run);
 	expect(v.state).toBe("DELIVERED");
+	expect(v.history.map((h) => h.to).slice(-4)).toEqual(["REVIEWING", "DELIVERING", "READY", "DELIVERED"]);
 	expect(t.boat.state().calls.filter((c) => c.op === "create")).toHaveLength(2);
 	expect(v.reviews[0]!.vm).toMatchObject({ attempt: 2, state: "disposed" });
 	expect(v.conversations.qa.map((x) => x.id)).toEqual(before.conversations.qa.map((x) => x.id));
 	const tr = await t.factory.getConversation(run, v.conversations.qa[0]!.id);
 	expect(tr.items.some((i) => i.role === "user" && /has been replaced/.test(i.text ?? ""))).toBe(true);
 	expect((await t.boat.list()).filter((x) => x.name?.includes(run))).toEqual([]);
+});
+
+test("kill -9 while the integrator is resolving a conflict: the bundle resumes in INTEGRATING with the same integrator Conversation, then reviews, delivers one PR and merges", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "sf-crash-"));
+	const { run, before, bundle } = await crashChild<BundleView>(dir, "bundle-conflict");
+	const [a, b] = run.split(",") as [string, string];
+	expect(bundle).toBe(before.id);
+	expect(before.state).toBe("INTEGRATING");
+	expect(before.integration?.conflict).toEqual({ run: b, files: ["shared.txt"] });
+	expect(before.conversations.integrator).toBeDefined();
+	const control = newControl();
+	t = await makeFactory({ dir, storage: "sqlite", control });
+	const id = bundle!;
+	const resumed = await t.factory.getBundle(id);
+	expect(resumed.state).toBe("INTEGRATING");
+	expect(resumed.conversations.integrator).toBe(before.conversations.integrator);
+	expect(resumed.members.map((m) => m.run)).toEqual([a, b]);
+	const v = await untilBundle(t.factory, id, (x) => (x.state === "AWAITING_MERGE" && !!x.pendingAsk) || ["MERGED", "FAILED", "CANCELLED", "ESCALATED"].includes(x.state));
+	expect(v.state).toBe("AWAITING_MERGE");
+	expect(v.history.map((h) => h.to)).toEqual(["INTEGRATING", "REVIEWING", "DELIVERING", "AWAITING_CI", "AWAITING_MERGE"]);
+	expect(v.conversations.integrator).toBe(before.conversations.integrator);
+	expect(v.integration?.resolved).toEqual([{ run: b, files: ["shared.txt"] }]);
+	expect(v.integration?.conflict).toBeUndefined();
+	expect(v.reviews.length).toBe(1);
+	expect(t.host.state().prs.length).toBe(1);
+	// the conflict input was admitted once (idempotent submission), and the resumed generation answered it
+	const tr = await t.factory.getBundleConversation(id, v.conversations.integrator!);
+	const users = tr.items.filter((i) => i.role === "user");
+	expect(users.length).toBe(1);
+	expect(users[0]!.text).toContain("# Merge conflict");
+	expect(control.integratorInputs.length).toBe(1);
+	expect(tr.items.filter((i) => i.toolCalls?.some((c) => c.name === "report_done")).length).toBe(1);
+	await t.factory.mergeBundle(id);
+	expect((await untilBundle(t.factory, id, bundleIn("MERGED", "FAILED"))).state).toBe("MERGED");
+	for (const r of [a, b]) {
+		const x = await t.factory.waitForState(r, (y) => y.state === "DELIVERED");
+		expect(x.bundle).toBe(id);
+		expect(x.artifacts.delivery?.url).toBe(v.delivery!.url);
+	}
+}, 60_000);
+
+test("kill -9 while a legacy run waits for CI: after the restart it finishes the old way, with its own PR and no bundle", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "sf-crash-"));
+	const { run, before } = await crashChild(dir, "legacy-ci");
+	expect(before.state).toBe("AWAITING_CI");
+	const sha = before.artifacts.delivery!.sha;
+	expect(before.artifacts.delivery?.kind).toBe("pr");
+	// CI finishes green while the factory is down (the fake GitHub's state file is the "server")
+	const statePath = join(dir, "github", "github-state.json");
+	const gh = JSON.parse(readFileSync(statePath, "utf8"));
+	expect(gh.checks[`me/todo@${sha}`]).toEqual([{ name: "ci", status: "in_progress" }]);
+	gh.checks[`me/todo@${sha}`] = [{ name: "ci", status: "completed", conclusion: "success" }];
+	writeFileSync(statePath, JSON.stringify(gh, null, 2));
+	t = await makeFactory({ dir, storage: "sqlite" });
+	const v = await t.factory.waitForState(run, (x) => ["DELIVERED", "FAILED", "READY"].includes(x.state));
+	expect(v.state).toBe("DELIVERED");
+	expect(v.history.map((h) => h.to).slice(-5)).toEqual(["REVIEWING", "AWAITING_APPROVAL", "DELIVERING", "AWAITING_CI", "DELIVERED"]);
+	expect(v.artifacts.delivery).toMatchObject({ kind: "pr", sha, url: before.artifacts.delivery!.url });
+	expect(v.notices.some((n) => n.text === `CI green on ${sha.slice(0, 12)}`)).toBe(true);
+	expect(v.bundle).toBeUndefined();
+	expect(t.host.state().prs.map((p) => p.head)).toEqual([`factory/${run}`]);
+	expect(await t.factory.listBundles()).toEqual([]);
 });
 
 describe("discussions", () => {

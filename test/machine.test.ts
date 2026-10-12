@@ -1,10 +1,10 @@
 // State machine (spec §4): every transition, gates, rejections, escalations, fix-round caps, CI modes.
-import { existsSync, readFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import type { FactoryEvent, RunView } from "../src/core/types.ts";
 import { git } from "../src/github/git.ts";
-import { inState, makeFactory, type TestEnv, until } from "./helpers.ts";
+import { inState, makeFactory, shipAndMerge, type TestEnv, until } from "./helpers.ts";
 
 let t: TestEnv | undefined;
 afterEach(async () => {
@@ -15,6 +15,9 @@ afterEach(async () => {
 const states = (v: RunView) => v.history.map((h) => h.to);
 const G = { global: true } as const;
 const done = inState("DELIVERED", "FAILED", "CANCELLED");
+/** Where a run of the new flow stops (or ends). */
+const settled = inState("READY", "DELIVERED", "FAILED", "CANCELLED");
+const TO_READY = ["RECEIVED", "PREPARING", "DISCUSSING", "SPEC_READY", "BUILDING", "REVIEWING", "DELIVERING", "READY"];
 
 async function setup(settings: [string, unknown][] = [], project = "p", repo = "me/p") {
 	t = await makeFactory();
@@ -23,31 +26,83 @@ async function setup(settings: [string, unknown][] = [], project = "p", repo = "
 	return t;
 }
 const start = (body = "make hello", project = "p") => t!.factory.startRun(project, { source: "test", title: "hello", body });
+/**
+ * Start a run on the old (legacy) delivery flow: the spec gate holds it before DELIVERING, it is marked `legacy`, then
+ * the spec is approved. It then takes DELIVERING → AWAITING_CI → (merge gate) → DELIVERED with its own PR / push.
+ */
+async function startLegacy(body = "make hello", project = "p") {
+	const f = t!.factory;
+	const run = await start(body, project);
+	await until(f, run, (x) => x.state === "AWAITING_APPROVAL" && x.gate === "spec");
+	await f.patchRunForTests(run, (d) => {
+		d.legacy = true;
+	});
+	await f.approve(run, "spec");
+	return run;
+}
+const LEGACY_PREFIX = ["RECEIVED", "PREPARING", "DISCUSSING", "SPEC_READY", "AWAITING_APPROVAL", "BUILDING", "REVIEWING", "DELIVERING", "AWAITING_CI"];
 async function remoteFile(repo: string, ref: string, path: string) {
 	const r = await git(t!.host.bare(repo), ["show", `${ref}:${path}`], { allowFail: true });
 	return r.code === 0 ? r.stdout : undefined;
 }
 
-describe("new repo (zero to MVP), push-main", () => {
-	test("RECEIVED → PREPARING → DISCUSSING → SPEC_READY → BUILDING → REVIEWING → DELIVERING → AWAITING_CI → DELIVERED (no CI)", async () => {
+/** The ticket's section of a bundle's delivery notes / PR body (up to the next ticket or the integration section). */
+function ticketSection(text: string | undefined, title: string) {
+	const from = (text ?? "").indexOf(`## Ticket: ${title}`);
+	if (from < 0) return undefined;
+	const rest = text!.slice(from + 1);
+	const end = rest.search(/\n## (Ticket: |Integration)/);
+	return end < 0 ? rest : rest.slice(0, end);
+}
+
+describe("new repo (zero to MVP)", () => {
+	test("RECEIVED → PREPARING → DISCUSSING → SPEC_READY → BUILDING → REVIEWING → DELIVERING → READY; shipped alone → pushed to main (no CI) → DELIVERED", async () => {
 		await setup();
 		const run = await start();
-		const v = await until(t!.factory, run, done);
-		expect(states(v)).toEqual(["RECEIVED", "PREPARING", "DISCUSSING", "SPEC_READY", "BUILDING", "REVIEWING", "DELIVERING", "AWAITING_CI", "DELIVERED"]);
+		const r = await until(t!.factory, run, settled);
+		expect(states(r)).toEqual(TO_READY);
+		expect(r.specPath).toBe(`docs/specs/${run}.md`);
+		expect(r.artifacts.delivery).toBeUndefined();
+		expect(t!.host.state().created).not.toContain("me/p");
+		const v = await shipAndMerge(t!.factory, run);
+		expect(states(v)).toEqual([...TO_READY, "DELIVERED"]);
 		expect(v.artifacts.delivery?.kind).toBe("repo");
-		expect(v.noCi).toBe(true);
+		const b = await t!.factory.getBundle(v.bundle!);
+		expect(b.noCi).toBe(true);
+		expect(b.notices.at(-1)!.noCi).toBe(true);
 		expect(t!.host.state().created).toContain("me/p");
-		expect(await remoteFile("me/p", "main", "docs/spec.md")).toContain("Acceptance behaviours");
+		expect(await remoteFile("me/p", "main", `docs/specs/${run}.md`)).toContain("Acceptance behaviours");
+		expect(await remoteFile("me/p", "main", "docs/spec.md")).toBeUndefined();
 		expect(await remoteFile("me/p", "main", "round-1.txt")).toBe("round 1\n");
 		const notes = await remoteFile("me/p", "main", "docs/delivery-notes.md");
+		expect(notes).toContain("## Ticket: hello");
+		expect(ticketSection(notes, "hello")).toContain(`docs/specs/${run}.md`);
+		expect(notes).toContain("## Integration");
 		expect(notes).toContain("no CI");
 		expect(v.notices.at(-1)!.final).toBe(true);
-		expect(v.notices.at(-1)!.noCi).toBe(true);
+		expect(v.notices.at(-1)!.text).toBe(`Merged in ${v.bundle}: ${v.artifacts.delivery!.url}`);
 		// pinned config + Pi version + cost per role per round
 		expect(v.configHash).toMatch(/^[0-9a-f]{16}$/);
 		expect(v.piVersion).toBe("1.1.0");
 		expect(v.cost.map((c) => `${c.role}:${c.round}`)).toEqual(["architect:0", "builder:1", "reviewer:1"]);
 		expect(v.cost.every((c) => c.totalTokens > 0 && c.durationMs >= 0)).toBe(true);
+	});
+
+	test("legacy run: push-main delivery → AWAITING_CI → DELIVERED (no CI), with its own delivery notes", async () => {
+		await setup([["policy.approvals", ["spec"]]]);
+		const run = await startLegacy();
+		const v = await until(t!.factory, run, done);
+		expect(states(v)).toEqual([...LEGACY_PREFIX, "DELIVERED"]);
+		expect(v.artifacts.delivery?.kind).toBe("repo");
+		expect(v.noCi).toBe(true);
+		expect(t!.host.state().created).toContain("me/p");
+		expect(await remoteFile("me/p", "main", v.specPath)).toContain("Acceptance behaviours");
+		expect(await remoteFile("me/p", "main", "round-1.txt")).toBe("round 1\n");
+		const notes = await remoteFile("me/p", "main", "docs/delivery-notes.md");
+		expect(notes).toContain(`run \`${run}\``);
+		expect(notes).toContain("no CI");
+		expect(v.notices.at(-1)!.final).toBe(true);
+		expect(v.notices.at(-1)!.noCi).toBe(true);
 	});
 
 	test("discussion: ask_human → pending ask → answer resubmitted → spec gate → approve", async () => {
@@ -70,7 +125,9 @@ describe("new repo (zero to MVP), push-main", () => {
 		expect(v.pendingAsk!.question).toMatchObject({ kind: "approval", gate: "spec", options: ["approve", "reject"] });
 		expect(t!.control.architectInputs[1]).toBe("TypeScript");
 		await t!.factory.approve(run, "spec");
-		v = await until(t!.factory, run, done);
+		v = await until(t!.factory, run, settled);
+		expect(v.state).toBe("READY");
+		v = await shipAndMerge(t!.factory, run);
 		expect(v.state).toBe("DELIVERED");
 		const resolved = events.filter((e) => e.type === "run.askResolved");
 		expect(resolved[0]).toMatchObject({ type: "run.askResolved", by: "web" });
@@ -89,7 +146,7 @@ describe("new repo (zero to MVP), push-main", () => {
 		expect(v.conversations.architect).toBe(architect);
 		expect(t!.control.architectInputs[1]).toContain("use SQLite instead");
 		await t!.factory.approve(run, "spec");
-		expect((await until(t!.factory, run, done)).state).toBe("DELIVERED");
+		expect((await until(t!.factory, run, settled)).state).toBe("READY");
 	});
 });
 
@@ -98,9 +155,9 @@ describe("review loop", () => {
 		await setup();
 		t!.control.reviews = ["fail", "pass-advisory"];
 		const run = await start();
-		const v = await until(t!.factory, run, done);
-		expect(v.state).toBe("DELIVERED");
-		expect(states(v)).toEqual(["RECEIVED", "PREPARING", "DISCUSSING", "SPEC_READY", "BUILDING", "REVIEWING", "BUILDING", "REVIEWING", "DELIVERING", "AWAITING_CI", "DELIVERED"]);
+		let v = await until(t!.factory, run, settled);
+		expect(v.state).toBe("READY");
+		expect(states(v)).toEqual(["RECEIVED", "PREPARING", "DISCUSSING", "SPEC_READY", "BUILDING", "REVIEWING", "BUILDING", "REVIEWING", "DELIVERING", "READY"]);
 		expect(v.reviewRound).toBe(2);
 		expect(v.conversations.reviewers.length).toBe(2);
 		expect(v.conversations.reviewers[0]!.id).not.toBe(v.conversations.reviewers[1]!.id);
@@ -112,13 +169,15 @@ describe("review loop", () => {
 		expect(userInputs[1]).toContain("it does not print hello");
 		expect(t!.control.reviewerInputs[1]).toContain("Your prior findings and the builder's responses");
 		expect(t!.control.reviewerInputs[1]).toContain("builder: fixed");
-		// advisory findings of the final review are collected and delivered
+		// advisory findings of the final review are collected and delivered (in the run's ticket section)
 		expect(v.advisory.map((f) => f.description)).toEqual(["consider colours"]);
-		expect(await remoteFile("me/p", "main", "docs/delivery-notes.md")).toContain("consider colours");
 		expect(v.cost.filter((c) => c.role === "reviewer").map((c) => c.round)).toEqual([1, 2]);
+		v = await shipAndMerge(t!.factory, run);
+		expect(v.state).toBe("DELIVERED");
+		expect(ticketSection(await remoteFile("me/p", "main", "docs/delivery-notes.md"), "hello")).toContain("consider colours");
 	});
 
-	test("review round cap → ESCALATED; more rounds raises the cap; then delivered", async () => {
+	test("review round cap → ESCALATED; more rounds raises the cap; then READY", async () => {
 		await setup([["policy.reviewRoundCap", 2]]);
 		t!.control.reviews = ["fail", "fail", "pass"];
 		const run = await start();
@@ -128,22 +187,27 @@ describe("review loop", () => {
 		expect(v.pendingAsk!.question).toMatchObject({ kind: "escalation", options: ["accept", "more-rounds", "abort"] });
 		await expect(t!.factory.resolveEscalation(run, v.pendingAsk!.id, { moreRounds: 0 })).rejects.toThrow();
 		await t!.factory.resolveEscalation(run, v.pendingAsk!.id, { moreRounds: 1 });
-		v = await until(t!.factory, run, done);
-		expect(v.state).toBe("DELIVERED");
+		v = await until(t!.factory, run, settled);
+		expect(v.state).toBe("READY");
 		expect(v.caps.review).toBe(3);
 		expect(v.reviewRound).toBe(3);
 	});
 
-	test("escalation accept → DELIVERING; open blocking findings are listed in the delivery note and final report", async () => {
+	test("escalation accept → DELIVERING → READY; open blocking findings are listed in the ticket's delivery notes and final report", async () => {
 		await setup([["policy.reviewRoundCap", 1]]);
 		t!.control.reviews = ["fail"];
 		const run = await start();
 		let v = await until(t!.factory, run, inState("ESCALATED"));
 		await t!.factory.resolveEscalation(run, v.pendingAsk!.id, { accept: true });
-		v = await until(t!.factory, run, done);
-		expect(v.state).toBe("DELIVERED");
+		v = await until(t!.factory, run, settled);
+		expect(v.state).toBe("READY");
+		expect(states(v).slice(-3)).toEqual(["ESCALATED", "DELIVERING", "READY"]);
 		expect(v.acceptedBlocking.map((f) => f.description)).toEqual(["it does not print hello"]);
-		expect(await remoteFile("me/p", "main", "docs/delivery-notes.md")).toContain("accepted as is");
+		v = await shipAndMerge(t!.factory, run);
+		expect(v.state).toBe("DELIVERED");
+		const section = ticketSection(await remoteFile("me/p", "main", "docs/delivery-notes.md"), "hello");
+		expect(section).toContain("accepted as is");
+		expect(section).toContain("it does not print hello");
 		expect(v.notices.at(-1)!.acceptedBlocking!.length).toBe(1);
 	});
 
@@ -153,7 +217,7 @@ describe("review loop", () => {
 		const run = await start();
 		const v = await until(t!.factory, run, inState("ESCALATED"));
 		await t!.factory.resolveEscalation(run, v.pendingAsk!.id, { abort: true });
-		expect((await until(t!.factory, run, done)).state).toBe("CANCELLED");
+		expect((await until(t!.factory, run, settled)).state).toBe("CANCELLED");
 	});
 
 	test("a fix round with an empty diff escalates early (no progress)", async () => {
@@ -161,7 +225,7 @@ describe("review loop", () => {
 		t!.control.reviews = ["fail"];
 		t!.control.noProgressFromInput = 2;
 		const run = await start();
-		const v = await until(t!.factory, run, inState("ESCALATED", "DELIVERED"));
+		const v = await until(t!.factory, run, inState("ESCALATED", "READY"));
 		expect(v.state).toBe("ESCALATED");
 		expect(v.escalation!.reason).toMatch(/no progress/);
 		expect(v.escalation!.from).toBe("BUILDING");
@@ -174,15 +238,15 @@ describe("review loop", () => {
 		const run = await start();
 		await until(t!.factory, run, (v) => v.reviewRound === 2);
 		t!.control.builderNoProgress = true;
-		expect((await until(t!.factory, run, done)).state).toBe("DELIVERED");
+		expect((await until(t!.factory, run, settled)).state).toBe("READY");
 	});
 
 	test("the bridge rejects an invalid review (no evidence, fail without blocking); the reviewer then submits a valid one", async () => {
 		await setup();
 		t!.control.reviews = ["invalid-then-pass"];
 		const run = await start();
-		const v = await until(t!.factory, run, done);
-		expect(v.state).toBe("DELIVERED");
+		const v = await until(t!.factory, run, settled);
+		expect(v.state).toBe("READY");
 		const tr = await t!.factory.getConversation(run, v.conversations.reviewers[0]!.id);
 		const results = tr.items.filter((i) => i.toolResult?.name === "submit_review").map((i) => i.toolResult!);
 		expect(results[0]!.isError).toBe(true);
@@ -192,12 +256,12 @@ describe("review loop", () => {
 	});
 });
 
-describe("existing repo (incremental), PR delivery, delivery + merge gates", () => {
-	test("reject at delivery and merge gates → same builder gets a blocking human finding, no round added, next reviewer sees it; approve → merge", async () => {
+describe("existing repo (incremental): branch pushed at READY, delivery gate; legacy PR delivery and merge gate", () => {
+	test("reject at the delivery gate → same builder gets a blocking human finding, no round added, next reviewer sees it; approve → DELIVERING → READY (branch pushed, no PR); shipped → merged", async () => {
 		t = await makeFactory();
 		await t.host.seedRepo("me/app", { "README.md": "# app\n", "AGENTS.md": "Test: true\n" });
 		await t.factory.createProject("app", "me/app");
-		await t.factory.setSetting({ project: "app" }, "policy.approvals", ["spec", "delivery", "merge"]);
+		await t.factory.setSetting({ project: "app" }, "policy.approvals", ["spec", "delivery"]);
 		const run = await t.factory.startRun("app", { source: "test", title: "add due dates", body: "add due dates" });
 		let v = await until(t.factory, run, inState("AWAITING_APPROVAL"));
 		await t.factory.approve(run, "spec");
@@ -216,31 +280,79 @@ describe("existing repo (incremental), PR delivery, delivery + merge gates", () 
 		expect(humanLog.findings[0]).toMatchObject({ source: "human", blocking: true });
 		expect(humanLog.responses?.[0]).toMatchObject({ status: "fixed" });
 		await t.factory.approve(run, "delivery");
-		v = await until(t.factory, run, (x) => x.state === "AWAITING_APPROVAL" && x.gate === "merge");
+		v = await until(t.factory, run, settled);
+		expect(v.state).toBe("READY");
+		expect(states(v).slice(-3)).toEqual(["AWAITING_APPROVAL", "DELIVERING", "READY"]);
+		expect(states(v).filter((s) => s === "BUILDING").length).toBe(2);
+		expect(states(v)).not.toContain("AWAITING_CI");
+		expect(v.artifacts.delivery).toBeUndefined();
+		expect(t.host.state().prs).toEqual([]);
+		expect(await remoteFile("me/app", `factory/${run}`, `docs/specs/${run}.md`)).toContain("Acceptance behaviours");
+		expect(await remoteFile("me/app", `factory/${run}`, "round-2.txt")).toBe("round 2\n");
+		v = await shipAndMerge(t.factory, run);
+		expect(v.state).toBe("DELIVERED");
+		expect(v.artifacts.delivery?.kind).toBe("pr");
+		const prs = t.host.state().prs;
+		expect(prs.length).toBe(1);
+		expect(prs[0]!.state).toBe("merged");
+		expect(prs[0]!.title).toBe("add due dates");
+		expect(ticketSection(prs[0]!.body, "add due dates")).toContain(`docs/specs/${run}.md`);
+		expect(await remoteFile("me/app", "main", `docs/specs/${run}.md`)).toContain("Acceptance behaviours");
+	});
+
+	test("legacy run: reject at the merge gate → same builder, back through review and the delivery gate, the PR is reused; approve at the merge gate → merged", async () => {
+		t = await makeFactory();
+		await t.host.seedRepo("me/app", { "README.md": "# app\n", "AGENTS.md": "Test: true\n" });
+		await t.factory.createProject("app", "me/app");
+		await t.factory.setSetting({ project: "app" }, "policy.approvals", ["delivery", "merge"]);
+		const run = await t.factory.startRun("app", { source: "test", title: "add due dates", body: "add due dates" });
+		let v = await until(t.factory, run, (x) => x.state === "AWAITING_APPROVAL" && x.gate === "delivery");
+		const builder = v.conversations.builder;
+		await t.factory.patchRunForTests(run, (d) => {
+			d.legacy = true;
+		});
+		await t.factory.approve(run, "delivery");
+		v = await until(t.factory, run, (x) => (x.state === "AWAITING_APPROVAL" && x.gate === "merge") || settled(x));
+		expect(v.gate).toBe("merge");
+		expect(states(v).slice(-4)).toEqual(["AWAITING_APPROVAL", "DELIVERING", "AWAITING_CI", "AWAITING_APPROVAL"]);
 		expect(v.artifacts.delivery?.kind).toBe("pr");
 		const pr = v.artifacts.delivery!.pr!;
+		expect(t.host.state().prs.length).toBe(1);
+		expect(t.host.state().prs[0]!.body).toContain(`run \`${run}\``);
 		// structured rejection at the merge gate
 		await t.factory.submitHumanFindings(run, "merge", [{ severity: "major", description: "rename the flag", specRef: "AB2" }]);
-		v = await until(t.factory, run, (x) => x.state === "AWAITING_APPROVAL" && x.gate === "delivery" && x.conversations.reviewers.length === 3);
+		v = await until(t.factory, run, (x) => x.state === "AWAITING_APPROVAL" && x.gate === "delivery" && x.conversations.reviewers.length === 2);
 		expect(v.reviewRound).toBe(1);
-		expect(t.control.reviewerInputs[2]).toContain("rename the flag");
+		expect(v.conversations.builder).toBe(builder);
+		expect(t.control.builderInputs[1]).toContain("The human rejected the merge gate.");
+		expect(t.control.builderInputs[1]).toContain("(human, BLOCKING, major) spec: AB2");
+		expect(t.control.builderInputs[1]).toContain("rename the flag");
+		expect(t.control.reviewerInputs[1]).toContain("rename the flag");
 		await t.factory.approve(run, "delivery");
-		v = await until(t.factory, run, (x) => x.state === "AWAITING_APPROVAL" && x.gate === "merge");
+		v = await until(t.factory, run, (x) => (x.state === "AWAITING_APPROVAL" && x.gate === "merge") || settled(x));
+		expect(v.gate).toBe("merge");
 		expect(v.artifacts.delivery!.pr!.number).toBe(pr.number); // the existing PR is reused
 		await t.factory.approve(run, "merge");
 		v = await until(t.factory, run, done);
 		expect(v.state).toBe("DELIVERED");
+		expect(states(v)).not.toContain("READY");
 		expect(t.host.state().prs.find((p) => p.number === pr.number)!.state).toBe("merged");
-		expect(await remoteFile("me/app", "main", "docs/spec.md")).toContain("Acceptance behaviours");
-		expect(states(v).filter((s) => s === "BUILDING").length).toBe(3);
+		expect(await remoteFile("me/app", "main", v.specPath)).toContain("Acceptance behaviours");
+		expect(states(v).filter((s) => s === "BUILDING").length).toBe(2);
 	});
 
-	test("merge gate off: the PR is left open (no auto-merge) and the run is DELIVERED", async () => {
+	test("legacy run: merge gate off: the PR is left open (no auto-merge) and the run is DELIVERED", async () => {
 		t = await makeFactory();
 		await t.host.seedRepo("me/app", { "README.md": "# app\n" });
 		await t.factory.createProject("app", "me/app");
+		await t.factory.setSetting({ project: "app" }, "policy.approvals", ["delivery"]);
 		const run = await t.factory.startRun("app", { source: "test", title: "x", body: "x" });
-		const v = await until(t.factory, run, done);
+		await until(t.factory, run, (x) => x.state === "AWAITING_APPROVAL" && x.gate === "delivery");
+		await t.factory.patchRunForTests(run, (d) => {
+			d.legacy = true;
+		});
+		await t.factory.approve(run, "delivery");
+		const v = await until(t.factory, run, settled);
 		expect(v.state).toBe("DELIVERED");
 		expect(v.artifacts.delivery?.kind).toBe("pr");
 		expect(t.host.state().prs[0]!.state).toBe("open");
@@ -248,28 +360,52 @@ describe("existing repo (incremental), PR delivery, delivery + merge gates", () 
 		expect(t.host.state().prs[0]!.body).toMatch(/no CI/);
 	});
 
-	test("the merge gate does not apply to push-main deliveries", async () => {
-		await setup([["policy.approvals", ["merge"]]]);
-		const run = await start();
-		const v = await until(t!.factory, run, done);
+	test("the merge gate is legacy: approvals [merge] does not stop a new run; the bundle's Merge merges its PR", async () => {
+		t = await makeFactory();
+		await t.host.seedRepo("me/app", { "README.md": "# app\n" });
+		await t.factory.createProject("app", "me/app");
+		await t.factory.setSetting({ project: "app" }, "policy.approvals", ["merge"]);
+		const run = await t.factory.startRun("app", { source: "test", title: "x", body: "x" });
+		let v = await until(t.factory, run, settled);
+		expect(states(v)).toEqual(TO_READY);
+		v = await shipAndMerge(t.factory, run);
 		expect(v.state).toBe("DELIVERED");
 		expect(states(v)).not.toContain("AWAITING_APPROVAL");
+		expect(t.host.state().prs[0]!.state).toBe("merged");
+	});
+
+	test("legacy run: the merge gate does not apply to push-main deliveries", async () => {
+		await setup([["policy.approvals", ["spec", "merge"]]]);
+		const run = await startLegacy();
+		const v = await until(t!.factory, run, done);
+		expect(v.state).toBe("DELIVERED");
+		expect(states(v)).toEqual([...LEGACY_PREFIX, "DELIVERED"]);
+		expect(states(v).filter((s) => s === "AWAITING_APPROVAL").length).toBe(1); // the spec gate only
 	});
 });
 
-describe("CI modes", () => {
-	test("ci.mode off: finishes at delivery without waiting for CI", async () => {
-		await setup([["ci.mode", "off"]]);
+describe("CI (per run: legacy runs only; bundle CI is in test/bundle.test.ts)", () => {
+	test("a new run never waits for CI: ci.mode required with no checks still stops at READY", async () => {
+		await setup([["ci.mode", "required"], ["ci.noChecksTimeout", "200ms"]]);
 		const run = await start();
-		const v = await until(t!.factory, run, done);
-		expect(v.state).toBe("DELIVERED");
-		expect(states(v)).not.toContain("AWAITING_CI");
+		const v = await until(t!.factory, run, inState("READY", "ESCALATED", "DELIVERED", "FAILED"));
+		expect(states(v)).toEqual(TO_READY);
+		expect(v.noCi).toBeUndefined();
 	});
 
-	test("ci.mode required and no checks → ESCALATED (no CI checks) after ci.noChecksTimeout", async () => {
-		await setup([["ci.mode", "required"], ["ci.noChecksTimeout", "400ms"]]);
-		const run = await start();
-		const v = await until(t!.factory, run, inState("ESCALATED", "DELIVERED"));
+	test("legacy run: ci.mode off: finishes at delivery without waiting for CI", async () => {
+		await setup([["ci.mode", "off"], ["policy.approvals", ["spec"]]]);
+		const run = await startLegacy();
+		const v = await until(t!.factory, run, settled);
+		expect(v.state).toBe("DELIVERED");
+		expect(states(v)).not.toContain("AWAITING_CI");
+		expect(states(v).slice(-2)).toEqual(["DELIVERING", "DELIVERED"]);
+	});
+
+	test("legacy run: ci.mode required and no checks → ESCALATED (no CI checks) after ci.noChecksTimeout", async () => {
+		await setup([["ci.mode", "required"], ["ci.noChecksTimeout", "400ms"], ["policy.approvals", ["spec"]]]);
+		const run = await startLegacy();
+		const v = await until(t!.factory, run, inState("ESCALATED", "DELIVERED", "READY"));
 		expect(v.state).toBe("ESCALATED");
 		expect(v.escalation!.reason).toMatch(/no CI checks/);
 		expect(v.escalation!.from).toBe("AWAITING_CI");
@@ -277,101 +413,109 @@ describe("CI modes", () => {
 		expect(v.history.at(-1)!.at - ci).toBeGreaterThanOrEqual(400);
 	});
 
-	test("ci.mode if-present and no checks → DELIVERED, noting no CI", async () => {
-		await setup([["ci.mode", "if-present"]]);
-		const run = await start();
-		const v = await until(t!.factory, run, done);
+	test("legacy run: ci.mode if-present and no checks → DELIVERED, noting no CI", async () => {
+		await setup([["ci.mode", "if-present"], ["policy.approvals", ["spec"]]]);
+		const run = await startLegacy();
+		const v = await until(t!.factory, run, settled);
 		expect(v.state).toBe("DELIVERED");
 		expect(v.noCi).toBe(true);
 	});
 
-	test("CI red → same builder fixes → review (counts toward ci.fixRounds) → redeliver → CI green", async () => {
-		await setup([["ci.mode", "required"]]);
+	test("legacy run: CI red → same builder fixes → review (counts toward ci.fixRounds) → redeliver → CI green", async () => {
+		await setup([["ci.mode", "required"], ["policy.approvals", ["spec"]]]);
 		t!.host.forceChecks("me/p", [{ name: "test", status: "completed", conclusion: "failure", summary: "1 failing" }], [{ name: "test", status: "completed", conclusion: "success" }]);
-		const run = await start();
-		const v = await until(t!.factory, run, done);
+		const run = await startLegacy();
+		const v = await until(t!.factory, run, settled);
 		expect(v.state).toBe("DELIVERED");
-		expect(states(v)).toEqual([
-			"RECEIVED", "PREPARING", "DISCUSSING", "SPEC_READY", "BUILDING", "REVIEWING", "DELIVERING", "AWAITING_CI",
-			"BUILDING", "REVIEWING", "DELIVERING", "AWAITING_CI", "DELIVERED",
-		]);
+		expect(states(v)).toEqual([...LEGACY_PREFIX, "BUILDING", "REVIEWING", "DELIVERING", "AWAITING_CI", "DELIVERED"]);
 		expect(v.ciFixes).toBe(1);
 		expect(v.reviewRound).toBe(1);
 		expect(t!.control.builderInputs[1]).toContain("CI failed on the delivered commit");
 		expect(t!.control.builderInputs[1]).toContain("(ci, BLOCKING");
 	});
 
-	test("ci.fixRounds 0: CI red escalates without a fix round", async () => {
-		await setup([["ci.fixRounds", 0]]);
+	test("legacy run: ci.fixRounds 0: CI red escalates without a fix round", async () => {
+		await setup([["ci.fixRounds", 0], ["policy.approvals", ["spec"]]]);
 		t!.host.forceChecks("me/p", [{ name: "test", status: "completed", conclusion: "failure" }]);
-		const run = await start();
-		const v = await until(t!.factory, run, inState("ESCALATED", "DELIVERED"));
+		const run = await startLegacy();
+		const v = await until(t!.factory, run, inState("ESCALATED", "DELIVERED", "READY"));
 		expect(v.state).toBe("ESCALATED");
 		expect(states(v).slice(-2)).toEqual(["AWAITING_CI", "ESCALATED"]);
 		expect(states(v).filter((s) => s === "BUILDING").length).toBe(1);
 	});
 
-	test("CI red at cap → ESCALATED; accept from AWAITING_CI → DELIVERED (merge gate off)", async () => {
-		await setup([["ci.fixRounds", 1]]);
+	test("legacy run: CI red at cap → ESCALATED; accept from AWAITING_CI → DELIVERED (merge gate off)", async () => {
+		await setup([["ci.fixRounds", 1], ["policy.approvals", ["spec"]]]);
 		const red = [{ name: "test", status: "completed" as const, conclusion: "failure" }];
 		t!.host.forceChecks("me/p", red, red);
-		const run = await start();
-		let v = await until(t!.factory, run, inState("ESCALATED"));
+		const run = await startLegacy();
+		let v = await until(t!.factory, run, inState("ESCALATED", "DELIVERED", "READY"));
+		expect(v.state).toBe("ESCALATED");
 		expect(v.ciFixes).toBe(1);
 		expect(v.escalation).toMatchObject({ from: "AWAITING_CI", cap: "ciFix" });
 		await t!.factory.resolveEscalation(run, v.pendingAsk!.id, { accept: true });
-		v = await until(t!.factory, run, done);
+		v = await until(t!.factory, run, settled);
 		expect(v.state).toBe("DELIVERED");
 		expect(states(v).slice(-2)).toEqual(["ESCALATED", "DELIVERED"]);
 	});
 
-	test("CI red at cap → more rounds → another CI fix round", async () => {
-		await setup([["ci.fixRounds", 0]]);
+	test("legacy run: CI red at cap → more rounds → another CI fix round", async () => {
+		await setup([["ci.fixRounds", 0], ["policy.approvals", ["spec"]]]);
 		t!.host.forceChecks("me/p", [{ name: "t", status: "completed", conclusion: "failure" }], [{ name: "t", status: "completed", conclusion: "success" }]);
-		const run = await start();
-		let v = await until(t!.factory, run, inState("ESCALATED"));
+		const run = await startLegacy();
+		let v = await until(t!.factory, run, inState("ESCALATED", "DELIVERED", "READY"));
+		expect(v.state).toBe("ESCALATED");
 		await t!.factory.resolveEscalation(run, v.pendingAsk!.id, { moreRounds: 1 });
-		v = await until(t!.factory, run, done);
+		v = await until(t!.factory, run, settled);
 		expect(v.state).toBe("DELIVERED");
 		expect(v.caps.ciFix).toBe(1);
 		expect(v.ciFixes).toBe(1);
 	});
 
-	test("a failing review after a CI fix counts toward ci.fixRounds, not reviewRoundCap", async () => {
-		await setup([["ci.fixRounds", 1]]);
+	test("legacy run: a failing review after a CI fix counts toward ci.fixRounds, not reviewRoundCap", async () => {
+		await setup([["ci.fixRounds", 1], ["policy.approvals", ["spec"]]]);
 		t!.host.forceChecks("me/p", [{ name: "t", status: "completed", conclusion: "failure" }]);
 		t!.control.reviews = ["pass", "fail"];
-		const run = await start();
-		const v = await until(t!.factory, run, inState("ESCALATED", "DELIVERED"));
+		const run = await startLegacy();
+		const v = await until(t!.factory, run, inState("ESCALATED", "DELIVERED", "READY"));
 		expect(v.state).toBe("ESCALATED");
 		expect(v.escalation).toMatchObject({ cap: "ciFix", from: "REVIEWING" });
 		expect(v.reviewRound).toBe(1);
 	});
 
-	test("ci.checks limits the checks that count", async () => {
-		await setup([["ci.checks", ["test"]], ["ci.mode", "required"]]);
+	test("legacy run: ci.checks limits the checks that count", async () => {
+		await setup([["ci.checks", ["test"]], ["ci.mode", "required"], ["policy.approvals", ["spec"]]]);
 		t!.host.forceChecks("me/p", [
 			{ name: "lint", status: "completed", conclusion: "failure" },
 			{ name: "test", status: "completed", conclusion: "success" },
 		]);
-		const run = await start();
-		const v = await until(t!.factory, run, done);
+		const run = await startLegacy();
+		const v = await until(t!.factory, run, settled);
 		expect(v.state).toBe("DELIVERED");
 		expect(v.noCi).toBeUndefined();
 	});
 
-	test("CI from a real workflow in the repo (local CI runner): pending → green", async () => {
-		await setup([["ci.mode", "required"]]);
-		// the builder in this test writes round-N.txt; seed a workflow via the spec artifact path is not possible, so
-		// add one to the workspace before delivery (as a builder would)
+	test("legacy run: CI from a real workflow in the repo (local CI runner): pending → green", async () => {
+		await setup([["ci.mode", "required"], ["policy.approvals", ["delivery"]]]);
+		const f = t!.factory;
 		const run = await start();
-		await until(t!.factory, run, (x) => x.state === "REVIEWING" || x.state === "DELIVERING" || done(x));
-		const ws = (await t!.factory.getRun(run)).workspace!;
-		const { writeFileSync, mkdirSync } = await import("node:fs");
-		mkdirSync(join(ws.path, ".github/workflows"), { recursive: true });
-		writeFileSync(join(ws.path, ".github/workflows/ci.yml"), "name: ci\non: [push]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: test -f round-1.txt\n");
-		const v = await until(t!.factory, run, done);
+		// add a workflow to the reviewed workspace at the delivery gate (as a builder acting on a message would): it is
+		// reviewed again before delivery
+		let v = await until(f, run, (x) => x.state === "AWAITING_APPROVAL" && x.gate === "delivery");
+		const { mkdirSync } = await import("node:fs");
+		mkdirSync(join(v.workspace!.path, ".github/workflows"), { recursive: true });
+		writeFileSync(join(v.workspace!.path, ".github/workflows/ci.yml"), "name: ci\non: [push]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: test -f round-1.txt\n");
+		await f.patchRunForTests(run, (d) => {
+			d.legacy = true;
+		});
+		const asked = new Set<string>();
+		while (v.state === "AWAITING_APPROVAL" && v.pendingAsk && !asked.has(v.pendingAsk.id)) {
+			asked.add(v.pendingAsk.id);
+			await f.approve(run, "delivery");
+			v = await until(f, run, (x) => settled(x) || x.state === "ESCALATED" || (x.state === "AWAITING_APPROVAL" && !!x.pendingAsk && !asked.has(x.pendingAsk.id)));
+		}
 		expect(v.state).toBe("DELIVERED");
+		expect(await remoteFile("me/p", "main", ".github/workflows/ci.yml")).toBeDefined();
 		expect(v.notices.some((n) => /CI green/.test(n.text))).toBe(true);
 	});
 });
@@ -391,10 +535,10 @@ describe("cancel, failure, retry", () => {
 		await t!.factory.retryRun(run);
 		v = await until(t!.factory, run, (x) => x.state === "DISCUSSING" && !!x.pendingAsk);
 		await t!.factory.answer(run, v.pendingAsk!.id, "Go");
-		expect((await until(t!.factory, run, done)).state).toBe("DELIVERED");
+		expect((await until(t!.factory, run, settled)).state).toBe("READY");
 	});
 
-	test("cancel at AWAITING_APPROVAL and at AWAITING_CI", async () => {
+	test("cancel at AWAITING_APPROVAL and (legacy run) at AWAITING_CI", async () => {
 		await setup([["policy.approvals", ["spec"]]]);
 		const run = await start();
 		await until(t!.factory, run, inState("AWAITING_APPROVAL"));
@@ -403,11 +547,10 @@ describe("cancel, failure, retry", () => {
 		await t!.factory.retryRun(run);
 		await until(t!.factory, run, inState("AWAITING_APPROVAL"));
 		await t!.factory.approve(run, "spec");
-		expect((await until(t!.factory, run, done)).state).toBe("DELIVERED");
+		expect((await until(t!.factory, run, settled)).state).toBe("READY");
 
-		await t!.factory.setSetting({ project: "p" }, "policy.approvals", []);
 		await t!.factory.setSetting({ project: "p" }, "ci.noChecksTimeout", "1h");
-		const run2 = await start();
+		const run2 = await startLegacy();
 		await until(t!.factory, run2, inState("AWAITING_CI"));
 		await t!.factory.cancelRun(run2);
 		const v2 = await until(t!.factory, run2, done);
@@ -444,16 +587,36 @@ describe("cancel, failure, retry", () => {
 		expect(v.failure!.state).toBe("PREPARING");
 	});
 
-	test("DELIVERING error → FAILED; retry resumes at DELIVERING", async () => {
-		await setup();
+	test("DELIVERING error (the branch push is refused) → FAILED; retry resumes at DELIVERING → READY", async () => {
+		t = await makeFactory();
+		await t.host.seedRepo("me/app", { "README.md": "# app\n" });
+		await t.factory.createProject("app", "me/app");
+		const hook = join(t.host.bare("me/app"), "hooks", "pre-receive");
+		const { mkdirSync } = await import("node:fs");
+		mkdirSync(join(t.host.bare("me/app"), "hooks"), { recursive: true });
+		writeFileSync(hook, "#!/bin/sh\necho 'GitHub is down' >&2\nexit 1\n");
+		chmodSync(hook, 0o755);
+		const run = await t.factory.startRun("app", { source: "test", title: "x", body: "x" });
+		let v = await until(t.factory, run, settled);
+		expect(v.state).toBe("FAILED");
+		expect(v.failure!.state).toBe("DELIVERING");
+		rmSync(hook);
+		await t.factory.retryRun(run);
+		v = await until(t.factory, run, (x) => x.state === "READY");
+		expect(states(v).slice(-3)).toEqual(["FAILED", "DELIVERING", "READY"]);
+		expect(await remoteFile("me/app", `factory/${run}`, "round-1.txt")).toBe("round 1\n");
+	});
+
+	test("legacy run: DELIVERING error → FAILED; retry resumes at DELIVERING", async () => {
+		await setup([["policy.approvals", ["spec"]]]);
 		const orig = t!.host.createRepo.bind(t!.host);
 		let fail = true;
 		t!.host.createRepo = async (...a: Parameters<typeof orig>) => {
 			if (fail) throw new Error("GitHub is down");
 			return orig(...a);
 		};
-		const run = await start();
-		let v = await until(t!.factory, run, done);
+		const run = await startLegacy();
+		let v = await until(t!.factory, run, settled);
 		expect(v.state).toBe("FAILED");
 		expect(v.failure).toMatchObject({ state: "DELIVERING", reason: "GitHub is down" });
 		fail = false;
@@ -470,12 +633,12 @@ describe("cancel, failure, retry", () => {
 		await t!.factory.setSetting(G, "roles.reviewer.model", "scripted/reviewer-strict");
 		await t!.factory.setSetting(G, "roles.reviewer.thinking", "low");
 		await t!.factory.approve(r1, "spec");
-		expect((await until(t!.factory, r1, done)).state).toBe("DELIVERED");
+		expect((await until(t!.factory, r1, settled)).state).toBe("READY");
 		expect(t!.control.reviewerModels).toEqual(["reviewer"]);
 		const r2 = await start();
 		await until(t!.factory, r2, inState("AWAITING_APPROVAL"));
 		await t!.factory.approve(r2, "spec");
-		const v2 = await until(t!.factory, r2, done);
+		const v2 = await until(t!.factory, r2, settled);
 		expect(t!.control.reviewerModels).toEqual(["reviewer", "reviewer-strict"]);
 		expect(v2.configHash).not.toBe(hash1);
 		const agent = await (await t!.factory.harnessForTests.conversation(v2.conversations.reviewers[0]!.id as never, {} as never))!.agent({} as never);
@@ -488,7 +651,7 @@ describe("roles and isolation", () => {
 	test("fixed tool sets: read-only roles get no write/edit; only the builder gets report_done and subagent; the reviewer has no browser", async () => {
 		await setup();
 		const run = await start();
-		const v = await until(t!.factory, run, done);
+		const v = await until(t!.factory, run, settled);
 		const h = t!.factory.harnessForTests;
 		const tools = async (id: string) => (await (await h.conversation(id as never, {} as never))!.agent({} as never)).tools.map((x) => x.name).sort();
 		expect(await tools(v.conversations.architect!)).toEqual(["ask_human", "bash", "read", "submit_spec", "web_search"]);
@@ -496,14 +659,45 @@ describe("roles and isolation", () => {
 		expect(await tools(v.conversations.reviewers[0]!.id)).toEqual(["bash", "read", "run_tests", "submit_review", "web_search"]);
 	});
 
-	test("delivered artifacts: AGENTS.md pointer is the builder's job; docs/spec.md is committed by the core at SPEC_READY", async () => {
+	test("delivered artifacts: AGENTS.md pointer is the builder's job; docs/specs/<run-id>.md is committed by the core at SPEC_READY", async () => {
 		await setup([["policy.approvals", ["spec"]]]);
 		const run = await start();
 		const v = await until(t!.factory, run, inState("AWAITING_APPROVAL"));
-		const spec = readFileSync(join(v.workspace!.path, "docs/spec.md"), "utf8");
+		expect(v.specPath).toBe(`docs/specs/${run}.md`);
+		const spec = readFileSync(join(v.workspace!.path, "docs/specs", `${run}.md`), "utf8");
 		expect(spec).toContain("## Acceptance behaviours");
-		const log = await git(v.workspace!.path, ["log", "--oneline"]);
-		expect(log.stdout).toMatch(/docs: spec v1/);
+		expect(existsSync(join(v.workspace!.path, "docs/spec.md"))).toBe(false);
+		const log = await git(v.workspace!.path, ["log", "--format=%s"]);
+		expect(log.stdout).toContain(`docs: spec v1 (factory run ${run})`);
+		const files = await git(v.workspace!.path, ["show", "--name-only", "--format=", "HEAD"]);
+		expect(files.stdout.trim()).toBe(`docs/specs/${run}.md`);
 		expect(existsSync(join(v.workspace!.path, ".git"))).toBe(true);
+	});
+
+	test("the builder's input names docs/specs/<run-id>.md as the contract; it updates docs/spec.md only if the repo already has one", async () => {
+		t = await makeFactory();
+		await t.host.seedRepo("me/with", { "README.md": "# with\n", "docs/spec.md": "# Product spec\n" });
+		await t.host.seedRepo("me/without", { "README.md": "# without\n" });
+		await t.factory.createProject("with", "me/with");
+		await t.factory.createProject("without", "me/without");
+		const a = await start("make hello", "with");
+		const ra = await until(t.factory, a, settled);
+		expect(ra.state).toBe("READY");
+		const inA = t.control.builderInputs[0]!;
+		expect(inA).toContain(`The spec is committed at docs/specs/${a}.md and is the contract`);
+		expect(inA).toContain("docs/spec.md is the product spec: update it to reflect this change");
+		expect(inA).not.toContain("do not create one");
+		const b = await start("make hello", "without");
+		const rb = await until(t.factory, b, settled);
+		expect(rb.state).toBe("READY");
+		const inB = t.control.builderInputs[1]!;
+		expect(inB).toContain(`The spec is committed at docs/specs/${b}.md and is the contract`);
+		expect(inB).toContain("The repo has no docs/spec.md (the product spec); do not create one.");
+		expect(inB).not.toContain("update it to reflect this change");
+		// a new repo has none either
+		await t.factory.createProject("fresh", "me/fresh");
+		const c = await start("make hello", "fresh");
+		expect((await until(t.factory, c, settled)).state).toBe("READY");
+		expect(t.control.builderInputs[2]).toContain("do not create one");
 	});
 });

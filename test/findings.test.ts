@@ -1,7 +1,7 @@
 // Findings/evidence enforcement (spec §2 "Findings", §3.4).
 import { afterEach, describe, expect, test } from "vitest";
 import { formatFinding, humanFindings, validateQa, validateResponses, validateReview, validateTickets } from "../src/core/findings.ts";
-import { makeFactory, type TestEnv } from "./helpers.ts";
+import { makeFactory, shipAndMerge, type TestEnv } from "./helpers.ts";
 
 const ok = { severity: "major", blocking: true, specRef: "AB1", description: "broken", evidence: "$ npm test\n1 failing" };
 
@@ -107,8 +107,9 @@ describe("bridge enforcement in a live run", () => {
 		t.control.responsePlan = ["omit", "wontfix-noreason", "wontfix"];
 		await t.factory.createProject("p", "me/p");
 		const run = await t.factory.startRun("p", { source: "t", title: "x", body: "x" });
-		const v = await t.factory.waitForState(run, (x) => ["DELIVERED", "FAILED", "ESCALATED"].includes(x.state));
-		expect(v.state).toBe("DELIVERED");
+		// a run that passes review stops at READY (bundles spec §1.1)
+		const v = await t.factory.waitForState(run, (x) => ["READY", "DELIVERED", "FAILED", "ESCALATED"].includes(x.state));
+		expect(v.state).toBe("READY");
 		const tr = await t.factory.getConversation(run, v.conversations.builder!);
 		const results = tr.items.filter((i) => i.toolResult?.name === "report_done").map((i) => i.toolResult!);
 		expect(results.map((r) => r.isError)).toEqual([false, true, true, false]);
@@ -123,7 +124,8 @@ describe("bridge enforcement in a live run", () => {
 		t.control.architectDouble = true;
 		await t.factory.createProject("p", "me/p");
 		const run = await t.factory.startRun("p", { source: "t", title: "x", body: "x" });
-		const v = await t.factory.waitForState(run, (x) => x.state === "DELIVERED");
+		const v = await t.factory.waitForState(run, (x) => ["READY", "FAILED", "ESCALATED"].includes(x.state));
+		expect(v.state).toBe("READY");
 		const tr = await t.factory.getConversation(run, v.conversations.architect!);
 		const results = tr.items.filter((i) => i.toolResult?.name === "submit_spec").map((i) => i.toolResult!);
 		expect(results.map((r) => r.isError)).toEqual([false, true]);
@@ -136,7 +138,8 @@ describe("bridge enforcement in a live run", () => {
 		t.control.architectNoAB = true;
 		await t.factory.createProject("p", "me/p");
 		const run = await t.factory.startRun("p", { source: "t", title: "x", body: "x" });
-		const v = await t.factory.waitForState(run, (x) => x.state === "DELIVERED");
+		const v = await t.factory.waitForState(run, (x) => ["READY", "FAILED", "ESCALATED"].includes(x.state));
+		expect(v.state).toBe("READY");
 		const tr = await t.factory.getConversation(run, v.conversations.architect!);
 		const results = tr.items.filter((i) => i.toolResult?.name === "submit_spec").map((i) => i.toolResult!);
 		expect(results.map((r) => r.isError)).toEqual([true, false]);
@@ -155,7 +158,9 @@ describe("helpers (subagent)", () => {
 		t.control.builderSubagent = true;
 		await t.factory.createProject("p", "me/p");
 		const run = await t.factory.startRun("p", { source: "t", title: "x", body: "x" });
-		const v = await t.factory.waitForState(run, (x) => x.state === "DELIVERED");
+		// shipped alone: the bundle (new repo) pushes the reviewed result to main
+		const v = await shipAndMerge(t.factory, run);
+		expect(v.state).toBe("DELIVERED");
 		const tr = await t.factory.getConversation(run, v.conversations.builder!);
 		expect(tr.helpers.length).toBe(1);
 		const h = await t.factory.getConversation(run, tr.helpers[0]!);
