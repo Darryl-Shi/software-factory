@@ -16,6 +16,7 @@ coverage/
 
 # local state: factory storage, test and dry-run work dirs
 .factory/
+.factory-dev/
 .factory-test/
 *.sqlite
 *.sqlite-*

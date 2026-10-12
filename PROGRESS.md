@@ -15,3 +15,9 @@ Spec: docs/spec.md (bundles). Notes for myself.
 
 ## Status
 - [x] types.ts
+- [x] run changes (READY, spec path, legacy), bundle task/doc, task-kit refactor, core ops/events, GitHub additions
+- [x] web UI (helper), tests updated (helpers), bundle/legacy tests, dry run (98/98), docs
+- [x] AGENTS.md, scripts/setup.sh, scripts/run.sh (credential-free scripted factory on :7317)
+- docs/spec.md was this ticket's spec; moved to docs/specs/run-mv4ghzj2-allm.md, docs/spec.md is now the product spec.
+- Drop note to the integrator goes with its next task (prepended); not delivered if the re-integration is clean.
+- policy.messages also gates messages to a bundle's reviewer; integrator always takes messages.
