@@ -136,7 +136,14 @@ test("a daemon updates: fast-forward, restart with the same serve arguments, the
 	// `factory status` prints the running SHA
 	const st = await factory(root, ["status", "--config", config]);
 	expect(st.stdout).toContain(`version ${to.slice(0, 7)}`);
-}, 240_000);
+	// `factory update --yes` from a terminal: the same check and apply, through the running factory
+	const third = push((w) => writeFileSync(join(w, "README.md"), `${readFileSync(join(w, "README.md"), "utf8")}\nagain\n`), "docs: another line");
+	const cli = await factory(root, ["update", "--yes", "--config", config]);
+	expect(cli.stdout).toContain("docs: another line");
+	expect(cli.stdout).toContain(`updated from ${to.slice(0, 7)} to ${third.slice(0, 7)}`);
+	expect(cli.code).toBe(0);
+	expect((await api("/api/version")).fullSha).toBe(third);
+}, 300_000);
 
 test("a version that can't start is rolled back: the old SHA runs again and the record says why", async () => {
 	expect((await factory(root, ["serve", "--config", config, "--fake-github", join(dir, "gh"), "--scripted"])).code).toBe(0);
