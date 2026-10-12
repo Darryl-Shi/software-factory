@@ -397,8 +397,9 @@ function files(opts: { remove: boolean; due: boolean; ci: boolean }, readmeExtra
 }
 
 const writes = (fs: Record<string, string>) => calls(...Object.entries(fs).map(([path, content]) => ["write", { path, content }] as [string, Record<string, unknown>]));
-const commit = (msg: string, progress: string) =>
-	call("bash", { command: `printf '%s\\n' ${JSON.stringify(progress)} >> PROGRESS.md && chmod +x scripts/setup.sh bin/todo.js 2>/dev/null; git add -A && git commit -qm ${JSON.stringify(msg)} && git log --oneline -1` });
+/** Commit everything; `progress` (if any) is appended to PROGRESS.md first. */
+const commit = (msg: string, progress?: string) =>
+	call("bash", { command: `${progress === undefined ? "" : `printf '%s\\n' ${JSON.stringify(progress)} >> PROGRESS.md && `}chmod +x scripts/setup.sh bin/todo.js 2>/dev/null; git add -A && git commit -qm ${JSON.stringify(msg)} && git log --oneline -1` });
 
 const PUSH_ATTEMPT = 'git remote -v; out=$(git push origin HEAD:refs/heads/agent-push 2>&1); echo PUSH-EXIT=$?; echo "$out" | tail -2; out=$(curl -sS -m 10 https://api.github.com/ -o /dev/null 2>&1); echo GITHUB-API-EXIT=$?; echo "$out" | tail -1';
 
@@ -439,17 +440,22 @@ export const builder: Script = async (ctx) => {
 			if (t === 3) return slow(commit("feat: due dates and --overdue filter", "- due dates: --due on add, --overdue on list, tests"));
 			return respond();
 		}
-		// generic incremental change: document it and add a test
+		// generic incremental change: document it and add a test. A "document …" ticket writes a page of its own under
+		// docs/ (two of them merge cleanly when bundled); any other appends to README's change log (two of them conflict).
 		const title = /^# todo — change: (.*)$/m.exec(spec)?.[1] ?? "change";
+		const page = /^document /i.test(title) ? `docs/${title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "")}.md` : undefined;
 		if (t === 0) return slow(call("read", { path: "AGENTS.md" }));
 		if (t === 1)
 			return slow(
 				calls(
-					["bash", { command: `printf '\\n## Change log\\n\\n- ${title.replace(/'/g, "")}\\n' >> README.md && echo ok` }],
+					page
+						? ["write", { path: page, content: `# ${title}\n\n${title}.\n` }]
+						: ["bash", { command: `printf '\\n## Change log\\n\\n- ${title.replace(/'/g, "")}\\n' >> README.md && echo ok` }],
 					["write", { path: `test/change-${ctx.inputs.length}-${Date.now() % 100000}.test.js`, content: `import { test } from "node:test";\nimport assert from "node:assert/strict";\ntest(${JSON.stringify(title)}, () => assert.ok(true));\n` }],
 				),
 			);
-		if (t === 2) return slow(commit(`feat: ${title}`, `- ${title}`));
+		// a page of its own leaves PROGRESS.md alone too, so that two "document …" tickets merge cleanly
+		if (t === 2) return slow(commit(`feat: ${title}`, page ? undefined : `- ${title}`));
 		return respond();
 	}
 

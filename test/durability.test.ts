@@ -209,6 +209,33 @@ test("kill -9 while the integrator is resolving a conflict: the bundle resumes i
 	}
 }, 60_000);
 
+test("kill -9 while a clean two-ticket combination is being reviewed: the bundle resumes in REVIEWING with the same review number and round, then delivers and merges", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "sf-crash-"));
+	const { run, before, bundle } = await crashChild<BundleView>(dir, "bundle-clean-review");
+	const [a, b] = run.split(",") as [string, string];
+	expect(before.state).toBe("REVIEWING");
+	expect(before.history.map((h) => h.to)).toEqual(["INTEGRATING", "REVIEWING"]);
+	expect(before.integration).toMatchObject({ changed: false, resolved: [], reviewCombination: true });
+	expect(before.reviews.length).toBe(1);
+	const control = newControl();
+	t = await makeFactory({ dir, storage: "sqlite", control });
+	const id = bundle!;
+	const resumed = await t.factory.getBundle(id);
+	expect(resumed.state).toBe("REVIEWING");
+	expect(resumed.reviews.map((r) => [r.seq, r.round])).toEqual(before.reviews.map((r) => [r.seq, r.round]));
+	expect(resumed.reviewRound).toBe(before.reviewRound);
+	expect(resumed.members.map((m) => m.run)).toEqual([a, b]);
+	const v = await untilBundle(t.factory, id, (x) => (x.state === "AWAITING_MERGE" && !!x.pendingAsk) || ["MERGED", "FAILED", "CANCELLED", "ESCALATED"].includes(x.state));
+	expect(v.state).toBe("AWAITING_MERGE");
+	// nothing before the crash was redone: one integration, one review of the combination
+	expect(v.history.map((h) => h.to)).toEqual(["INTEGRATING", "REVIEWING", "DELIVERING", "AWAITING_CI", "AWAITING_MERGE"]);
+	expect(v.reviews.map((r) => [r.seq, r.round])).toEqual(before.reviews.map((r) => [r.seq, r.round]));
+	expect(v.notices.filter((n) => /reviewing the combination/.test(n.text)).length).toBe(1);
+	expect(t.host.state().prs.length).toBe(1);
+	await t.factory.mergeBundle(id);
+	expect((await untilBundle(t.factory, id, bundleIn("MERGED", "FAILED"))).state).toBe("MERGED");
+}, 60_000);
+
 test("kill -9 while a legacy run waits for CI: after the restart it finishes the old way, with its own PR and no bundle", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "sf-crash-"));
 	const { run, before } = await crashChild(dir, "legacy-ci");

@@ -5,7 +5,7 @@ import type { DiscussionView } from "../../src/core/types.ts";
 import { makeFactory, newControl } from "../helpers.ts";
 
 const dir = process.argv[2]!;
-// "mid-build" | "approval" | "helper" | "qa" | "bundle-conflict" | "legacy-ci" | "disc-say" | "disc-draft" | "disc-ticket"
+// "mid-build" | "approval" | "helper" | "qa" | "bundle-conflict" | "bundle-clean-review" | "legacy-ci" | "disc-say" | "disc-draft" | "disc-ticket"
 const mode = process.argv[3]!;
 const control = newControl();
 control.reviews = mode === "mid-build" ? ["fail", "pass"] : ["pass"];
@@ -91,6 +91,33 @@ async function bundleConflict() {
 }
 
 /**
+ * "bundle-clean-review": two runs of an existing repo that merge cleanly reach READY, then a bundle of both hangs in
+ * REVIEWING (the review of the clean combination) with the reviewer mid-review. The bundle's id goes to "bundle-id" (the
+ * runs' ids to "run-id"), its view to "ready".
+ */
+async function bundleCleanReview() {
+	control.reviews = [];
+	await t.host.seedRepo("me/todo", { "README.md": "# todo\n", "AGENTS.md": "Test: true\n" });
+	await f.createProject("todo", "me/todo");
+	const a = await f.startRun("todo", { source: "test", title: "alpha", body: "make alpha" });
+	const b = await f.startRun("todo", { source: "test", title: "beta", body: "make beta" });
+	writeFileSync(join(dir, "run-id"), `${a},${b}`);
+	const end = (v: { state: string }) => ["READY", "FAILED", "CANCELLED"].includes(v.state);
+	const [ra, rb] = await Promise.all([f.waitForState(a, end, 60_000), f.waitForState(b, end, 60_000)]);
+	if (ra.state !== "READY" || rb.state !== "READY") throw new Error(`runs not READY: ${ra.state} ${rb.state}`);
+	control.reviewerHang = true;
+	const id = await f.createBundle("todo", [a, b]);
+	writeFileSync(join(dir, "bundle-id"), id);
+	poll(
+		async () => {
+			const v = await f.getBundle(id);
+			return v.state === "REVIEWING" && v.reviews.length === 1 && control.reviewerHanging ? {} : undefined;
+		},
+		async (extra) => writeFileSync(join(dir, "ready"), JSON.stringify({ ...(await f.getBundle(id)), ...extra })),
+	);
+}
+
+/**
  * "legacy-ci": a run of an existing repo, marked legacy while it waits at the delivery gate, delivers the old way (its
  * own PR) and waits in AWAITING_CI: the delivered commit's checks are forced to stay in progress (the parent turns
  * them green in the fake GitHub's state file after the kill).
@@ -148,5 +175,5 @@ async function discussionModes() {
 	}
 }
 
-await (mode.startsWith("disc-") ? discussionModes() : mode === "bundle-conflict" ? bundleConflict() : mode === "legacy-ci" ? legacyCi() : runModes());
+await (mode.startsWith("disc-") ? discussionModes() : mode === "bundle-conflict" ? bundleConflict() : mode === "bundle-clean-review" ? bundleCleanReview() : mode === "legacy-ci" ? legacyCi() : runModes());
 setInterval(() => {}, 1000);
