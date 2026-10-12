@@ -11,7 +11,8 @@ one project together as a **bundle**: one PR (or a push to `main` for a new repo
   [`docs/specs/run-mv46mros-6c1p.md`](docs/specs/run-mv46mros-6c1p.md); the five-column board and UI sizing:
   [`docs/specs/run-mv4rgjw0-ch4q.md`](docs/specs/run-mv4rgjw0-ch4q.md); self-update from the web UI:
   [`docs/specs/run-mv4rp25k-mqna.md`](docs/specs/run-mv4rp25k-mqna.md), product spec §12; the combined review of
-  clean multi-ticket bundles: [`docs/specs/run-mv4vd9xu-g2si.md`](docs/specs/run-mv4vd9xu-g2si.md)).
+  clean multi-ticket bundles: [`docs/specs/run-mv4vd9xu-g2si.md`](docs/specs/run-mv4vd9xu-g2si.md); bulk cancel and clear from the board's select
+  mode: [`docs/specs/run-mv545v95-rg77.md`](docs/specs/run-mv545v95-rg77.md)).
 - **Design and deviations:** `docs/design-spec.md`, `docs/superpowers/specs/*`, `DEVIATIONS.md`.
 - **How it fits together:** `docs/architecture.md`; settings: `docs/configuration.md`.
 
@@ -23,7 +24,7 @@ through `tsx`).
 Test: `npm test`
 
 - Typecheck: `npm run typecheck`
-- One file: `npx vitest run test/bundle.test.ts` (the board's layout and columns: `test/web-board.test.ts`, jsdom)
+- One file: `npx vitest run test/bundle.test.ts` (the board's layout, columns and select mode: `test/web-board.test.ts`, jsdom; bulk cancel: `test/cancel-runs.test.ts`)
 - `test/sandbox.test.ts` and `test/sandbox-write.test.ts` need a working bubblewrap + socat (they fail where user
   namespaces are not available, e.g. inside another sandbox).
 - Dry run (end to end through the HTTP API, scripted agents, fake GitHub): `DRYRUN_SANDBOX=0 npm run dry-run`

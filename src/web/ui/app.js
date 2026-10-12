@@ -92,7 +92,7 @@ function conn(down) {
 }
 
 // ===================================================================== client state (filled only from core reads and events)
-const ui = { runs: new Map(), discs: new Map(), bundles: new Map(), ship: [], mode: null, projects: [], schema: null, keys: new Map(), touched: new Map(), filter: { project: "", turn: false, active: false, closed: false, q: "" }, open: null, rendered: false };
+const ui = { runs: new Map(), discs: new Map(), bundles: new Map(), ship: [], selecting: false, sel: new Set(), selCols: {}, confirmBulk: null, mode: null, projects: [], schema: null, keys: new Map(), touched: new Map(), filter: { project: "", turn: false, active: false, closed: false, q: "" }, open: null, rendered: false };
 function computeKeys() {
   const by = {};
   [...ui.runs.values()].sort((a, b) => a.createdAt - b.createdAt).forEach((r) => {
@@ -270,6 +270,65 @@ function readyCardHtml(r) {
   const why = other ? `A bundle holds tickets of one project: ${proj} is ticked. Untick those to pick ${r.project}.` : `Pick ${keyOf(r.id)} to ship it`;
   return `<div class="ship-wrap${ticked ? " ticked" : ""}"><label class="ship-tick${other ? " off" : ""}" title="${esc(why)}"><input type="checkbox" data-ship="${esc(r.id)}" aria-label="${esc(why)}"${ticked ? " checked" : ""}${other ? " disabled" : ""}></label>${cardHtml(r)}</div>`;
 }
+// Select mode: a checkbox on every run card the board shows except runs held by an active bundle; bulk Cancel / Clear.
+const selectable = (r) => !!r && !r.cleared && !inActiveBundle(r) && boardColumn(r) != null;
+function selCardHtml(r) {
+  if (!selectable(r)) return cardHtml(r);
+  const on = ui.sel.has(r.id), label = `Select ${keyOf(r.id)}`;
+  return `<div class="ship-wrap sel-wrap${on ? " ticked" : ""}"><label class="ship-tick sel-tick" title="${esc(label)}"><input type="checkbox" data-sel="${esc(r.id)}" aria-label="${esc(label)}"${on ? " checked" : ""}></label>${cardHtml(r)}</div>`;
+}
+// The selected runs the bar's two actions act on: live ones (Cancel K) and terminal ones not yet cleared (Clear M).
+function selSplit() {
+  const live = [], done = [];
+  for (const id of ui.sel) {
+    const r = ui.runs.get(id);
+    if (!r || r.cleared) continue;
+    (TERMINAL.includes(r.state) ? done : live).push(id);
+  }
+  return { live, done };
+}
+function renderSelBar() {
+  const bar = $("#sel-bar");
+  if (!bar) return;
+  if (!ui.selecting || !ui.sel.size) { bar.hidden = true; bar.innerHTML = ""; ui.confirmBulk = null; return; }
+  const { live, done } = selSplit();
+  const sigs = { cancel: `cancel:${[...live].sort().join(",")}`, clear: `clear:${[...done].sort().join(",")}` };
+  if (ui.confirmBulk && ui.confirmBulk !== sigs.cancel && ui.confirmBulk !== sigs.clear) ui.confirmBulk = null; // the set changed
+  const confirm = (k) => ui.confirmBulk === sigs[k];
+  bar.hidden = false;
+  bar.innerHTML = `<span class="sel-n">${ui.sel.size} selected</span>` +
+    (live.length ? `<button type="button" class="btn small danger" data-bulk="cancel" title="Cancel the selected tickets that are still running">${confirm("cancel") ? `Click again to cancel ${live.length}` : `Cancel ${live.length}`}</button>` : "") +
+    (done.length ? `<button type="button" class="btn small${confirm("clear") ? " danger" : ""}" data-bulk="clear" title="Clear the selected finished tickets from the board (nothing is deleted)">${confirm("clear") ? `Click again to clear ${done.length}` : `Clear ${done.length}`}</button>` : "") +
+    `<button type="button" class="btn small ghost sel-none" data-bulk="none">Clear selection</button>`;
+}
+let bulkTimer = 0;
+async function bulkAct(kind, btn) {
+  if (kind === "none") { ui.sel.clear(); ui.confirmBulk = null; renderBoard(); return; }
+  const { live, done } = selSplit(), ids = kind === "cancel" ? live : done;
+  if (!ids.length) return;
+  const sig = `${kind}:${[...ids].sort().join(",")}`;
+  if (ui.confirmBulk !== sig) {
+    ui.confirmBulk = sig; renderSelBar(); $(`#sel-bar [data-bulk="${kind}"]`)?.focus({ preventScroll: true });
+    clearTimeout(bulkTimer);
+    bulkTimer = setTimeout(() => { if (ui.confirmBulk === sig) { ui.confirmBulk = null; renderSelBar(); } }, 4000);
+    return;
+  }
+  ui.confirmBulk = null;
+  btn.disabled = true;
+  const ok = await act(() => (kind === "cancel" ? core.cancelRuns(ids, "cancelled from the web UI") : core.clearRuns(ids)));
+  if (!ok) { renderSelBar(); return; }
+  ids.forEach((id) => ui.sel.delete(id));
+  toast(kind === "cancel" ? `Cancelled ${plural(ids.length, "ticket")}` : `Cleared ${plural(ids.length, "ticket")} from the board`);
+  renderSelBar();
+  if (kind === "clear") await animateOut(ids);
+  ids.forEach(refreshRun);
+}
+function setSelecting(on) {
+  ui.selecting = on;
+  ui.sel.clear(); ui.confirmBulk = null;
+  $("#f-select").setAttribute("aria-pressed", String(on));
+  renderBoard();
+}
 async function shipTickets(ids) {
   const project = ui.runs.get(ids[0])?.project;
   let id;
@@ -326,11 +385,14 @@ function cardHtml(r) {
 function colHead(c, n, byCol, sub) {
   let extra = "";
   if (c.key === "done" && byCol.done.length) extra = `<button type="button" class="btn small ghost col-clear${ui.confirmClearAll ? " confirm" : ""}" id="clear-all" data-clear-all title="Clear the Done cards shown from the board (nothing is deleted)">${ui.confirmClearAll ? `Click again to clear ${byCol.done.length}` : "Clear all"}</button>`;
-  if (c.key === "ready" && ui.ship.length) extra = `<button type="button" class="btn primary small ship-go" data-ship-go>Ship ${plural(ui.ship.length, "ticket")}</button>`;
+  if (c.key === "ready" && ui.ship.length && !ui.selecting) extra = `<button type="button" class="btn primary small ship-go" data-ship-go>Ship ${plural(ui.ship.length, "ticket")}</button>`;
   const closed = c.key === "done" && ui.filter.closed, hint = closed ? COLUMN_CLOSED.hint : c.hint, states = closed ? COLUMN_CLOSED.states : c.states;
-  const head = `<div class="col-head"><span class="col-name">${esc(c.name)}</span><span class="col-count">${n}</span>${extra}</div>
+  const selIds = ui.selecting ? ui.selCols[c.key] ?? [] : [];
+  const all = selIds.length > 0 && selIds.every((id) => ui.sel.has(id)), selLabel = `Select all ${selIds.length} shown in ${c.name}`;
+  const selAll = selIds.length ? `<label class="col-sel" title="${esc(selLabel)}"><input type="checkbox" data-sel-col="${c.key}" aria-label="${esc(selLabel)}"${all ? " checked" : ""}></label>` : "";
+  const head = `<div class="col-head">${selAll}<span class="col-name">${esc(c.name)}</span><span class="col-count">${n}</span>${extra}</div>
       <div class="col-hint" title="${esc(states)}"><span>${esc(hint)}</span>${sub ? `<span class="col-break">${esc(sub)}</span>` : ""}</div>`;
-  if (c.key !== "ready" || !ui.ship.length) return head;
+  if (c.key !== "ready" || !ui.ship.length || ui.selecting) return head;
   const proj = shipProject(), others = byCol.ready.some((r) => r.project !== proj);
   return `${head}<div class="ship-note">${others ? `A bundle holds tickets of one project: only <b>${esc(proj)}</b> tickets can be added.` : `Tickets ship in the order you ticked them.`}</div>`;
 }
@@ -342,6 +404,7 @@ function renderBoard() {
   board.querySelectorAll(".col").forEach((el) => (scrolls[el.dataset.col] = $(".col-body", el).scrollTop));
   const focused = document.activeElement?.closest?.(".card")?.dataset.id;
   const focusedTick = document.activeElement?.matches?.("input[data-ship]") ? document.activeElement.dataset.ship : null;
+  const focusedSel = document.activeElement?.matches?.("input[data-sel], input[data-sel-col]") ? (document.activeElement.dataset.sel ?? `col:${document.activeElement.dataset.selCol}`) : null;
 
   const runs = visibleRuns();
   const byCol = Object.fromEntries(COLUMNS.map((c) => [c.key, []]));
@@ -355,9 +418,15 @@ function renderBoard() {
   const doneSig = byCol.done.map((r) => r.id).sort().join(",");
   if (ui.confirmClearAll && ui.confirmClearAll !== doneSig) ui.confirmClearAll = null;
   ui.doneIds = byCol.done.map((r) => r.id);
+  // The selection holds only cards the board shows and that can be selected: one that leaves (cleared, filtered out)
+  // or becomes unselectable (joined a bundle) drops out.
+  ui.selCols = Object.fromEntries(COLUMNS.map((c) => [c.key, ui.selecting ? byCol[c.key].filter(selectable).map((r) => r.id) : []]));
+  const shownSel = new Set(Object.values(ui.selCols).flat());
+  for (const id of [...ui.sel]) if (!shownSel.has(id)) ui.sel.delete(id);
+  const runCard = ui.selecting ? selCardHtml : cardHtml;
   const first = ui.runs.size === 0;
   board.innerHTML = COLUMNS.map((c) => {
-    const cards = c.key === "ready" ? byCol.ready.map(readyCardHtml) : c.key === "shipping" ? [...bundles.map(bundleCardHtml), ...byCol.shipping.map(cardHtml)] : byCol[c.key].map(cardHtml);
+    const cards = c.key === "ready" ? byCol.ready.map(ui.selecting ? selCardHtml : readyCardHtml) : c.key === "shipping" ? [...bundles.map(bundleCardHtml), ...byCol.shipping.map(runCard)] : byCol[c.key].map(runCard);
     const phases = [...(c.key === "shipping" ? bundles.map(() => [0, "bundle"]) : []), ...byCol[c.key].map(phaseOf)];
     const sub = breakdown(phases);
     return `<section class="col${c.key === "done" ? " done-col" : ""}" data-col="${c.key}" aria-label="${esc(c.name)}">
@@ -368,6 +437,12 @@ function renderBoard() {
   board.querySelectorAll(".col").forEach((el) => ($(".col-body", el).scrollTop = scrolls[el.dataset.col] ?? 0));
   if (focused) [...board.querySelectorAll(".card")].find((el) => el.dataset.id === focused)?.focus({ preventScroll: true });
   if (focusedTick) [...board.querySelectorAll("input[data-ship]")].find((el) => el.dataset.ship === focusedTick)?.focus({ preventScroll: true });
+  board.querySelectorAll("input[data-sel-col]").forEach((cb) => {
+    const ids = ui.selCols[cb.dataset.selCol] ?? [], n = ids.filter((id) => ui.sel.has(id)).length;
+    cb.indeterminate = n > 0 && n < ids.length;
+  });
+  if (focusedSel) [...board.querySelectorAll("input[data-sel], input[data-sel-col]")].find((el) => (el.dataset.sel ?? `col:${el.dataset.selCol}`) === focusedSel)?.focus({ preventScroll: true });
+  renderSelBar();
 
   if (!reduceMotion()) board.querySelectorAll(".card").forEach((el) => {
     const b = before.get(el.dataset.id);
@@ -1276,6 +1351,14 @@ function wire() {
     if (c.dataset.bundle) openBundleById(c.dataset.bundle); else openRun(c.dataset.id, c);
   });
   $("#board").addEventListener("change", (e) => {
+    const sc = e.target.closest("input[data-sel]");
+    if (sc) { if (sc.checked) ui.sel.add(sc.dataset.sel); else ui.sel.delete(sc.dataset.sel); renderBoard(); return; }
+    const cc = e.target.closest("input[data-sel-col]");
+    if (cc) {
+      const ids = ui.selCols[cc.dataset.selCol] ?? [], all = ids.length > 0 && ids.every((id) => ui.sel.has(id));
+      ids.forEach((id) => (all ? ui.sel.delete(id) : ui.sel.add(id)));
+      renderBoard(); return;
+    }
     const cb = e.target.closest("input[data-ship]"); if (!cb) return;
     const id = cb.dataset.ship, r = ui.runs.get(id), proj = shipProject();
     if (cb.checked && proj != null && r && r.project !== proj) { cb.checked = false; toast("A bundle holds tickets of one project. Untick the other project's tickets first.", "error"); return; }
@@ -1287,6 +1370,10 @@ function wire() {
     const l = e.target.closest("[data-open-bundle]"); if (!l) return;
     e.preventDefault(); openBundleById(l.dataset.openBundle);
   });
+  $("#f-select").addEventListener("click", () => setSelecting(!ui.selecting));
+  $("#sel-bar").addEventListener("click", (e) => { const b = e.target.closest("[data-bulk]"); if (b && !b.disabled) bulkAct(b.dataset.bulk, b); });
+  // A pending bulk confirmation resets when the user clicks anywhere else.
+  document.addEventListener("click", (e) => { if (ui.confirmBulk && !e.target.closest?.("[data-bulk]")) { ui.confirmBulk = null; renderSelBar(); } });
   // A pending "Clear all" confirmation resets when the user clicks anywhere else.
   document.addEventListener("click", (e) => { if (ui.confirmClearAll && !e.target.closest?.("[data-clear-all]")) { ui.confirmClearAll = null; if (!$("#view-board").hidden) renderBoard(); } });
   $("#proj-filter").addEventListener("change", (e) => { ui.filter.project = e.target.value; renderBoard(); });
