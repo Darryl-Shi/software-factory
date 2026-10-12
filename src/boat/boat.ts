@@ -14,7 +14,7 @@ import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { expandHome, parseDuration, resolveSecret } from "../core/settings.ts";
 import type { RunCtx, Workspace } from "../core/types.ts";
 import type { SecretStore } from "../secrets/store.ts";
-import { type BoatBackend, BoatNotFound, GONE_STATES, STOPPED_STATES } from "./backend.ts";
+import { type BoatBackend, BoatNotFound, boatTimeout, GONE_STATES, MAX_EXEC_SECONDS, STOPPED_STATES } from "./backend.ts";
 
 export type QaVmRecord = {
 	envId: string;
@@ -206,7 +206,7 @@ export class Boat {
 		let ok = true;
 		const setup = ((rc.config.sandbox?.setupScripts ?? []) as string[]).find((s) => existsSync(join(ws.path, s)));
 		if (setup) {
-			const r = await this.retry("exec", () => api.exec(vm.id, `bash ${shq(setup)} 2>&1`, { cwd: rec.appDir!, timeoutSeconds: 900 }));
+			const r = await this.retry("exec", () => api.exec(vm.id, `bash ${shq(setup)} 2>&1`, { cwd: rec.appDir!, timeoutSeconds: MAX_EXEC_SECONDS }));
 			log += `$ bash ${setup}\n${r.stdout}${r.stderr}\n[setup script exited ${r.exitCode}]\n`;
 			if (r.exitCode !== 0) {
 				ok = false;
@@ -473,7 +473,9 @@ class BoatEnv implements ExecutionEnv {
 	async exec(command: string | readonly string[], options: ShellExecOptions | undefined, context: Context): Promise<Result<ShellExecResult, ExecutionError>> {
 		const cmd = typeof command === "string" ? command : command.map(shq).join(" ");
 		try {
-			const r = await this.boat.execIn(this.rec, cmd, { cwd: options?.cwd ?? this.cwd, ...(options?.timeout ? { timeoutSeconds: options.timeout } : {}) });
+			// boat runs a command for at most 600 s, in whole seconds
+			const timeoutSeconds = boatTimeout(options?.timeout);
+			const r = await this.boat.execIn(this.rec, cmd, { cwd: options?.cwd ?? this.cwd, ...(timeoutSeconds ? { timeoutSeconds } : {}) });
 			if (r.note) options?.onOutput?.(r.note, context, { stream: "stdout" });
 			if (r.stdout) options?.onOutput?.(r.stdout, context, { stream: "stdout" });
 			if (r.stderr) options?.onOutput?.(r.stderr, context, { stream: "stderr" });

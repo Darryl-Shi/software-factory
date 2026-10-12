@@ -40,6 +40,8 @@ export interface Control {
 	searchResults: string[];
 	/** The builder also ships scripts/run.sh (a launchable product, so AQ testing applies). */
 	runScript?: boolean;
+	/** With runScript: the builder also ships scripts/setup.sh (it runs in the QA VM before the run script). */
+	setupScript?: boolean;
 	/** Per QA agent: pass | fail | no-screenshot-then-pass (default pass). */
 	qa: string[];
 	qaInputs: string[];
@@ -174,6 +176,7 @@ export function scripts(control: Control): Record<string, Script> {
 				return calls(
 					["write", { path: `round-${ctx.inputs.length}.txt`, content: `round ${ctx.inputs.length}\n` }],
 					["write", { path: "scripts/run.sh", content: "echo product up\nsleep 60\n" }],
+					...(control.setupScript ? [["write", { path: "scripts/setup.sh", content: "echo setup done\n" }] as [string, Record<string, unknown>]] : []),
 					...(control.sharedFile ? [["write", { path: "shared.txt", content: `builder ${++sharedSeq}\n` }] as [string, Record<string, unknown>]] : []),
 				);
 			if (!noProgress && control.sharedFile && ctx.inputs.length === 1)

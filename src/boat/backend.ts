@@ -36,6 +36,15 @@ export interface BoatBackend {
 	limits(): Promise<unknown>;
 }
 
+/** boat.dev runs a synchronous command for at most this long; `timeoutSeconds` must be an integer in 1..600. */
+export const MAX_EXEC_SECONDS = 600;
+
+/** A command timeout boat accepts: a whole number of seconds in 1..600; undefined (boat's default) for none or a non-number. */
+export function boatTimeout(seconds: number | undefined): number | undefined {
+	if (seconds === undefined || Number.isNaN(seconds) || seconds <= 0) return undefined;
+	return Math.min(MAX_EXEC_SECONDS, Math.max(1, Math.ceil(seconds)));
+}
+
 export const READY_STATES = ["ready", "idle", "running", "busy"];
 export const STOPPED_STATES = ["stopped", "stopping", "archived", "paused"];
 export const GONE_STATES = ["deleted", "deleting", "error", "failed", "destroyed"];
@@ -89,8 +98,9 @@ export class BoatApiBackend implements BoatBackend {
 		await this.wrap(() => this.api.resume({ sandboxId: id, resumeRequest: { noEnv: true } }));
 	}
 	async exec(id: string, command: string, opts: { cwd?: string; timeoutSeconds?: number } = {}): Promise<BoatExecResult> {
+		const timeoutSeconds = boatTimeout(opts.timeoutSeconds);
 		const r: any = await this.wrap(() =>
-			this.api.command({ sandboxId: id, commandRequest: { command, ...(opts.cwd ? { cwd: opts.cwd } : {}), ...(opts.timeoutSeconds ? { timeoutSeconds: opts.timeoutSeconds } : {}) } }),
+			this.api.command({ sandboxId: id, commandRequest: { command, ...(opts.cwd ? { cwd: opts.cwd } : {}), ...(timeoutSeconds ? { timeoutSeconds } : {}) } }),
 		);
 		return { exitCode: r.exitCode ?? (r.timedOut ? 124 : -1), stdout: r.stdout ?? "", stderr: (r.stderr ?? "") + (r.timedOut ? "\n[timed out]" : "") };
 	}
@@ -242,6 +252,10 @@ export class LocalBoatBackend implements BoatBackend {
 		}
 	}
 	exec(id: string, command: string, opts: { cwd?: string; timeoutSeconds?: number } = {}): Promise<BoatExecResult> {
+		// like boat.dev: a timeout outside 1..600 or not an integer is a 400 invalid_timeout
+		const t = opts.timeoutSeconds;
+		if (t !== undefined && !(Number.isInteger(t) && t >= 1 && t <= MAX_EXEC_SECONDS))
+			return Promise.reject(new Error(`boat API 400: {"ok":false,"code":"invalid_timeout","message":"timeoutSeconds must be an integer between 1 and 600."}`));
 		const v = this.vm(id);
 		if (!READY_STATES.includes(v.state)) return Promise.reject(Object.assign(new Error(`boat API 409: sandbox ${id} is ${v.state}`), { stopped: true }));
 		return new Promise((resolve) => {

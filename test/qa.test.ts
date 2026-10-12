@@ -3,6 +3,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
+import { boatTimeout } from "../src/boat/backend.ts";
 import { git } from "../src/github/git.ts";
 import type { RunView } from "../src/core/types.ts";
 import { inState, makeFactory, shipAndMerge, type TestEnv, until, untilBundle } from "./helpers.ts";
@@ -189,6 +190,32 @@ describe("VM lifecycle", () => {
 		await t!.boat.create({ name: "someone-else", idempotencyKey: "other", size: "default", ttlSeconds: 60 });
 		expect(await t!.factory.sweepForTests()).toEqual([`factory-${run}-1`]);
 		expect((await t!.boat.list()).map((x) => x.name)).toEqual(["someone-else"]);
+	});
+
+	test("a repo with a setup script boots in the VM (boat caps a command at 600 s); the QA agent's bash timeouts are clamped to boat's 1..600 whole seconds", async () => {
+		await setup();
+		t!.control.setupScript = true;
+		t!.control.qaHang = true;
+		const run = await start();
+		await until(t!.factory, run, () => t!.control.qaInputs.length === 1);
+		expect(t!.control.qaInputs[0]).toContain("setup done");
+		expect(t!.control.qaInputs[0]).toContain("[setup script exited 0]");
+		expect(t!.control.qaInputs[0]).toContain("run script is running");
+		const env = (t!.factory as any).opts.boat.env({ envId: `${run}-qa-1` });
+		for (const timeout of [1200, 2.5, 0.2]) {
+			let out = "";
+			const r = await env.exec("echo clamped", { timeout, onOutput: (s: string) => (out += s) }, {} as never);
+			expect(r.ok).toBe(true);
+			expect(out).toContain("clamped");
+		}
+		t!.control.qaHang = false;
+		const v = await until(t!.factory, run, done);
+		expect(v.state).toBe("READY");
+		expect(v.qaStatus).toBe("ran");
+	});
+
+	test("boat's command timeout: whole seconds in 1..600, none for no timeout", () => {
+		expect([undefined, 0, -5, Number.NaN, 0.2, 2.5, 60, 600, 900, Number.POSITIVE_INFINITY].map(boatTimeout)).toEqual([undefined, undefined, undefined, undefined, 1, 3, 60, 600, 600, 600]);
 	});
 
 	test("a VM the ttl stopped while the QA agent works is resumed and the product restarted on its next tool call", async () => {
