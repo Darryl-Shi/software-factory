@@ -7,7 +7,8 @@ one project together as a **bundle**: one PR (or a push to `main` for a new repo
 - **Product spec:** [`docs/spec.md`](docs/spec.md). Per-change specs: `docs/specs/<run-id>.md` (the bundles change:
   [`docs/specs/run-mv4ghzj2-allm.md`](docs/specs/run-mv4ghzj2-allm.md); clearing Done runs:
   [`docs/specs/run-mv46ek2u-7omz.md`](docs/specs/run-mv46ek2u-7omz.md); the Chat button and full-screen chat:
-  [`docs/specs/run-mv46hn3a-f4fa.md`](docs/specs/run-mv46hn3a-f4fa.md)).
+  [`docs/specs/run-mv46hn3a-f4fa.md`](docs/specs/run-mv46hn3a-f4fa.md); markdown rendering:
+  [`docs/specs/run-mv46mros-6c1p.md`](docs/specs/run-mv46mros-6c1p.md)).
 - **Design and deviations:** `docs/design-spec.md`, `docs/superpowers/specs/*`, `DEVIATIONS.md`.
 - **How it fits together:** `docs/architecture.md`; settings: `docs/configuration.md`.
 
@@ -56,6 +57,9 @@ src/github/              GitHub (worktrees, diff, deliver, bundles: integrate/me
 src/sandbox/             sandbox-runtime environments per role (builder and integrator write)
 src/boat/                boat.dev VMs for AQ testing (fake backend in backend.ts)
 src/web/                 HTTP + SSE server; ui/ (app.js board + run view, bundles.js bundle view, discussions.js the full-screen chat behind the Chat button)
+                         ui/markdown.js: md()/inline() (marked + DOMPurify, served at /vendor/marked.js, /vendor/purify.js
+                         from node_modules as exact STATIC routes); index.html loads vendor → markdown.js → app.js →
+                         discussions.js → bundles.js (classic scripts, one global scope; strict CSP, no build step)
 src/setup/               the setup wizard
 src/testing/             scripted model provider and the dry run's scripted agents
 scripts/                 setup.sh, run.sh, dry-run.ts

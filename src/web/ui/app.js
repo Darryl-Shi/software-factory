@@ -45,23 +45,7 @@ const core = new Proxy({}, { get: (_, op) => (op === "subscribe" ? subscribe : (
 const $ = (sel, el = document) => el.querySelector(sel);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 const linkify = (escaped) => escaped.replace(/https?:\/\/[^\s<"')]+/g, (u) => `<a href="${u}" target="_blank" rel="noopener noreferrer">${u}</a>`);
-const inline = (t) => linkify(esc(t)).replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
-function md(text) {
-  const out = []; let list = null, fence = null;
-  const close = () => { if (list) { out.push(`</${list}>`); list = null; } };
-  for (const line of String(text ?? "").split("\n")) {
-    let m;
-    if (fence !== null) { if (/^\s*```/.test(line)) { out.push(`<pre>${esc(fence.join("\n"))}</pre>`); fence = null; } else fence.push(line); continue; }
-    if (/^\s*```/.test(line)) { close(); fence = []; }
-    else if ((m = line.match(/^(#{1,3}) (.*)/))) { close(); out.push(`<h${m[1].length}>${inline(m[2])}</h${m[1].length}>`); }
-    else if ((m = line.match(/^\s*[-*] (.*)/))) { if (list !== "ul") { close(); out.push("<ul>"); list = "ul"; } out.push(`<li>${inline(m[1])}</li>`); }
-    else if ((m = line.match(/^\s*\d+\. (.*)/))) { if (list !== "ol") { close(); out.push("<ol>"); list = "ol"; } out.push(`<li>${inline(m[1])}</li>`); }
-    else if (!line.trim()) close();
-    else { close(); out.push(`<p>${inline(line)}</p>`); }
-  }
-  if (fence !== null) out.push(`<pre>${esc(fence.join("\n"))}</pre>`);
-  close(); return out.join("");
-}
+// md(text) and inline(text) (sanitised markdown → HTML) come from markdown.js, loaded before this file.
 function ago(t) {
   const s = (Date.now() - t) / 1000;
   if (s < 60) return "now"; if (s < 3600) return `${Math.floor(s / 60)}m`; if (s < 86400) return `${Math.floor(s / 3600)}h`; return `${Math.floor(s / 86400)}d`;
@@ -957,7 +941,7 @@ function renderComposer(r) {
 }
 function discussionComposer(el, r, pa) {
   el.innerHTML = `<div class="cbox ask"><div class="c-head turn">${avatar("architect", false)}<b>Architect</b> is asking you</div>
-    <div class="c-q">${inline(pa.question.text)}</div>
+    <div class="c-q">${md(pa.question.text)}</div>
     <form class="c-input" id="answer-form"><textarea id="cmp-answer" rows="1" placeholder="Write your answer…" aria-label="Your answer"></textarea><button type="submit" class="send" id="cmp-send" disabled aria-label="Send answer">${ICON.send}</button></form>
     <div class="c-foot"><span><kbd>Enter</kbd> to send · <kbd>Shift</kbd> + <kbd>Enter</kbd> for a new line</span><span>One question at a time</span></div></div>`;
   const ta = $("#cmp-answer"), send = $("#cmp-send");

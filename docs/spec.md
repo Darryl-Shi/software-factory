@@ -292,6 +292,14 @@ Served by the factory at `http://127.0.0.1:7317` (static files, no build step). 
 `factory serve` prints; the first visit swaps it for an HttpOnly cookie. Foreign `Host` and `Origin` headers are
 rejected.
 
+- **Markdown** (spec `docs/specs/run-mv46mros-6c1p.md`): prose (transcripts, notices, chat bubbles, the spec modal and
+  preview, the request, the discussion summary, draft bodies, the architect's question) renders as CommonMark + GFM
+  through `markdown.js` (`md()`; `inline()` for finding descriptions and one-line labels): `marked` parses, `DOMPurify`
+  sanitises, links open in a new tab with `rel="noopener noreferrer"`, images load only from the UI's origin or
+  `data:`. Both libraries are served from `node_modules` at the exact routes `/vendor/marked.js` and
+  `/vendor/purify.js`; the CSP is unchanged. Without them, prose falls back to escaped text. Tool panels and evidence
+  stay raw.
+
 - **Board:** columns Intake, Discussion, Spec approval, Build, Review, **Ready**, Deliver, Done. **Create** submits a
   ticket (creating the project if it is new). Cards move on their own and show "Your turn" when the human is needed.
 - **Ready column:** each card has a checkbox. Ticking a card of one project disables other projects' checkboxes, with

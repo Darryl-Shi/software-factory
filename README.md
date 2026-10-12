@@ -230,6 +230,11 @@ The factory keeps its files next to the config file (`~/.factory/` by default):
 - **Settings:** the layered settings as a form. Pick Global or a project; each field shows its source and a
   Reset/Inherit button.
 
+Agent replies, chat bubbles, specs, requests, summaries and draft tickets render as GitHub-flavoured markdown
+(tables, nested and task lists, quotes, links, code blocks), sanitised so raw HTML in them never runs; links open in a
+new tab. The markdown libraries (`marked`, `DOMPurify`) are served by the factory itself from `/vendor/`, so the UI
+loads nothing from other origins.
+
 The UI listens on localhost only. To use it from another machine, forward the port over SSH
 (`ssh -L 7317:127.0.0.1:7317 host`). Change the port with `web.port` or `serve --port`.
 
@@ -264,7 +269,8 @@ npm run typecheck   # tsc (noEmit)
 | `test/github-api.test.ts` | `GhApiHost` request shapes, token handling, the GitHub App JWT exchange |
 | `test/messages.test.ts` | `message`: routing, refusals, side turns and their cost, spec revision at the gate, steering a busy builder, held messages, re-review of changes made at the delivery gate |
 | `test/clear.test.ts` | `clearRuns`: validation (all or nothing), idempotency, `listRuns` with and without `includeCleared`, `retryRun` refused, the `run.cleared` event, the flag across a restart |
-| `test/web.test.ts` | The web server: token and cookie, Host/Origin/content-type checks, operations and error codes (discussion and bundle operations, `clearRuns`, `listModels` and `startDiscussion` without a title too), the event stream and its `discussion` and `bundle` filters, bundle screenshots, a busy port as an error, the static UI |
+| `test/web.test.ts` | The web server: token and cookie, Host/Origin/content-type checks, operations and error codes (discussion and bundle operations, `clearRuns`, `listModels` and `startDiscussion` without a title too), the event stream and its `discussion` and `bundle` filters, bundle screenshots, a busy port as an error, the static UI and the vendor markdown routes |
+| `test/web-markdown.test.ts` | `markdown.js` in jsdom: GFM rendering, sanitising (scripts, `javascript:` links, foreign images), links with `rel="noopener noreferrer"`, the plain-text fallback |
 | `test/web-search.test.ts` | `web_search` against a fake Parallel endpoint: request shape, result formatting, errors, a run using pinned `webSearch` settings |
 | `test/daemon.test.ts` | `serve`/`stop`/`status`/`web` as real processes: detaching, a second `serve`, a busy port, a bad or legacy config, unknown options, stale pid files, a fresh install |
 | `test/secrets.test.ts` | The secret store: file and directory modes, atomic writes, refusing a loose or unparseable file, `store:` refs |
