@@ -405,7 +405,7 @@ table.cost tr.total td { font-weight: 600; border-bottom: 0; }
 .modal-head { display: flex; align-items: center; justify-content: space-between; padding: 18px 22px 8px; }
 .modal-head h2 { margin: 0; font: 600 18px/1.3 var(--f-display); }
 .modal-body { padding: 8px 22px 4px; display: grid; gap: 14px; }
-.modal-foot { padding: 14px 22px 20px; display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+.modal-foot { padding: 14px 22px 20px; display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; position: sticky; bottom: 0; background: var(--sheet); }
 .hint { font-size: 12px; color: var(--fg-3); }
 .spec-doc { font-size: 14.5px; line-height: 1.65; max-width: 70ch; }
 .spec-doc h1 { font: 600 21px/1.3 var(--f-display); margin: 0 0 10px; }
@@ -472,8 +472,10 @@ table.cost tr.total td { font-weight: 600; border-bottom: 0; }
 .tx-wrap .transcript { min-height: 0; }
 .tx-wrap.docked::before { content: ""; position: absolute; top: 0; left: 0; right: 14px; height: 30px; background: linear-gradient(var(--sheet) 40%, transparent); z-index: 2; pointer-events: none; }
 .tx { transition: padding-top .25s cubic-bezier(.2, .8, .2, 1); }
-.dock { position: absolute; top: 14px; left: 50%; transform: translateX(-50%); width: min(720px, calc(100% - 32px)); max-height: calc(100% - 28px); display: grid; z-index: 3; pointer-events: none; }
-.dock-card { pointer-events: auto; min-height: 0; overflow: auto; overscroll-behavior: contain; border: 1px solid var(--hairline); border-radius: 16px; background: var(--sheet); box-shadow: var(--shadow-lift); }
+/* The card never grows past the transcript area: a long body (findings, spec preview) scrolls inside the card and the
+   actions row stays pinned at its bottom, so the buttons are always reachable. */
+.dock { position: absolute; top: 14px; left: 50%; transform: translateX(-50%); width: min(720px, calc(100% - 32px)); max-height: calc(100% - 28px); display: flex; flex-direction: column; z-index: 3; pointer-events: none; }
+.dock-card { pointer-events: auto; flex: 0 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; border: 1px solid var(--hairline); border-radius: 16px; background: var(--sheet); box-shadow: var(--shadow-lift); }
 .dock-card.turn { border-color: var(--turn-line); box-shadow: 0 0 0 4px var(--turn-soft), var(--shadow-lift); }
 .dock-card.bad { border-color: var(--bad); box-shadow: 0 0 0 4px var(--bad-soft), var(--shadow-lift); }
 .d-head { display: flex; align-items: center; gap: 11px; padding: 12px 10px 0 14px; }
@@ -486,7 +488,7 @@ table.cost tr.total td { font-weight: 600; border-bottom: 0; }
 .dock .c-q, .dock .c-list, .dock .c-preview, .dock .tiles, .dock .reject { margin-inline: 0; padding-inline: 14px; }
 .dock .c-list, .dock .c-preview { margin: 10px 14px 0; padding-inline: 0; }
 .dock .c-preview { padding: 10px 14px; max-height: 132px; }
-.dock .c-actions { padding: 12px 14px 14px; }
+.dock .c-actions { padding: 12px 14px 14px; position: sticky; bottom: 0; z-index: 1; background: var(--sheet); border-top: 1px solid var(--hairline); margin-top: 10px; }
 .dock-card.mini { display: flex; align-items: center; gap: 10px; padding: 6px 6px 6px 8px; border-radius: 999px; overflow: hidden; }
 .dock-card.mini .d-ico { width: 26px; height: 26px; border-radius: 50%; }
 .d-mini-text { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 13px; }
@@ -527,7 +529,7 @@ table.cost tr.total td { font-weight: 600; border-bottom: 0; }
 .shots img { width: 120px; max-height: 90px; object-fit: cover; border: 1px solid var(--line, #ccc); border-radius: 6px; background: var(--bg-2, #f4f4f4); }
 
 /* ---------- discussions: the full-screen chat (the run view's sheet), its history rail and its drafts panel ---------- */
-.disc-mark { display: inline-grid; place-items: center; color: var(--fg-3); }
+.disc-mark { display: inline-grid; place-items: center; color: var(--fg-3); flex: none; }
 .disc-mark svg, .from-disc svg { width: 13px; height: 13px; fill: currentColor; flex: none; }
 .avatar.discussant { background: var(--r-arch); }
 .linkish { border: 0; background: none; padding: 0; color: var(--accent); text-decoration: underline; text-underline-offset: 2px; text-align: left; }
@@ -622,7 +624,7 @@ table.cost tr.total td { font-weight: 600; border-bottom: 0; }
   #dh-drafts { padding: 3px 6px; }
 }
 
-/* ---------- bundles: the Ready column's ticks, bundle cards in Deliver, the bundle view (the run view's sheet) ---------- */
+/* ---------- bundles: the Ready column's ticks, bundle cards in Shipping, the bundle view (the run view's sheet) ---------- */
 .toast-act { border: 0; background: none; padding: 0; color: inherit; font-weight: 600; text-decoration: underline; text-underline-offset: 2px; }
 .ship-wrap { position: relative; }
 .ship-wrap .card { padding-right: 34px; }
@@ -698,7 +700,7 @@ table.cost tr.total td { font-weight: 600; border-bottom: 0; }
   .topbar { gap: 8px; padding: 8px 12px; }
   .brand { margin-right: 0; }
   .brand-name { display: none; }
-  .nav button { padding: 7px 8px; }
+  .nav button { padding: 7px 7px; }
   .top-actions { gap: 6px; }
   .top-actions .btn { padding: 6px 10px; }
   .search { order: 10; flex: 1 1 100%; min-width: 0; }
@@ -711,6 +713,10 @@ table.cost tr.total td { font-weight: 600; border-bottom: 0; }
   .modal, .modal.wide { width: 100%; max-height: calc(100% - 8px); border-radius: 12px; }
   .modal-head { padding: 14px 16px 6px; } .modal-body { padding: 6px 16px 4px; } .modal-foot { padding: 12px 16px 16px; }
   .rv-extra .btn.small { padding: 3px 6px; }
+  /* the chat header: Draft tickets keeps its icon (its name stays for screen readers and as the tooltip) */
+  #dh-drafts { font-size: 0; gap: 0; padding: 5px 7px; }
+  #dh-drafts svg { width: 14px; height: 14px; }
+  .chatbar .ch-pill { max-width: 100%; }
 }
 @media (min-width: 1600px) {
   .topbar { padding: 10px 24px; }

@@ -45,7 +45,7 @@ async function load(runs: unknown[], bundles: unknown[] = []): Promise<Win> {
 		return { status: 200, json: async () => ({ ok: true, result: results[op] ?? null }) };
 	}) as unknown as typeof fetch;
 	w.EventSource = class { readyState = 1; close() {} } as unknown;
-	w.matchMedia = (() => ({ matches: true })) as unknown; // reduced motion: no Web Animations needed
+	w.matchMedia = (() => ({ matches: true })) as unknown as typeof w.matchMedia; // reduced motion: no Web Animations needed
 	w.eval(MARKED); w.eval(PURIFY);
 	// the classic scripts share one global scope: evaluated together, with the functions under test exposed
 	w.eval([read("markdown.js"), read("app.js"), read("discussions.js"), read("bundles.js"), "globalThis.__t = { PIPELINE, stageOf, stageInfo, boardColumn, ui };"].join("\n;"));
@@ -166,5 +166,11 @@ describe("stylesheet: sizing rules", () => {
 	test("one set of breakpoints: phone 640, tablet 1024, wide 1600 (plus the run view's 1180 and 760)", () => {
 		const widths = new Set([...css.matchAll(/@media \((?:max|min)-width: (\d+)px\)/g)].map((m) => m[1]));
 		expect([...widths].sort()).toEqual(["1024", "1180", "1600", "640", "760"].sort());
+	});
+	test("a long approval or escalation card scrolls inside itself and keeps its action buttons reachable", () => {
+		expect(css).toMatch(/\.dock \{[^}]*max-height: calc\(100% - 28px\)[^}]*display: flex; flex-direction: column/);
+		expect(css).toMatch(/\.dock-card \{[^}]*min-height: 0; overflow-y: auto/);
+		expect(css).toMatch(/\.dock \.c-actions \{[^}]*position: sticky; bottom: 0/);
+		expect(css).toMatch(/\.modal-foot \{[^}]*position: sticky; bottom: 0/);
 	});
 });
