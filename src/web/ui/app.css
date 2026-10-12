@@ -178,7 +178,7 @@ select.proj { border: 1px solid var(--line-strong); background: var(--surface); 
 .rv-close:active { transform: translate(-2px, 2px) scale(.96); }
 .rv-close svg { width: 16px; height: 16px; fill: currentColor; }
 
-.rv-body { display: grid; grid-template-columns: 264px minmax(0, 1fr) 0px; min-height: 0; transition: grid-template-columns .28s cubic-bezier(.2, .8, .2, 1); }
+.rv-body { display: grid; grid-template-columns: 264px minmax(0, 1fr) 0px; grid-template-rows: minmax(0, 1fr); min-height: 0; transition: grid-template-columns .28s cubic-bezier(.2, .8, .2, 1); }
 .rv-body.with-details { grid-template-columns: 264px minmax(0, 1fr) 348px; }
 .rv-threads { background: var(--rail); border-right: 1px solid var(--hairline); overflow-y: auto; padding: 12px 10px; display: flex; flex-direction: column; gap: 2px; min-height: 0; }
 .rv-details { background: var(--rail); border-left: 1px solid var(--hairline); overflow-y: auto; overflow-x: hidden; min-height: 0; }
@@ -202,6 +202,11 @@ select.proj { border: 1px solid var(--line-strong); background: var(--surface); 
 
 /* center column */
 .rv-center { position: relative; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; grid-template-columns: minmax(0, 1fr); min-height: 0; min-width: 0; background: var(--sheet); }
+/* explicit rows: the chat view hides .conv-head (display:none is not a grid item), so implicit auto-placement would
+   shift the transcript into the auto row and the composer into the 1fr row, pushing the composer off-screen */
+.rv-center > .conv-head { grid-row: 1; }
+.rv-center > .tx-wrap { grid-row: 2; }
+.rv-center > #composer-wrap { grid-row: 3; }
 .conv-head { display: flex; align-items: center; gap: 10px; padding: 11px 24px; border-bottom: 1px solid var(--hairline); min-width: 0; }
 .conv-head .who { font: 600 14px/1.2 var(--f-display); white-space: nowrap; }
 .chip-model { font: 11.5px/1 var(--f-mono); color: var(--fg-3); border: 1px solid var(--hairline); border-radius: 999px; padding: 4px 9px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
@@ -548,6 +553,7 @@ table.cost tr.total td { font-weight: 600; border-bottom: 0; }
 .chatbar { display: none; }
 .runview[data-mode="discussion"] .chatbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
 .runview[data-mode="discussion"] :is(.rv-key, #rv-state, .rv-progress, #rv-details-btn, .conv-head) { display: none; }
+.runview[data-mode="discussion"] .rv-center { grid-template-rows: 0px minmax(0, 1fr) auto; }
 .runview[data-mode="discussion"] .rv-title { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 .runview[data-mode="discussion"] .drawer-btn.threads { display: grid; }
 .runview[data-mode="discussion"] .rv-top { grid-template-columns: minmax(0, 1fr) auto; }

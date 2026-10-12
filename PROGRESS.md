@@ -90,3 +90,13 @@ Decisions
 - No browser available in the build sandbox; layout checked by reasoning (grid minmax(0,1fr), .blk min-width:0).
 - Full suite: 8–9 failures in sandbox*.test.ts / durability.test.ts are pre-existing here (bwrap cannot create namespaces in this build host); identical on the base commit.
 - Integrated with bundles + chat: bundles.js loads after markdown.js and uses its inline(); the static-UI test checks all six scripts in order.
+
+## Continuous chat (run run-mv4rfo5d-i74d; spec docs/specs/run-mv4rfo5d-i74d.md)
+
+- [x] app.css: explicit grid-row for .rv-center > .conv-head/.tx-wrap/#composer-wrap; chat mode row template
+      `0px minmax(0, 1fr) auto`; .rv-body grid-template-rows minmax(0, 1fr) (definite, viewport-bounded row)
+- [x] test/web.test.ts "chat layout" test on the served /app.css (fails on the previous stylesheet)
+- [x] docs/spec.md Chat bullet
+Decisions
+- CSS only; no browser in the build host, layout checked by reasoning (all .rv-body siblings of .rv-center are in
+  its single row or position:fixed at ≤760/≤1180, so the bounded row holds at every breakpoint).

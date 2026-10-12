@@ -329,7 +329,12 @@ rejected.
   (`listModels`, the project's `discussion.model` marked "(default)") and thinking dropdowns at the top, locked to the
   pinned values after the first message; a collapsible history rail of the project's discussions with **New chat**;
   the transcript and composer (**Stop**); a drafts panel (**Draft tickets**, edit drafts, **Create ticket**); a ⋯ menu
-  with **Close discussion**, **Reopen**, **Retry**.
+  with **Close discussion**, **Reopen**, **Retry**. The chat is continuous (spec `docs/specs/run-mv4rfo5d-i74d.md`):
+  the composer is always visible, pinned to the bottom of the sheet, whatever the transcript's length, at every
+  breakpoint, with the rail collapsed or expanded and the drafts panel open or closed, in every composer state
+  (blank, Preparing, replying/Stop, Your turn, Closed/Reopen, Failed/Retry); only the transcript scrolls. A
+  discussion ends only when the human closes it or it fails, never after a reply. (The center grid places the
+  header, transcript and composer in explicit rows, so hiding the header in chat mode cannot shift them.)
 - **Settings:** a form generated from `settingsSchema()`, global or per project, each field with its source and a
   Reset/Inherit button.
 
