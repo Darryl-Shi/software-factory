@@ -302,8 +302,9 @@ describe("apply", () => {
 		expect(head()).toBe(tip);
 		expect(calls.jobs).toEqual([]);
 		expect(readRecord(home)).toMatchObject({ from, to: tip, phase: "done", restartRequired: true, message: "Restart the factory to finish the update" });
-		// the running version is still the old one until the restart
+		// the running version is still the old one until the restart; nothing is left to update
 		expect((await u.version()).fullSha).toBe(from);
+		expect((await u.version()).check).toMatchObject({ behind: 0, commits: [] });
 		const { u: next } = makeUpdater({ startedBy: "foreground" });
 		await next.init();
 		expect(await next.version()).toMatchObject({ fullSha: tip, update: { phase: "done", to: tip } });
@@ -324,6 +325,9 @@ describe("apply", () => {
 		writeRecord(home, { from: "a".repeat(40), to: sha, startedAt: 0, restartAt: 0, phase: "restarting" });
 		await u.init();
 		expect(readRecord(home)?.phase).toBe("done");
+		// a running factory settles one whose helper went away, too
+		writeRecord(home, { from: "a".repeat(40), to: "b".repeat(40), startedAt: 0, restartAt: 0, phase: "restarting" });
+		expect((await u.version()).update).toMatchObject({ phase: "failed" });
 	});
 });
 

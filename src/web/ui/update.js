@@ -208,13 +208,20 @@
     st.dlg.addEventListener("click", onDialogClick);
     renderDialog();
     setTimeout(() => st.dlg?.querySelector(".btn.primary, [data-act=check]")?.focus(), 40);
+    refresh(); // the active work (and the record) as of now, not as of the last poll
   }
 
   async function onDialogClick(e) {
     const act = e.target.closest("[data-act]")?.dataset.act;
     if (!act || st.busy) { if (act === "close") closeDialog(); return; }
     if (act === "close") return closeDialog();
-    if (act === "update") { st.mode = "confirm"; st.note = null; return renderDialog(); }
+    if (act === "update") {
+      // The confirmation lists the work active at this moment: fetch it before showing it.
+      st.busy = "confirm"; st.note = null; renderDialog();
+      try { const v = await api("/api/version"); st.busy = ""; st.mode = "confirm"; accept(v); }
+      catch (e) { st.busy = ""; st.note = { kind: "error", text: e.message }; renderDialog(); }
+      return;
+    }
     if (act === "back") { st.mode = "view"; return renderDialog(); }
     if (act === "check") return check();
     if (act === "apply") return apply();

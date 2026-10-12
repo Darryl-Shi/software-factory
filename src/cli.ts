@@ -87,9 +87,9 @@ async function runningVersion(link: string) {
 
 /** The checkout's HEAD (short SHA), when no factory answers. */
 async function diskVersion(): Promise<string> {
-	const { INSTALL_ROOT } = await import("./main.ts");
+	const { resolve } = await import("node:path");
 	const { runCommand } = await import("./update/restart.ts");
-	const r = await runCommand("git", ["log", "-1", "--format=%h (%cI)"], { cwd: INSTALL_ROOT });
+	const r = await runCommand("git", ["log", "-1", "--format=%h (%cI)"], { cwd: resolve(import.meta.dirname, "..") });
 	return r.code === 0 ? r.stdout.trim() : "unknown (not a git checkout)";
 }
 

@@ -132,10 +132,17 @@ export class Updater {
 				this.helperSources.set(f, readFileSync(join(import.meta.dirname, f), "utf8"));
 			} catch {}
 		}
+		this.settle(true);
+	}
+
+	/** Settles a record no process works on any more: at startup, one left `pulling`/`installing` (its process died)
+	 * or `restarting` for over 5 minutes; later, a `restarting` one past 5 minutes (its helper is gone). */
+	private settle(startup: boolean): void {
+		if (this.applying) return;
 		const r = readRecord(this.home);
 		if (r && ACTIVE_PHASES.includes(r.phase)) {
 			const at = r.restartAt ?? r.startedAt;
-			if (r.phase !== "restarting" || this.now() - at > STALE_RESTART_MS) {
+			if ((startup && r.phase !== "restarting") || (r.phase === "restarting" && this.now() - at > STALE_RESTART_MS)) {
 				const ok = this.running.fullSha === r.to;
 				writeRecord(this.home, {
 					...r,
@@ -176,6 +183,7 @@ export class Updater {
 	}
 
 	async version(): Promise<VersionInfo> {
+		this.settle(false);
 		const reason = await this.unavailable();
 		const update = readRecord(this.home);
 		const active = this.o.activeWork ? await this.o.activeWork().catch(() => []) : [];
@@ -312,6 +320,8 @@ export class Updater {
 				return fail(`${error}\n\nThe checkout is back on ${short(from)}.`);
 			}
 		}
+		// The checkout is on the upstream SHA now: the last check's "behind" no longer holds.
+		if (this.lastCheck?.upstreamFullSha === to) this.lastCheck = { ...this.lastCheck, behind: 0, ahead: 0, commits: [], checkedAt: this.now() };
 		if (this.startedBy === "foreground") {
 			this.set(r, { phase: "done", restartRequired: true, message: "Restart the factory to finish the update", finishedAt: this.now() });
 			this.log(`update: pulled ${short(to)}; restart the factory to finish the update`);

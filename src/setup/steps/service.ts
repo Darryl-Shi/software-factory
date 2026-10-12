@@ -7,7 +7,6 @@ import { daemonFiles, stopDaemon } from "../../daemon.ts";
 import { LABEL, UNIT } from "../../update/restart.ts";
 import type { SetupContext, Step, StepStatus } from "../context.ts";
 
-
 export function servicePaths(homedir: string): { unit: string; plist: string } {
 	return {
 		unit: join(homedir, ".config", "systemd", "user", `${UNIT}.service`),
