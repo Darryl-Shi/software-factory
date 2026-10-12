@@ -1430,6 +1430,14 @@ export class Factory implements FactoryCore {
 		return this.harness;
 	}
 
+	/** Test hook: change a run's Document in one commit (e.g. mark it `legacy` to exercise the old delivery flow). */
+	async patchRunForTests(run: RunId, change: (d: RunDocState) => void): Promise<void> {
+		await this.doc(run);
+		await this.root.commit(async (tx) => {
+			change((await tx.doc(RunDoc, run, null as never)) as unknown as RunDocState);
+		}, this.ctx);
+	}
+
 	async waitForState(run: RunId, pred: (v: RunView) => boolean, timeoutMs = 30_000): Promise<RunView> {
 		const deadline = Date.now() + timeoutMs;
 		for (;;) {
