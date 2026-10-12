@@ -194,6 +194,10 @@ The factory keeps its files next to the config file (`~/.factory/` by default):
     column header creates a bundle of the ticked tickets, in the order ticked.
   - **Deliver:** bundle cards (id, state, member ticket keys), with their member runs inside. Legacy runs still
     delivering the old way show as ordinary cards. **Done** shows merged runs with a bundle chip.
+  - **Clear all** in the Done column header clears exactly the Done cards shown (so it follows the project filter,
+    the search box and "Show closed"), after a second click to confirm. Clearing archives a run and deletes nothing:
+    its record, conversations, screenshots, worktree and delivery stay, cleared runs stay off the board across
+    restarts, and the other cards keep their ticket keys. There is no undo on the board.
 - **Bundle view:** click a bundle card. It reuses the run view: the integrator, reviewers and QA conversations and a
   timeline on the left, the transcript and a chat box (to the integrator, or the reviewer while reviewing), and a
   header with the member tickets and the PR. The merge card has **Merge**, **Request changes** and **Drop tickets…**;
@@ -206,6 +210,9 @@ The factory keeps its files next to the config file (`~/.factory/` by default):
   architect are answered there, and at other times your message is steered into the agent's work (a busy agent sees
   it after its current step; an idle one replies). Approvals and escalations float above the conversation, so you can
   ask before you decide. At the spec gate, asking the architect for a change makes it revise the spec.
+  A finished run (Delivered, Failed or Cancelled) has **Clear from board** in its details' Actions (click twice); the
+  view stays open and shows when and from which interface the run was cleared. A cleared run still opens, read-only and
+  marked as cleared with no Retry, from a `#run=` link or from the discussion it came from.
 - **Discussions:** talk a problem through with one model before it becomes a ticket. **New discussion** asks for the
   project, a title, the model (prefilled from `discussion.model`) and the first message. The discussion view reuses
   the run view: the transcript and a chat box (**Stop** while the model is replying), and a drafts panel on the
@@ -250,7 +257,8 @@ npm run typecheck   # tsc (noEmit)
 | `test/sandbox-write.test.ts` | A write root around the factory home: neither the home nor the storage is writable; the builder's worktree inside the home still is |
 | `test/github-api.test.ts` | `GhApiHost` request shapes, token handling, the GitHub App JWT exchange |
 | `test/messages.test.ts` | `message`: routing, refusals, side turns and their cost, spec revision at the gate, steering a busy builder, held messages, re-review of changes made at the delivery gate |
-| `test/web.test.ts` | The web server: token and cookie, Host/Origin/content-type checks, operations and error codes (discussion and bundle operations too), the event stream and its `discussion` and `bundle` filters, bundle screenshots, a busy port as an error, the static UI |
+| `test/clear.test.ts` | `clearRuns`: validation (all or nothing), idempotency, `listRuns` with and without `includeCleared`, `retryRun` refused, the `run.cleared` event, the flag across a restart |
+| `test/web.test.ts` | The web server: token and cookie, Host/Origin/content-type checks, operations and error codes (discussion and bundle operations and `clearRuns` too), the event stream and its `discussion` and `bundle` filters, bundle screenshots, a busy port as an error, the static UI |
 | `test/web-search.test.ts` | `web_search` against a fake Parallel endpoint: request shape, result formatting, errors, a run using pinned `webSearch` settings |
 | `test/daemon.test.ts` | `serve`/`stop`/`status`/`web` as real processes: detaching, a second `serve`, a busy port, a bad or legacy config, unknown options, stale pid files, a fresh install |
 | `test/secrets.test.ts` | The secret store: file and directory modes, atomic writes, refusing a loose or unparseable file, `store:` refs |

@@ -5,7 +5,8 @@ discussion, a spec, an unattended build, a review (code review + AQ testing) to 
 one project together as a **bundle**: one PR (or a push to `main` for a new repo), CI, and Merge.
 
 - **Product spec:** [`docs/spec.md`](docs/spec.md). Per-change specs: `docs/specs/<run-id>.md` (the bundles change:
-  [`docs/specs/run-mv4ghzj2-allm.md`](docs/specs/run-mv4ghzj2-allm.md)).
+  [`docs/specs/run-mv4ghzj2-allm.md`](docs/specs/run-mv4ghzj2-allm.md); clearing Done runs:
+  [`docs/specs/run-mv46ek2u-7omz.md`](docs/specs/run-mv46ek2u-7omz.md)).
 - **Design and deviations:** `docs/design-spec.md`, `docs/superpowers/specs/*`, `DEVIATIONS.md`.
 - **How it fits together:** `docs/architecture.md`; settings: `docs/configuration.md`.
 

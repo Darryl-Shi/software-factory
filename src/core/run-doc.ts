@@ -96,6 +96,8 @@ export type RunDocState = {
 	bundleMerged?: { bundle: string; delivery: Delivery };
 	/** READY: how many messages to the builder were already checked for a workspace change. */
 	readyChecked?: number;
+	/** Set by `clearRuns`: the run is archived (off the board and default listings); nothing is deleted. */
+	cleared?: { at: number; by: string };
 };
 
 /** Where a run's spec is committed: docs/specs/<run-id>.md, or the path its spec already has (docs/spec.md for older runs). */
@@ -175,6 +177,7 @@ export function toView(d: RunDocState): RunView {
 		...(d.workspace ? { workspace: d.workspace } : {}),
 		specPath: specPathOf(d),
 		...(d.bundle ? { bundle: d.bundle } : {}),
+		...(d.cleared ? { cleared: { at: d.cleared.at, by: d.cleared.by } } : {}),
 		createdAt: d.createdAt,
 		updatedAt: d.updatedAt,
 	};

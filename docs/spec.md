@@ -76,7 +76,7 @@ projects, automatic shipping, stacked PRs.
 | `ESCALATED` | Pending ask: accept as is / N more rounds / abort | accept → `DELIVERING` · more rounds → `BUILDING` · abort → `CANCELLED` |
 | `DELIVERING` | If the diff differs from the last reviewed fingerprint → `REVIEWING` (no round added). Else commit what the builder left uncommitted and, for an existing repo, push `factory/<run-id>` to `origin`. No PR, no repo creation, no CI | → `READY` · error → `FAILED` |
 | `READY` | Waits for a bundle. Not terminal | bundle merged → `DELIVERED` · builder changed the diff after a message → `REVIEWING` → … → `READY` |
-| `DELIVERED` / `FAILED` / `CANCELLED` | Terminal. Environments disposed, worktrees kept. A final notice (`run.notice` with `final`) carries the URL, advisory and accepted findings, the QA status and any "no CI" note | `retryRun` resumes a `FAILED` or `CANCELLED` run from the state it failed in |
+| `DELIVERED` / `FAILED` / `CANCELLED` | Terminal. Environments disposed, worktrees kept. A final notice (`run.notice` with `final`) carries the URL, advisory and accepted findings, the QA status and any "no CI" note | `retryRun` resumes a `FAILED` or `CANCELLED` run from the state it failed in (not a cleared one) · `clearRuns` archives it off the board |
 
 - **The builder** is the only build role the core talks to. It may spawn helpers (`subagent`) that write code in the
   same worktree and environment; the core never sees, splits, locks or merges their work. Helpers finish within the
@@ -187,7 +187,12 @@ The core's whole outside surface is `FactoryCore` (`src/core/types.ts`). Every o
 
 - **Projects:** `createProject`, `getProject`, `listProjects`.
 - **Runs:** `startRun`, `getRun`, `listRuns`, `getConversation`, `cancelRun`, `retryRun`, `answer`, `approve`,
-  `reject`, `submitHumanFindings`, `resolveEscalation`, `message`, `getScreenshot`.
+  `reject`, `submitHumanFindings`, `resolveEscalation`, `message`, `getScreenshot`, `clearRuns`.
+  - `clearRuns(runs)` soft-archives terminal runs (spec `docs/specs/run-mv46ek2u-7omz.md`): it sets
+    `cleared: { at, by }` on each run's Document in one commit and deletes nothing. All or nothing: an empty list is
+    `invalid`, an unknown id `not_found`, a non-terminal run `conflict`; already-cleared runs are skipped (idempotent).
+    `listRuns` leaves cleared runs out unless `includeCleared: true`; `getRun` still returns them; `retryRun` refuses
+    them with `conflict`.
 - **Settings:** `settingsSchema`, `getSettings`, `setSetting`, `unsetSetting`.
 - **Discussions:** `startDiscussion`, `getDiscussion`, `listDiscussions`, `getDiscussionConversation`, `say`,
   `stopTurn`, `requestDrafts`, `updateDraft`, `deleteDraft`, `createTicket`, `closeDiscussion`, `reopenDiscussion`,
@@ -196,14 +201,14 @@ The core's whole outside surface is `FactoryCore` (`src/core/types.ts`). Every o
   already in an active bundle), `getBundle`, `listBundles`, `getBundleConversation`, `mergeBundle`,
   `requestBundleChanges`, `dropFromBundle`, `resolveBundleEscalation` (`{ moreRounds }` | `{ drop }` | `{ abort }`),
   `cancelBundle`, `retryBundle`, `messageBundle`, `getBundleScreenshot`.
-- **Events** (`subscribe` over `GET /api/events`, server-sent): `run.state`, `run.ask`, `run.askResolved`,
+- **Events** (`subscribe` over `GET /api/events`, server-sent): `run.state`, `run.cleared`, `run.ask`, `run.askResolved`,
   `run.notice`, `run.message`, `conversation.updated`, `settings.changed`, `discussion.state`, `discussion.updated`,
   `discussion.conversation.updated`, `bundle.state`, `bundle.ask`, `bundle.askResolved`, `bundle.notice`,
   `bundle.conversation.updated`. Filters: `project` (matches run, discussion and bundle events), `run`, `discussion`,
   `bundle`. Member runs emit their own `run.state` as they change.
 - **Views:** `RunView` (state, gate, rounds and caps, pending ask, spec and delivery artifacts, conversations, reviews
   with QA status and VM, findings log, advisory and accepted findings, notices, messages, history, cost, `specPath`,
-  `bundle`) and `BundleView` (members with key, spec path and branch, dropped runs, merge method, delivery, CI, pending
+  `bundle`, `cleared`) and `BundleView` (members with key, spec path and branch, dropped runs, merge method, delivery, CI, pending
   ask, escalation, `mergeRequested`, the latest integration, rounds, conversations, reviews, findings, notices,
   messages, history, cost, failure).
 - **Pending asks are core state,** stored in the Document and published as events. The first valid answer resolves an
@@ -290,6 +295,11 @@ rejected.
   ticked) and shows a toast linking to it. A Ready run's view has **Ship this ticket**.
 - **Deliver column:** bundle cards (id, state, member keys, "Your turn"); member runs show inside their bundle card.
   Legacy runs still delivering the old way show as ordinary cards. **Done** shows merged runs with a bundle chip.
+- **Clearing Done runs:** **Clear all** in the Done header (two clicks) clears exactly the Done cards shown (project
+  filter, search and "Show closed" apply); a finished run's view has **Clear from board** (two clicks). Cleared runs
+  leave the board, its counts and counters, live in every tab (`run.cleared`), and stay off across restarts; the board
+  still loads them (`includeCleared`) so ticket keys don't shift. A cleared run opened by link is read-only, marked
+  cleared, with no Retry.
 - **Run view:** full screen for any run: a left rail with the conversations (architect, builder and its helpers,
   reviewers, QA agents) and a timeline; the transcript with every tool call as a plain row (QA screenshots inline); a
   chat box to the agent the run is with; approval and escalation cards floating over it with the final round's

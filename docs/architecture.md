@@ -345,8 +345,15 @@ only during a `draft` turn. It can't be messaged through `message`: the human ta
 server is its transport.
 
 - **Projects:** `createProject`, `getProject`, `listProjects`.
-- **Runs:** `startRun`, `getRun`, `listRuns`, `getConversation`, `cancelRun`, `retryRun`.
+- **Runs:** `startRun`, `getRun`, `listRuns`, `getConversation`, `cancelRun`, `retryRun`, `clearRuns`.
   - `getRun` returns a `RunView`.
+  - `clearRuns(runs)` archives terminal runs (`DELIVERED`, `FAILED`, `CANCELLED`) so they leave the board: it sets
+    `cleared: { at, by }` on each run's `RunDoc` and deletes nothing (record, conversations, screenshots, worktree and
+    delivery stay; `RunIndex` is unchanged). The whole call is checked first and applied in one commit: an empty list
+    is `invalid`, an unknown id `not_found`, a run that isn't terminal `conflict`. Runs already cleared are skipped and
+    left out of the result `{ cleared }`, so the call is idempotent. `listRuns` leaves cleared runs out unless
+    `includeCleared: true`; `getRun`, `getConversation`, `getScreenshot` and discussions' run links still work, and
+    `retryRun` refuses a cleared run with `conflict`.
   - `getConversation` returns a read-only transcript, including the builder's helpers.
 - **Answers to the pending ask:** `answer`, `approve`, `reject`, `submitHumanFindings`, `resolveEscalation`.
 - **Messages:** `message(run, text)` sends a message to the agent the run is with: the architect through the spec
@@ -367,11 +374,12 @@ server is its transport.
   `stopTurn`, `requestDrafts`, `updateDraft`, `deleteDraft`, `createTicket`, `closeDiscussion`, `reopenDiscussion`,
   `retryDiscussion`. An operation in the wrong state is refused with `conflict`, naming the state.
 - **Filters:** `listRuns`, `listBundles` and `listDiscussions` take `{ project?, states? }`; `states` must be an array of known
-  states, else the call is refused with `invalid`.
+  states, else the call is refused with `invalid`. `listRuns` also takes `includeCleared?: boolean`.
 - **Settings:** `settingsSchema`, `getSettings`, `setSetting`, `unsetSetting`.
 - **Events:** `subscribe(filter, on)`. A filter can select a project, a run, a bundle or a discussion; a project
   filter matches run, bundle and discussion events. Event types:
   - `run.state`: a state transition.
+  - `run.cleared`: a run was cleared from the board (`clearRuns`); carries `run` and `project`.
   - `run.ask`: a question, approval or escalation is pending.
   - `run.askResolved`: carries `by`, who answered (`web` for the web UI).
   - `run.notice`: progress and the final result.
