@@ -7,8 +7,8 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync
 import { dirname, join, sep } from "node:path";
 import { expandHome, type Obj } from "../core/settings.ts";
 import type { CiStatus, Delivery, DeliveryContext, Diff, Finding, PrRef, QaStatus, RepoRef, RunCtx, Workspace } from "../core/types.ts";
-import { git, gitOut } from "./git.ts";
-import type { GitHubHost, Identity } from "./host.ts";
+import { type CommitIdentity, git, gitOut } from "./git.ts";
+import { commitIdentityError, type GitHubHost, type Identity } from "./host.ts";
 
 const OK_CONCLUSIONS = ["success", "neutral", "skipped"];
 
@@ -175,8 +175,35 @@ function withClone<T>(clone: string, f: () => Promise<T>): Promise<T> {
 	return next;
 }
 
+/** The settings that name an account: the commit-identity cache key (a different `github.identity` is a new lookup). */
+export function identityKey(id: Identity): string {
+	return JSON.stringify([id.kind ?? "pat", id.tokenRef ?? null, id.appId ?? null, id.installationId ?? null, id.privateKeyRef ?? null]);
+}
+
 export class GitHub {
+	/** Commit identities per identity settings, for the life of the process; failures are dropped (the next call retries). */
+	private identities = new Map<string, Promise<CommitIdentity>>();
+
 	constructor(readonly host: GitHubHost) {}
+
+	/**
+	 * The commit identity (author and committer of every factory-made commit) of the owner's pinned `github.identity`:
+	 * the account behind it, looked up once per process and identity settings (concurrent first calls share one lookup).
+	 * Throws `cannot resolve the commit identity for github.identity (...): <call> failed: ...` when the lookup fails.
+	 */
+	commitIdentity(rc: RunCtx): Promise<CommitIdentity> {
+		const id = identityOf(rc);
+		const key = identityKey(id);
+		let p = this.identities.get(key);
+		if (!p) {
+			p = this.host.commitIdentity(id).catch((e) => {
+				if (this.identities.get(key) === p) this.identities.delete(key);
+				throw commitIdentityError(id, e);
+			});
+			this.identities.set(key, p);
+		}
+		return p;
+	}
 
 	// ------------------------------------------------------------------ disk cleanup (docs/specs/run-mv58bn4q-q2zs.md)
 
@@ -298,8 +325,9 @@ export class GitHub {
 		} else {
 			if (!existsSync(join(clone, ".git"))) {
 				mkdirSync(clone, { recursive: true });
+				const who = await this.commitIdentity(rc);
 				await git(clone, ["init", "-q", "-b", "main"]);
-				await git(clone, ["commit", "-q", "--allow-empty", "-m", "factory: initial commit"]);
+				await git(clone, ["commit", "-q", "--allow-empty", "-m", "factory: initial commit"], { identity: who });
 			}
 			base = await gitOut(clone, ["rev-parse", "main"]);
 		}
@@ -399,7 +427,8 @@ export class GitHub {
 	 * `refs/factory/<run branch>/<name>`, without touching HEAD, the index or the files. The reviewer's "changes since
 	 * the previous review" and the QA VM's copy of the reviewed build are taken from it. Returns the commit SHA.
 	 */
-	async snapshot(ws: Workspace, name: string): Promise<string> {
+	async snapshot(ws: Workspace, name: string, rc: RunCtx): Promise<string> {
+		const who = await this.commitIdentity(rc);
 		const index = join(ws.path, "..", `.${ws.branch.replace(/\//g, "_")}.snap-index`);
 		rmSync(index, { force: true });
 		const env = { GIT_INDEX_FILE: index };
@@ -409,14 +438,14 @@ export class GitHub {
 		const ref = `refs/factory/${ws.branch.replace(/^factory\//, "")}/${name}`;
 		const existing = await git(ws.path, ["rev-parse", "--verify", "-q", ref], { allowFail: true });
 		if (existing.code === 0 && (await gitOut(ws.path, ["rev-parse", `${existing.stdout.trim()}^{tree}`])) === tree) return existing.stdout.trim();
-		const sha = (await git(ws.path, ["commit-tree", tree, "-p", "HEAD", "-m", `factory: ${name}`])).stdout.trim();
+		const sha = (await git(ws.path, ["commit-tree", tree, "-p", "HEAD", "-m", `factory: ${name}`], { identity: who })).stdout.trim();
 		await git(ws.path, ["update-ref", ref, sha]);
 		return sha;
 	}
 
 	/** A git bundle of one snapshot (see `snapshot`), for a machine that has no access to the remote. */
-	async bundle(ws: Workspace, name: string, out: string): Promise<{ ref: string; sha: string }> {
-		const sha = await this.snapshot(ws, name);
+	async bundle(ws: Workspace, name: string, out: string, rc: RunCtx): Promise<{ ref: string; sha: string }> {
+		const sha = await this.snapshot(ws, name, rc);
 		const ref = `refs/factory/${ws.branch.replace(/^factory\//, "")}/${name}`;
 		mkdirSync(dirname(out), { recursive: true });
 		await git(ws.path, ["bundle", "create", out, ref]);
@@ -424,24 +453,26 @@ export class GitHub {
 	}
 
 	/** Deviation (DEVIATIONS.md): commit a core artifact (docs/spec.md) into the workspace. Idempotent. */
-	async writeArtifact(ws: Workspace, path: string, content: string, message: string): Promise<void> {
+	async writeArtifact(ws: Workspace, path: string, content: string, message: string, rc: RunCtx): Promise<void> {
+		const who = await this.commitIdentity(rc);
 		const file = join(ws.path, path);
 		mkdirSync(dirname(file), { recursive: true });
 		writeFileSync(file, content);
 		await git(ws.path, ["add", "--", path]);
 		const staged = await git(ws.path, ["diff", "--cached", "--quiet", "--", path], { allowFail: true });
-		if (staged.code !== 0) await git(ws.path, ["commit", "-q", "-m", message, "--", path]);
+		if (staged.code !== 0) await git(ws.path, ["commit", "-q", "-m", message, "--", path], { identity: who });
 	}
 
 	/** Writes advisory findings into the PR description (existing repo) or docs/delivery-notes.md (new repo). */
 	async deliver(ws: Workspace, ctx: DeliveryContext, rc: RunCtx): Promise<Delivery> {
 		const host = this.host;
 		const id = identityOf(rc);
+		const who = await this.commitIdentity(rc);
 		const auth = await host.gitAuth(id);
 		// Commit whatever the builder left uncommitted, so the delivered commit is the reviewed tree.
 		await git(ws.path, ["add", "-A"]);
 		if ((await git(ws.path, ["diff", "--cached", "--quiet"], { allowFail: true })).code !== 0)
-			await git(ws.path, ["commit", "-q", "-m", "factory: commit uncommitted builder changes"]);
+			await git(ws.path, ["commit", "-q", "-m", "factory: commit uncommitted builder changes"], { identity: who });
 		const remotes = await gitOut(ws.path, ["remote"]);
 		if (!remotes.split("\n").includes("origin")) await git(ws.path, ["remote", "add", "origin", host.remoteUrl(ws.repo)]);
 
@@ -451,7 +482,7 @@ export class GitHub {
 			writeFileSync(note, `# Delivery notes\n\n${report({ ...ctx, runId: rc.runId })}\n`);
 			await git(ws.path, ["add", "docs/delivery-notes.md"]);
 			if ((await git(ws.path, ["diff", "--cached", "--quiet"], { allowFail: true })).code !== 0)
-				await git(ws.path, ["commit", "-q", "-m", "docs: delivery notes"]);
+				await git(ws.path, ["commit", "-q", "-m", "docs: delivery notes"], { identity: who });
 			await git(ws.path, ["push", "-q", "origin", "HEAD:refs/heads/main"], auth);
 			const sha = await gitOut(ws.path, ["rev-parse", "HEAD"]);
 			return { kind: "repo", url: host.webUrl(ws.repo), ref: "main", sha };
@@ -506,9 +537,10 @@ export class GitHub {
 		const file = join(ws.path, "docs", "delivery-notes.md");
 		const cur = existsSync(file) ? readFileSync(file, "utf8") : "# Delivery notes\n";
 		if (cur.includes(note)) return;
+		const who = await this.commitIdentity(rc);
 		writeFileSync(file, `${cur.trimEnd()}\n\n> ${note}\n`);
 		await git(ws.path, ["add", "docs/delivery-notes.md"]);
-		await git(ws.path, ["commit", "-q", "-m", "docs: delivery notes (no CI)"]);
+		await git(ws.path, ["commit", "-q", "-m", "docs: delivery notes (no CI)"], { identity: who });
 		await git(ws.path, ["push", "-q", "origin", "HEAD:refs/heads/main"], await host.gitAuth(id));
 	}
 
@@ -519,10 +551,11 @@ export class GitHub {
 	// ------------------------------------------------------------------ Ready runs and bundles (bundles spec §1.1, §2)
 
 	/** Commit whatever is uncommitted in the worktree (untracked files included). Returns whether it committed. */
-	async commitAll(ws: Workspace, message: string): Promise<boolean> {
+	async commitAll(ws: Workspace, message: string, rc: RunCtx): Promise<boolean> {
+		const who = await this.commitIdentity(rc);
 		await git(ws.path, ["add", "-A"]);
 		if ((await git(ws.path, ["diff", "--cached", "--quiet"], { allowFail: true })).code === 0) return false;
-		await git(ws.path, ["commit", "-q", "-m", message]);
+		await git(ws.path, ["commit", "-q", "-m", message], { identity: who });
 		return true;
 	}
 
@@ -616,10 +649,11 @@ export class GitHub {
 	 * `git merge --no-ff` of a member's local branch into the bundle's branch. On a conflict the conflicted merge is left
 	 * in the worktree for the integrator; any other failure throws.
 	 */
-	async mergeMember(ws: Workspace, branch: string, message: string): Promise<{ clean: true } | { clean: false; files: string[] }> {
+	async mergeMember(ws: Workspace, branch: string, message: string, rc: RunCtx): Promise<{ clean: true } | { clean: false; files: string[] }> {
+		const who = await this.commitIdentity(rc);
 		if ((await git(ws.path, ["rev-parse", "--verify", "-q", `refs/heads/${branch}`], { allowFail: true })).code !== 0)
 			throw new Error(`branch ${branch} does not exist in the project's clone`);
-		const r = await git(ws.path, ["merge", "--no-ff", "--no-edit", "-m", message, `refs/heads/${branch}`], { allowFail: true });
+		const r = await git(ws.path, ["merge", "--no-ff", "--no-edit", "-m", message, `refs/heads/${branch}`], { allowFail: true, identity: who });
 		if (r.code === 0) return { clean: true };
 		const st = await this.mergeState(ws);
 		if (!st.inProgress || st.conflicted.length === 0) throw new Error(`merging ${branch} failed: ${gitReason(r)}`);
@@ -627,9 +661,10 @@ export class GitHub {
 	}
 
 	/** Conclude a merge whose conflicts are all resolved (the integrator staged but did not commit). */
-	async concludeMerge(ws: Workspace): Promise<void> {
+	async concludeMerge(ws: Workspace, rc: RunCtx): Promise<void> {
+		const who = await this.commitIdentity(rc);
 		await git(ws.path, ["add", "-A"]);
-		await git(ws.path, ["commit", "-q", "--no-edit"]);
+		await git(ws.path, ["commit", "-q", "--no-edit"], { identity: who });
 	}
 
 	/** The head of the repo's default branch on the remote right now (after a fetch). */
@@ -644,7 +679,8 @@ export class GitHub {
 	async deliverBundle(ws: Workspace, ctx: BundleDeliveryContext, rc: RunCtx): Promise<Delivery> {
 		const host = this.host;
 		const id = identityOf(rc);
-		await this.commitAll(ws, "factory: commit uncommitted integrator changes");
+		const who = await this.commitIdentity(rc);
+		await this.commitAll(ws, "factory: commit uncommitted integrator changes", rc);
 		const body = bundleReport(ctx, rc.runId);
 		if (ctx.mode === "push-main") {
 			await host.createRepo(ws.repo, { private: (rc.config.github?.visibility ?? "private") === "private" }, id);
@@ -654,7 +690,7 @@ export class GitHub {
 			mkdirSync(dirname(note), { recursive: true });
 			writeFileSync(note, `# Delivery notes\n\n${body}\n`);
 			await git(ws.path, ["add", "docs/delivery-notes.md"]);
-			if ((await git(ws.path, ["diff", "--cached", "--quiet"], { allowFail: true })).code !== 0) await git(ws.path, ["commit", "-q", "-m", "docs: delivery notes"]);
+			if ((await git(ws.path, ["diff", "--cached", "--quiet"], { allowFail: true })).code !== 0) await git(ws.path, ["commit", "-q", "-m", "docs: delivery notes"], { identity: who });
 			await git(ws.path, ["push", "-q", "origin", "HEAD:refs/heads/main"], await host.gitAuth(id));
 			return { kind: "repo", url: host.webUrl(ws.repo), ref: "main", sha: await gitOut(ws.path, ["rev-parse", "HEAD"]) };
 		}

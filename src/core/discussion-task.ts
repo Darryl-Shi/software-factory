@@ -291,8 +291,10 @@ export function createDiscussionTask(svc: DiscussionServices) {
 	// ------------------------------------------------------------------ phases
 	const handlers: Record<Phase, (rt: RT, c: Context, d: DiscussionDocState) => Promise<void>> = {
 		PREPARING: async (rt, c, d) => {
+			// The commit identity before any work (the discussant's environment carries it): a failed lookup fails here.
+			const who = await svc.github.commitIdentity(rc(d));
 			const ws = d.workspace ? await svc.github.refresh(d.workspace, rc(d)) : await svc.github.open(d.repo, rc(d), "discussions");
-			const env = await svc.sandbox.provision(ws, "discussant", rc(d));
+			const env = await svc.sandbox.provision(ws, "discussant", rc(d), who);
 			await transition(rt, c, d.id, async (doc, tx): Promise<Phase> => {
 				const prev = doc.workspace;
 				doc.workspace = ws;

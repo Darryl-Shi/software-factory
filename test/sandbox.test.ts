@@ -7,6 +7,7 @@ import { BACKGROUND_CONTEXT as c } from "@earendil-works/chord/context";
 import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
 import { beforeAll, describe, expect, test } from "vitest";
 import { git } from "../src/github/git.ts";
+import { GITHUB_SIDE_IDENTITY } from "../src/github/host.ts";
 import { Sandbox } from "../src/sandbox/sandbox.ts";
 import type { Workspace } from "../src/core/types.ts";
 
@@ -22,6 +23,7 @@ describe.skipIf(!available)("Sandbox (bubblewrap)", () => {
 	const dir = mkdtempSync(join(tmpdir(), "sf-sbx-"));
 	const secretDir = join(dir, "secret-home", ".factory");
 	const ws: Workspace = { repo: "me/x", path: join(dir, "wt"), baseRef: "", branch: "main", newRepo: true };
+	const WHO = { name: "octocat", email: "583231+octocat@users.noreply.github.com" };
 	const sandbox = new Sandbox({ stateDir: join(dir, "state") }); // the factory home is dir: the worktree and workdir live in it
 	const workdir = join(dir, "root");
 	const settings = {
@@ -47,9 +49,9 @@ describe.skipIf(!available)("Sandbox (bubblewrap)", () => {
 		await git(ws.path, ["init", "-q", "-b", "main"]);
 		writeFileSync(join(ws.path, "scripts/setup.sh"), "echo setup-ran > .setup-marker\n");
 		await git(ws.path, ["add", "-A"]);
-		await git(ws.path, ["commit", "-qm", "init"]);
-		const b = await sandbox.provision(ws, "builder", { runId: "r1", config: { workdir, sandbox: settings.sandbox } });
-		const r = await sandbox.provision(ws, "reviewer", { runId: "r1", config: { workdir, sandbox: settings.sandbox } });
+		await git(ws.path, ["commit", "-qm", "init"], { identity: GITHUB_SIDE_IDENTITY });
+		const b = await sandbox.provision(ws, "builder", { runId: "r1", config: { workdir, sandbox: settings.sandbox } }, WHO);
+		const r = await sandbox.provision(ws, "reviewer", { runId: "r1", config: { workdir, sandbox: settings.sandbox } }, WHO);
 		builder = sandbox.env({ conversationId: "c1", envId: b.envId });
 		reviewer = sandbox.env({ conversationId: "c2", envId: r.envId });
 	});
@@ -60,6 +62,8 @@ describe.skipIf(!available)("Sandbox (bubblewrap)", () => {
 
 	test("the builder can write the worktree and commit; the reviewer cannot write the worktree (bash or file tools)", async () => {
 		expect((await exec(builder, "echo hi > built.txt && git add built.txt && git commit -qm built && echo OK")).out).toContain("OK");
+		// the commit is authored and committed by the environment's commit identity (the GitHub account), not factory-<role>
+		expect((await exec(builder, "git log -1 --format='%an <%ae>|%cn <%ce>'")).out.trim()).toBe(`${WHO.name} <${WHO.email}>|${WHO.name} <${WHO.email}>`);
 		const rb = await exec(reviewer, "echo x > reviewer.txt");
 		expect(rb.code).not.toBe(0);
 		expect(rb.out).toMatch(/Read-only file system|Permission denied/);
@@ -72,7 +76,7 @@ describe.skipIf(!available)("Sandbox (bubblewrap)", () => {
 	});
 
 	test("the discussant cannot write the worktree with bash but can write its scratch dir", async () => {
-		const p = await sandbox.provision(ws, "discussant", { runId: "r1", config: { workdir, sandbox: settings.sandbox } });
+		const p = await sandbox.provision(ws, "discussant", { runId: "r1", config: { workdir, sandbox: settings.sandbox } }, WHO);
 		const discussant = sandbox.env({ conversationId: "c3", envId: p.envId });
 		// it reads the repo and runs commands in it
 		expect((await exec(discussant, "cat scripts/setup.sh")).out).toContain("setup-ran");

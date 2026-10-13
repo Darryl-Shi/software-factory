@@ -13,7 +13,8 @@ one project together as a **bundle**: one PR (or a push to `main` for a new repo
   [`docs/specs/run-mv4rp25k-mqna.md`](docs/specs/run-mv4rp25k-mqna.md), product spec §12; the combined review of
   clean multi-ticket bundles: [`docs/specs/run-mv4vd9xu-g2si.md`](docs/specs/run-mv4vd9xu-g2si.md); bulk cancel and clear from the board's select
   mode: [`docs/specs/run-mv545v95-rg77.md`](docs/specs/run-mv545v95-rg77.md); disk cleanup and
-  `gc`: [`docs/specs/run-mv58bn4q-q2zs.md`](docs/specs/run-mv58bn4q-q2zs.md), product spec §8.1).
+  `gc`: [`docs/specs/run-mv58bn4q-q2zs.md`](docs/specs/run-mv58bn4q-q2zs.md), product spec §8.1; commits authored by
+  the GitHub identity's account: [`docs/specs/run-mv6dwfsi-7xli.md`](docs/specs/run-mv6dwfsi-7xli.md)).
 - **Design and deviations:** `docs/design-spec.md`, `docs/superpowers/specs/*`, `DEVIATIONS.md`.
 - **How it fits together:** `docs/architecture.md`; settings: `docs/configuration.md`.
 
@@ -63,7 +64,9 @@ src/core/
   findings.ts            submission validation; messages.ts human messages (runs and bundles); usage.ts costs
   settings.ts            layered config + schema (bundle.mergeMethod, roles.integrator, ...)
 src/agents/              role prompts (prompts.ts) and fixed tool sets (tools.ts), web_search
-src/github/              GitHub (worktrees, diff, deliver, bundles: integrate/merge/PR), host.ts (gh API / LocalGitHubHost fake)
+src/github/              GitHub (worktrees, diff, deliver, bundles: integrate/merge/PR; commitIdentity(rc): the account
+                         behind github.identity, cached per process, author+committer of every commit), host.ts (gh API /
+                         LocalGitHubHost fake; commitIdentity lookups: GET /user, or GET /app + /users/<slug>[bot])
 src/sandbox/             sandbox-runtime environments per role (builder and integrator write)
 src/boat/                boat.dev VMs for AQ testing (fake backend in backend.ts)
 src/web/                 HTTP + SSE server; ui/ (app.js board + run view, bundles.js bundle view, discussions.js the full-screen chat behind the Chat button)

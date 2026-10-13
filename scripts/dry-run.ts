@@ -877,6 +877,27 @@ async function main() {
 	check("all runs recorded with cost and round counts", runs.every((r) => Array.isArray(r.cost) && typeof r.reviewRound === "number"));
 	check("all bundles recorded with cost and round counts", bundles.every((b) => Array.isArray(b.cost) && typeof b.reviewRound === "number") && bundles.filter((b) => b.reviews.length).every((b) => b.cost.some((c) => c.role === "reviewer")));
 	const refs = (await Promise.all([`${ME}/todo`, `${ME}/todo2`].map((r) => pexec("git", ["--git-dir", join(GH, "remotes", `${r}.git`), "for-each-ref", "--format=%(refname)"]).then((x) => x.stdout)))).join("");
+	// Commit identity (docs/specs/run-mv6dwfsi-7xli.md): every factory-made commit on the remotes' branches (main and
+	// factory/<id>) is authored and committed by the fake GitHub's account; the only others are GitHub-side commits
+	// (the seed, fake PR merges/squashes) by `GitHub <noreply@github.com>`.
+	const FACTORY_DEV = "factory-dev <1+factory-dev@users.noreply.github.com>";
+	const GITHUB_SIDE = "GitHub <noreply@github.com>";
+	const who = new Map<string, number>();
+	let factoryMade = 0;
+	for (const r of [`${ME}/todo`, `${ME}/todo2`]) {
+		const out = (await pexec("git", ["--git-dir", join(GH, "remotes", `${r}.git`), "log", "--branches", "--format=%an <%ae>|%cn <%ce>"], { maxBuffer: 64 << 20 })).stdout;
+		for (const line of out.split("\n").filter(Boolean)) {
+			const [a, c] = line.split("|");
+			if (a === GITHUB_SIDE && c === GITHUB_SIDE) continue;
+			if (a === FACTORY_DEV && c === FACTORY_DEV) factoryMade++;
+			else who.set(line, (who.get(line) ?? 0) + 1);
+		}
+	}
+	check(
+		`every factory-made commit on the remotes' branches is authored and committed by the GitHub identity's account (${FACTORY_DEV}); the rest are GitHub-side (${GITHUB_SIDE})`,
+		factoryMade > 0 && who.size === 0,
+		JSON.stringify({ factoryMade, others: Object.fromEntries(who) }),
+	);
 	if (!SANDBOX) say("  (sandbox OFF: the builder's deliberate push attempt reaches the fake remote, so the remote-refs check is skipped)");
 	else check("no agent-made ref reached the remotes (only main and factory/<run> branches)", refs.split("\n").filter(Boolean).every((r) => r === "refs/heads/main" || r.startsWith("refs/heads/factory/")), refs);
 }

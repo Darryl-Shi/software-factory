@@ -202,3 +202,13 @@ holds; 64–72 are choices the bundles spec left open.
 70. **Ticket keys (`PROJECT-N`) are computed by the core the same way as the web UI**: the project name's first segment, upper-cased and cut to 6 characters, and N counting the project's runs by creation. `BundleView.members[].key` uses it, and so do the bundle's notices and the integrator's inputs.
 71. **QA VMs of a bundle are named `factory-bundle-<n>-<seq>`** (entry 30's `factory-<id>-<seq>` with the bundle id), and the startup sweep keeps a bundle's VM only while that bundle is in `REVIEWING` at that seq.
 72. **The PR's title and description are rewritten at the next delivery.** After a drop, the bundle re-integrates and goes through `DELIVERING` again, which updates the open PR's title and description to the remaining tickets; it is not rewritten at the moment of the drop.
+
+## Commit identity (added after bundles; [commit identity spec](docs/specs/run-mv6dwfsi-7xli.md))
+
+Every factory-made commit is authored and committed by the GitHub account behind the pinned `github.identity`
+(docs/configuration.md, "Commit identity"). Entries 73–75 are where the code differs from the rest of the GitHub seam
+or from what a reader might expect.
+
+73. **The identity lookups bypass `gh api`.** `GhApiHost.commitIdentity` makes direct HTTPS requests to its `apiBase`, like the installation-token request, so a test can point it at a local stub and the App's `/app` call can carry the App JWT. Everything else on `GhApiHost`, including `whoami` (the setup wizard's `GET /user` check of a token and its scopes), still goes through `gh api`.
+74. **Known limitation: pre-July-2017 accounts.** The email is always the ID-based no-reply form `<id>+<login>@users.noreply.github.com`. An account created before July 2017 that never switched may only link commits through `<login>@users.noreply.github.com`; for it, factory commits show up unlinked. There is no setting to change the email (no `git.author`).
+75. **The fake GitHub has an account.** `LocalGitHubHost` resolves every identity to `factory-dev <1+factory-dev@users.noreply.github.com>` (test controls in its state file: `setAccount`, `failIdentity`), and its own GitHub-side commits (the seed, PR merges and squashes) are made as `GitHub <noreply@github.com>`. So `scripts/run.sh`, the tests and the dry run produce commits authored by `factory-dev`, and the dry run checks that every other commit on the fake remotes is GitHub-side.

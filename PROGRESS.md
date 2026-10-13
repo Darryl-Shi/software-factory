@@ -200,3 +200,18 @@ Decisions:
 - Round 2: F1 fixed — `LocalGitHubHost.save` is atomic (temp + rename) and `deleteBranch` no longer logs to the state
   file (the dry-run driver read a half-written github-state.json); dry run 104/104 three times in a row. F4: docs warn
   not to share a workdir between factories. F5 left as is (indexing the cache outside onChange would skew event diffs).
+
+## Commit identity (run run-mv6dwfsi-7xli; spec docs/specs/run-mv6dwfsi-7xli.md)
+
+- [x] git.ts: baseEnv has no identity; `git()` throws for commit-creating subcommands without `{ identity }`.
+- [x] host.ts: `GitHubHost.commitIdentity`; GhApiHost direct HTTPS lookups (`appJwt` factored out; installation tokens
+      cached per app/installation); LocalGitHubHost `setAccount`/`failIdentity`, logs `commitIdentity`, GitHub-side
+      commits as `GitHub <noreply@github.com>`.
+- [x] github.ts: `GitHub.commitIdentity(rc)` cache (key: kind/tokenRef/appId/installationId/privateKeyRef, shared
+      in-flight, failures dropped); every commit-creating method takes rc.
+- [x] sandbox: `EnvRecord.commitIdentity`, provision(…, identity), policy() refuses a record without one; core env
+      factory fills old records from the owner's pinned config (owner kind from the id prefix bundle-/disc-/run).
+- [x] doctor: `commits as:` per distinct identity (GhApiHost takes the doctor's secret store; `SF_TEST_GITHUB_API`).
+- [x] tests: commit-identity.test.ts (acceptance 1,4,5,6), sandbox-home, github-api, doctor; dry run 105/105.
+- Decisions: whoami stays on `gh api` (setup only). Missing credential in doctor → the existing warn, no lookup.
+- Full suite: only the 8 bubblewrap tests fail (no user namespaces on this host), as before.

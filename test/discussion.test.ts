@@ -10,6 +10,7 @@ import { draftInstructions } from "../src/core/discussion-task.ts";
 import type { DiscussionView, FactoryEvent, RunCtx } from "../src/core/types.ts";
 import { git, gitOut } from "../src/github/git.ts";
 import { GitHub } from "../src/github/github.ts";
+import { GITHUB_SIDE_IDENTITY } from "../src/github/host.ts";
 import { Sandbox } from "../src/sandbox/sandbox.ts";
 import { makeFactory, type TestEnv, until, untilDiscussion } from "./helpers.ts";
 
@@ -30,7 +31,7 @@ async function pushCommit(repo: string, path: string, content: string): Promise<
 		await git(work, ["checkout", "-q", "-B", "main"]);
 		writeFileSync(join(work, path), content);
 		await git(work, ["add", "-A"]);
-		await git(work, ["commit", "-q", "-m", `add ${path}`]);
+		await git(work, ["commit", "-q", "-m", `add ${path}`], { identity: GITHUB_SIDE_IDENTITY });
 		await git(work, ["push", "-q", "origin", "HEAD:refs/heads/main"]);
 		return await gitOut(work, ["rev-parse", "HEAD"]);
 	} finally {
@@ -47,7 +48,7 @@ async function forcePush(repo: string, path: string, content: string): Promise<s
 		await git(work, ["init", "-q", "-b", "main"]);
 		writeFileSync(join(work, path), content);
 		await git(work, ["add", "-A"]);
-		await git(work, ["commit", "-q", "-m", "rewrite"]);
+		await git(work, ["commit", "-q", "-m", "rewrite"], { identity: GITHUB_SIDE_IDENTITY });
 		await git(work, ["push", "-q", "--force", t!.host.bare(repo), "HEAD:refs/heads/main"]);
 		return await gitOut(work, ["rev-parse", "HEAD"]);
 	} finally {
@@ -102,7 +103,7 @@ describe("workspace", () => {
 		const ws = await gh.open("me/p", rc, "discussions");
 		writeFileSync(join(ws.path, "LOCAL.md"), "local\n");
 		await git(ws.path, ["add", "-A"]);
-		await git(ws.path, ["commit", "-q", "-m", "diverge"]);
+		await git(ws.path, ["commit", "-q", "-m", "diverge"], { identity: GITHUB_SIDE_IDENTITY });
 		writeFileSync(join(ws.path, "README.md"), "changed\n");
 		writeFileSync(join(ws.path, "STRAY.md"), "stray\n");
 		const head = await pushCommit("me/p", "NEW.md", "new\n");

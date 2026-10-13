@@ -9,6 +9,7 @@ import { BACKGROUND_CONTEXT as c } from "@earendil-works/chord/context";
 import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
 import { beforeAll, describe, expect, test } from "vitest";
 import { git } from "../src/github/git.ts";
+import { GITHUB_SIDE_IDENTITY } from "../src/github/host.ts";
 import { Sandbox } from "../src/sandbox/sandbox.ts";
 import type { Workspace } from "../src/core/types.ts";
 
@@ -25,6 +26,7 @@ describe.skipIf(!available)("Sandbox (bubblewrap): a write root around the facto
 	const home = join(outer, "fh");
 	const db = join(outer, "db", "factory.sqlite");
 	const ws: Workspace = { repo: "me/x", path: join(home, "wt"), baseRef: "", branch: "main", newRepo: true };
+	const WHO = { name: "octocat", email: "583231+octocat@users.noreply.github.com" };
 	const sandbox = new Sandbox({ stateDir: join(home, "environments") });
 	let builder: any, envId: string;
 
@@ -37,9 +39,9 @@ describe.skipIf(!available)("Sandbox (bubblewrap): a write root around the facto
 		await git(ws.path, ["init", "-q", "-b", "main"]);
 		writeFileSync(join(ws.path, "README.md"), "x\n");
 		await git(ws.path, ["add", "-A"]);
-		await git(ws.path, ["commit", "-qm", "init"]);
+		await git(ws.path, ["commit", "-qm", "init"], { identity: GITHUB_SIDE_IDENTITY });
 		const sb = { enabled: true, allowedDomains: [], deniedDomains: [], denyRead: [], extraWrite: [outer], unixSockets: "auto" };
-		({ envId } = await sandbox.provision(ws, "builder", { runId: "r9", config: { workdir: join(home, "root"), sandbox: sb, storage: { kind: "sqlite", path: db } } }));
+		({ envId } = await sandbox.provision(ws, "builder", { runId: "r9", config: { workdir: join(home, "root"), sandbox: sb, storage: { kind: "sqlite", path: db } } }, WHO));
 		builder = sandbox.env({ conversationId: "c1", envId });
 	});
 

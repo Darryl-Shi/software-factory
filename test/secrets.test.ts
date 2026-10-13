@@ -107,6 +107,7 @@ test("sandbox denies the factory home", async () => {
 		cwd: scratch,
 		scratch,
 		sandbox: { enabled: false, allowedDomains: [], deniedDomains: [], denyRead: [], extraWrite: [], unixSockets: "block" },
+		commitIdentity: { name: "octocat", email: "583231+octocat@users.noreply.github.com" },
 	};
 	writeFileSync(join(stateDir, "r1-reviewer.json"), JSON.stringify(rec));
 	const env = new Sandbox({ stateDir }).env({ conversationId: "c", envId: "r1-reviewer" });

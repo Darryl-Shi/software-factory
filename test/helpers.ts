@@ -79,6 +79,13 @@ export interface Control {
 	/** Hang the reviewer after its first step (crash tests); `reviewerHanging` is set while it hangs. */
 	reviewerHang?: boolean;
 	reviewerHanging?: boolean;
+	/**
+	 * The builder commits its own work in the sandbox (`git add -A && git commit` through bash) before report_done, then
+	 * writes leftover.txt ("... (round N)") and leaves it uncommitted (so the factory's "commit uncommitted builder changes" has work).
+	 */
+	builderCommits?: boolean;
+	/** With builderCommits: the bash outputs of the builder's commit commands. */
+	builderCommitOutputs?: string[];
 }
 
 export function newControl(): Control {
@@ -190,6 +197,17 @@ export function scripts(control: Control): Record<string, Script> {
 			if (!noProgress && control.sharedFile && ctx.inputs.length === 1)
 				return calls(["write", { path: `round-${ctx.inputs.length}.txt`, content: `round ${ctx.inputs.length}\n` }], ["write", { path: "shared.txt", content: `builder ${++sharedSeq}\n` }]);
 			if (!noProgress) return call("write", { path: `round-${ctx.inputs.length}.txt`, content: `round ${ctx.inputs.length}\n` });
+		}
+		if (control.builderCommits && ctx.turn > 0) {
+			const committed = ctx.results.find((r) => r.name === "bash");
+			if (!committed)
+				return call("bash", {
+					command: `git add -A && (git commit -q -m 'builder: round ${ctx.inputs.length}' || true) && git log -1 --format='%an <%ae>|%cn <%ce>' && echo BUILDER-COMMIT-DONE`,
+				});
+			if (!ctx.results.some((r) => r.name === "write" && ctx.results.indexOf(r) > ctx.results.indexOf(committed))) {
+				(control.builderCommitOutputs ??= []).push(committed.text);
+				return call("write", { path: "leftover.txt", content: `left for the factory to commit (round ${ctx.inputs.length})\n` });
+			}
 		}
 		const ids = [...ctx.inputs.at(-1)!.matchAll(/\[(F\d+)\] \([a-z]+, BLOCKING/g)].map((m) => m[1]!);
 		const plan = ids.length ? (control.responsePlan.shift() ?? "ok") : "ok";
