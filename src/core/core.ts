@@ -198,6 +198,8 @@ export class Factory implements FactoryCore {
 					const b = await read.snapshot(EnvDoc, conversationId, c);
 					if (!b?.envId || !b.runId) return undefined;
 					if (b.role === "qa") return this.opts.boat.env({ envId: b.envId, ...(cwd ? { cwd } : {}) });
+					// A record written before commits were authored by the GitHub identity gets it first (never a shellEnv without one).
+					if (this.opts.sandbox.needsCommitIdentity(b.envId)) this.opts.sandbox.setCommitIdentity(b.envId, await this.ownerCommitIdentity(b.runId));
 					return this.opts.sandbox.env({ conversationId: conversationId as unknown as string, ...(cwd ? { cwd } : {}), envId: b.envId });
 				},
 				conversationCreated: async (tx, rec) => {
@@ -312,6 +314,17 @@ export class Factory implements FactoryCore {
 		}
 		const d = this.discussions.get(id);
 		return d && discussionOwner(d);
+	}
+
+	/**
+	 * The commit identity of a run's, bundle's or discussion's pinned `github.identity` (through the GitHub class's cache),
+	 * for an environment record that lacks one. Throws the lookup's error.
+	 */
+	private async ownerCommitIdentity(id: string) {
+		const Doc = id.startsWith("bundle-") ? BundleDoc : id.startsWith("disc-") ? DiscussionDoc : RunDoc;
+		const d = (await this.harness.snapshot(Doc as typeof RunDoc, id, this.ctx)) as { pinned?: { config?: Record<string, any> } } | undefined;
+		if (!d?.pinned?.config) throw new Error(`cannot resolve the commit identity for ${id}: its Document has no pinned config`);
+		return this.opts.github.commitIdentity({ runId: id, config: d.pinned.config });
 	}
 
 	/** The owner as committed now (from storage, not the cache). */

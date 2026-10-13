@@ -1,4 +1,4 @@
-# Dry run of spec §8 — 2026-10-12T06:53:02.583Z
+# Dry run of spec §8 — 2026-10-13T08:14:19.147Z
 
 Directory: .dryrun (DRYRUN_DIR). Scripted agents (no model credentials), sandbox OFF (DRYRUN_SANDBOX=0), fake GitHub with local CI runner, SQLite storage, a daemonized `factory serve` driven through the web HTTP API (`POST /api/op/<op>`, `GET /api/events`).
 
@@ -6,7 +6,7 @@ Dropped CLI-only checks: none. The terminal attach view check is replaced by the
 
 Bundles: runs stop at Ready after review (branch `factory/<run-id>` pushed, no PR); every step ships its Ready run(s) as a bundle (`createBundle`) and merges it (`mergeBundle`) where the run used to deliver by itself. The PR description and delivery notes are written by the bundle (`## Ticket: <title>` sections and `## Integration`).
 
-**104/104 checks passed.**
+**105/105 checks passed.**
 
 ## §8.1 zero-to-MVP: createProject todo → me/todo, a discussion, then a ticket from its draft (repo does not exist)
 - ✅ discussion reached OPEN and answered both messages (after an ls, then a web search)
@@ -143,3 +143,4 @@ Bundles: runs stop at Ready after review (branch `factory/<run-id>` pushed, no P
 ## §8.5 pass criteria
 - ✅ all runs recorded with cost and round counts
 - ✅ all bundles recorded with cost and round counts
+- ✅ every factory-made commit on the remotes' branches is authored and committed by the GitHub identity's account (factory-dev <1+factory-dev@users.noreply.github.com>); the rest are GitHub-side (GitHub <noreply@github.com>)

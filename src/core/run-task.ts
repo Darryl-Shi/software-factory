@@ -310,10 +310,12 @@ export function createRunTask(svc: CoreServices) {
 					`AQ testing is on (qa.enabled) but the boat API key does not resolve (boat.apiKey = ${ref}). Either set the key (e.g. export ${String(ref).startsWith("env:") ? String(ref).slice(4) : "BOAT_API_KEY"} for the factory process), or set qa.enabled: false for project ${d.project}.`,
 				);
 			}
+			// The commit identity (the GitHub account behind github.identity) before any work: a failed lookup fails here.
+			const who = await svc.github.commitIdentity(rc(d));
 			const ws = await svc.github.open(d.repo, rc(d));
 			const envs: RunDocState["envs"] = {};
 			// Helpers run in the builder's environment; they get none of their own.
-			for (const role of ["architect", "builder", "reviewer"] as Role[]) envs[role] = await svc.sandbox.provision(ws, role, rc(d));
+			for (const role of ["architect", "builder", "reviewer"] as Role[]) envs[role] = await svc.sandbox.provision(ws, role, rc(d), who);
 			await transition(rt, c, d.id, async (doc, tx): Promise<Phase> => {
 				doc.workspace = ws;
 				doc.envs = envs;
@@ -352,7 +354,7 @@ export function createRunTask(svc: CoreServices) {
 		},
 
 		SPEC_READY: async (rt, c, d) => {
-			await svc.github.writeArtifact(d.workspace!, specPathOf(d), d.artifacts.spec!.text, `docs: spec v${d.artifacts.spec!.version} (factory run ${d.id})`);
+			await svc.github.writeArtifact(d.workspace!, specPathOf(d), d.artifacts.spec!.text, `docs: spec v${d.artifacts.spec!.version} (factory run ${d.id})`, rc(d));
 			await transition(rt, c, d.id, async (doc, tx): Promise<Phase> => {
 				const next = toGateOrNext(doc, "spec", "BUILDING");
 				if (next === "BUILDING") await startBuild(rt, tx, doc);
@@ -512,7 +514,7 @@ export function createRunTask(svc: CoreServices) {
 			if (!d.legacy) {
 				// Bundles (spec §1.1): the reviewed branch is committed and, for an existing repo, pushed; it waits in READY
 				// for a bundle. No PR, no repo, no CI.
-				await svc.github.commitAll(ws, "factory: commit uncommitted builder changes");
+				await svc.github.commitAll(ws, "factory: commit uncommitted builder changes", rc(d));
 				if (!ws.newRepo) await svc.github.pushBranch(ws, rc(d));
 				await transition(rt, c, d.id, (doc): Phase => {
 					doc.readyChecked = (doc.messages ?? []).filter((m) => m.to === "builder").length;

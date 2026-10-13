@@ -14,7 +14,7 @@ import { type ExecutionEnv, ExecutionError, FileError, type Result, type ShellEx
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { DEFAULT_DENY_READ, expandHome, type Obj } from "../core/settings.ts";
 import { ROLES, type Role, type RunCtx, type Workspace } from "../core/types.ts";
-import { gitOut } from "../github/git.ts";
+import { type CommitIdentity, gitOut } from "../github/git.ts";
 
 export const CREDENTIAL_ENV_VARS = ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "FACTORY_GIT_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "AWS_SECRET_ACCESS_KEY", "BOAT_API_KEY", "PARALLEL_API_KEY"];
 
@@ -41,6 +41,11 @@ type EnvRecord = {
 	storage?: string;
 	/** Set by `dispose`; a later `provision` of the same environment (a reopened discussion) clears it. */
 	disposed?: boolean;
+	/**
+	 * The author and committer of the commits made in this environment: the GitHub account behind the owner's pinned
+	 * `github.identity` (missing on records written before; the core fills it in before the environment is opened).
+	 */
+	commitIdentity?: CommitIdentity;
 };
 
 /**
@@ -253,6 +258,8 @@ export class Sandbox {
 	}
 
 	private policy(rec: EnvRecord) {
+		const who = rec.commitIdentity;
+		if (!who?.name || !who.email) throw new Error(`environment ${rec.envId} has no commit identity`);
 		// The factory home (parent of stateDir) holds secrets.json and the factory's state: deny it whole, whatever denyRead
 		// says, and re-allow the environment's own roots inside it (the workdir may live there). Its private entries and the
 		// run's storage are denied again on their own, read and write.
@@ -287,10 +294,10 @@ export class Sandbox {
 			GOCACHE: join(rec.scratch, "go-cache"),
 			LANG: process.env.LANG ?? "C.UTF-8",
 			TERM: "dumb",
-			GIT_AUTHOR_NAME: `factory-${rec.role}`,
-			GIT_AUTHOR_EMAIL: `${rec.role}@factory.local`,
-			GIT_COMMITTER_NAME: `factory-${rec.role}`,
-			GIT_COMMITTER_EMAIL: `${rec.role}@factory.local`,
+			GIT_AUTHOR_NAME: who.name,
+			GIT_AUTHOR_EMAIL: who.email,
+			GIT_COMMITTER_NAME: who.name,
+			GIT_COMMITTER_EMAIL: who.email,
 			GIT_CONFIG_NOSYSTEM: "1",
 		};
 		for (const d of ["home", "tmp", "cache", "npm-cache"]) mkdirSync(join(rec.scratch, d), { recursive: true });
@@ -322,14 +329,19 @@ export class Sandbox {
 		return { initialized: this.initialized, ...(this.unixSocketMode ? { unixSockets: this.unixSocketMode } : {}) };
 	}
 
-	/** Reads the run's pinned `workdir` (scratch root) and `sandbox.*` (including `setupScripts`). */
-	async provision(ws: Workspace, role: Role, rc: RunCtx): Promise<{ envId: string; cwd: string }> {
+	/**
+	 * Reads the run's pinned `workdir` (scratch root) and `sandbox.*` (including `setupScripts`). `commitIdentity` is the
+	 * resolved identity of the owner's `github.identity` (the caller resolves it first); an existing record without one
+	 * (a reopened discussion) gets it.
+	 */
+	async provision(ws: Workspace, role: Role, rc: RunCtx, commitIdentity: CommitIdentity): Promise<{ envId: string; cwd: string }> {
 		const root = expandHome(rc.config.workdir ?? "~/factory/work");
 		const envId = `${rc.runId}-${role}`;
 		const existing = existsSync(this.recordPath(envId)) ? this.load(envId) : undefined;
 		if (existing) {
-			if (existing.disposed) {
+			if (existing.disposed || !existing.commitIdentity) {
 				delete existing.disposed;
+				existing.commitIdentity ??= { name: commitIdentity.name, email: commitIdentity.email };
 				writeFileSync(this.recordPath(envId), JSON.stringify(existing, null, 2));
 			}
 			return { envId, cwd: existing.cwd };
@@ -350,6 +362,7 @@ export class Sandbox {
 				unixSockets: sb.unixSockets ?? "auto",
 			},
 			credentials: credentialLocations(rc.config),
+			commitIdentity: { name: commitIdentity.name, email: commitIdentity.email },
 			...(typeof rc.config.storage?.path === "string" ? { storage: expandHome(rc.config.storage.path) } : {}),
 		};
 		const common = await gitOut(ws.path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).catch(() => "");
@@ -370,6 +383,24 @@ export class Sandbox {
 		writeFileSync(this.recordPath(envId), JSON.stringify(rec, null, 2));
 		this.records.set(envId, rec);
 		return { envId, cwd: rec.cwd };
+	}
+
+	/** Whether the environment's record lacks a commit identity (written before commits were authored by the GitHub identity). */
+	needsCommitIdentity(envId: string): boolean {
+		return !this.load(envId).commitIdentity;
+	}
+
+	/** Store the commit identity on a record that lacks one (an old record, before it is opened); idempotent. */
+	setCommitIdentity(envId: string, commitIdentity: CommitIdentity): void {
+		const rec = this.load(envId);
+		if (rec.commitIdentity) return;
+		rec.commitIdentity = { name: commitIdentity.name, email: commitIdentity.email };
+		writeFileSync(this.recordPath(envId), JSON.stringify(rec, null, 2));
+	}
+
+	/** The environment's commit identity, if its record has one. */
+	commitIdentityOf(envId: string): CommitIdentity | undefined {
+		return this.load(envId).commitIdentity;
 	}
 
 	env(input: { conversationId: string; cwd?: string; envId: string }): ExecutionEnv {

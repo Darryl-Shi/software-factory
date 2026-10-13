@@ -286,7 +286,7 @@ export function createTaskKit<D extends KitDoc>(svc: CoreServices, Doc: unknown,
 		if (!d.reviews?.[String(seq)]) await commitReview(rt, c, d.id, seq, (r) => Object.assign(r, { reviewer, qaStatus: "off" }));
 		let r = (await read(rt, d.id, c)).reviews![String(seq)]!;
 		if (!r.sha) {
-			const sha = await svc.github.snapshot(ws, `review-${seq}`);
+			const sha = await svc.github.snapshot(ws, `review-${seq}`, rc(d));
 			await commitReview(rt, c, d.id, seq, (x) => (x.sha = sha));
 		}
 		if (r.qaStatus === undefined) {
@@ -320,7 +320,7 @@ export function createTaskKit<D extends KitDoc>(svc: CoreServices, Doc: unknown,
 			if (r.qaStatus !== "pending" && !(r.qaStatus === "ran" && !r.qaResult)) return;
 			let prov: Awaited<ReturnType<Boat["provision"]>>;
 			try {
-				prov = await svc.boat.provision(ws, rc(d), { seq, bundle: (out) => svc.github.bundle(ws, `review-${seq}`, out) });
+				prov = await svc.boat.provision(ws, rc(d), { seq, bundle: (out) => svc.github.bundle(ws, `review-${seq}`, out, rc(d)) });
 			} catch (e) {
 				const why = e instanceof Error ? e.message : String(e);
 				svc.log(`${hooks.noun} ${d.id}: boat unavailable for review ${seq}: ${why}`);

@@ -271,3 +271,165 @@ describe("CI failure logs", () => {
 		expect(st.failures![2]).toBe("legacy: failure\n1 failing");
 	});
 });
+
+// ------------------------------------------------------------------ commit identity (the account behind github.identity)
+
+type StubReq = { method: string; url: string; auth: string };
+type StubRoute = (req: StubReq) => { status: number; body?: unknown } | undefined;
+
+/** A local HTTP stand-in for api.github.com: answers from `handler` (404 otherwise) and records every request. */
+async function apiStub(handler: StubRoute) {
+	const reqs: StubReq[] = [];
+	const srv = createServer((req, res) => {
+		const r: StubReq = { method: req.method!, url: req.url!, auth: String(req.headers.authorization ?? "") };
+		reqs.push(r);
+		const out = handler(r) ?? { status: 404, body: { message: "Not Found" } };
+		res.writeHead(out.status, { "content-type": "application/json" });
+		res.end(out.body === undefined ? "" : JSON.stringify(out.body));
+	});
+	await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()));
+	const base = `http://127.0.0.1:${(srv.address() as any).port}`;
+	return { base, reqs, close: () => new Promise<void>((r) => srv.close(() => r())) };
+}
+
+const decode = (part: string) => JSON.parse(Buffer.from(part, "base64url").toString());
+
+describe("GhApiHost.commitIdentity", () => {
+	test("app: GET /app with the App JWT gives the slug; GET /users/<slug>%5Bbot%5D with the installation token gives the id; never /user", async () => {
+		const { privateKey, publicKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+		const keyFile = join(dir, "app-ci.pem");
+		writeFileSync(keyFile, privateKey.export({ type: "pkcs1", format: "pem" }));
+		const stub = await apiStub(({ method, url, auth }) => {
+			if (method === "GET" && url === "/app") return { status: 200, body: { slug: "my-app", id: 7 } };
+			if (method === "POST" && url === "/app/installations/456/access_tokens")
+				return { status: 201, body: { token: "ghs_installation_tok", expires_at: new Date(Date.now() + 3600_000).toISOString() } };
+			if (method === "GET" && url === "/users/my-app%5Bbot%5D" && auth === "Bearer ghs_installation_tok") return { status: 200, body: { id: 42, login: "my-app[bot]" } };
+			return undefined;
+		});
+		try {
+			const h = new GhApiHost(stub.base);
+			const id = { kind: "app" as const, appId: 123, installationId: 456, privateKeyRef: `file:${keyFile}` };
+			expect(await h.commitIdentity(id)).toEqual({ name: "my-app[bot]", email: "42+my-app[bot]@users.noreply.github.com" });
+			// the JWT on /app: three base64url parts, RS256, issued by the App, signed with its key
+			const app = stub.reqs.find((r) => r.url === "/app")!;
+			expect(app.method).toBe("GET");
+			const jwt = app.auth.replace(/^Bearer /, "");
+			const parts = jwt.split(".");
+			expect(parts).toHaveLength(3);
+			for (const p of parts) expect(p).toMatch(/^[A-Za-z0-9_-]+$/);
+			expect(decode(parts[0]!)).toMatchObject({ alg: "RS256" });
+			expect(decode(parts[1]!).iss).toBe("123");
+			const { createVerify } = await import("node:crypto");
+			expect(createVerify("RSA-SHA256").update(`${parts[0]}.${parts[1]}`).verify(publicKey, Buffer.from(parts[2]!, "base64url"))).toBe(true);
+			// the installation token is used on /users/..., never on /user or /app
+			const users = stub.reqs.filter((r) => r.url.startsWith("/users/"));
+			expect(users).toHaveLength(1);
+			expect(users[0]!.auth).toBe("Bearer ghs_installation_tok");
+			expect(app.auth).not.toContain("ghs_installation_tok");
+			expect(stub.reqs.some((r) => r.url === "/user" || r.url.startsWith("/user?"))).toBe(false);
+			expect(stub.reqs.map((r) => `${r.method} ${r.url}`)).toEqual(["GET /app", "POST /app/installations/456/access_tokens", "GET /users/my-app%5Bbot%5D"]);
+		} finally {
+			await stub.close();
+		}
+	});
+
+	test("app: a /app response without a slug fails; there is no partial identity", async () => {
+		const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
+		const keyFile = join(dir, "app-ci2.pem");
+		writeFileSync(keyFile, privateKey.export({ type: "pkcs1", format: "pem" }));
+		const stub = await apiStub(({ url }) => (url === "/app" ? { status: 200, body: { id: 7 } } : undefined));
+		try {
+			const id = { kind: "app" as const, appId: 123, installationId: 456, privateKeyRef: `file:${keyFile}` };
+			await expect(new GhApiHost(stub.base).commitIdentity(id)).rejects.toThrow(/GET \/app failed/);
+			expect(stub.reqs.map((r) => r.url)).toEqual(["/app"]);
+		} finally {
+			await stub.close();
+		}
+	});
+
+	test("pat: GET /user with the token gives <login> <id+login@users.noreply.github.com>", async () => {
+		const stub = await apiStub(({ method, url, auth }) =>
+			method === "GET" && url === "/user" && auth === "Bearer ghp_test_token_123" ? { status: 200, body: { id: 583231, login: "octocat" } } : undefined,
+		);
+		try {
+			expect(await new GhApiHost(stub.base).commitIdentity(pat)).toEqual({ name: "octocat", email: "583231+octocat@users.noreply.github.com" });
+			expect(stub.reqs.map((r) => `${r.method} ${r.url}`)).toEqual(["GET /user"]);
+			// bot identities are user accounts too
+			expect(await new GhApiHost(stub.base).commitIdentity({ ...pat, kind: "bot" as const })).toEqual({ name: "octocat", email: "583231+octocat@users.noreply.github.com" });
+		} finally {
+			await stub.close();
+		}
+	});
+
+	test("pat: a rejected token fails with the call and its status; responses missing the id or the login fail", async () => {
+		let body: { status: number; body?: unknown } = { status: 401, body: { message: "Bad credentials" } };
+		const stub = await apiStub(() => body);
+		try {
+			const h = new GhApiHost(stub.base);
+			await expect(h.commitIdentity(pat)).rejects.toThrow("GET /user failed: 401 Bad credentials");
+			body = { status: 200, body: { login: "octocat" } };
+			await expect(h.commitIdentity(pat)).rejects.toThrow(/GET \/user failed/);
+			body = { status: 200, body: { id: "583231", login: "octocat" } };
+			await expect(h.commitIdentity(pat)).rejects.toThrow(/GET \/user failed/);
+			body = { status: 200, body: { id: 583231, login: "" } };
+			await expect(h.commitIdentity(pat)).rejects.toThrow(/GET \/user failed/);
+		} finally {
+			await stub.close();
+		}
+	});
+
+	test("GitHub.commitIdentity names the identity and the failing call, never the token", async () => {
+		const stub = await apiStub(() => ({ status: 401, body: { message: "Bad credentials" } }));
+		try {
+			const gh = new GitHub(new GhApiHost(stub.base));
+			const rc = { runId: "r1", config: { github: { identity: pat } } };
+			const err = await gh.commitIdentity(rc as any).then(
+				() => undefined,
+				(e: Error) => e,
+			);
+			expect(err?.message).toBe("cannot resolve the commit identity for github.identity (kind pat, tokenRef env:SF_TEST_TOKEN): GET /user failed: 401 Bad credentials");
+			expect(err?.message).not.toContain("ghp_test_token_123");
+		} finally {
+			await stub.close();
+		}
+	});
+
+	test("GitHub caches per identity settings: concurrent calls share one lookup, another identity is a new lookup, failures are not cached", async () => {
+		const lookups: string[] = [];
+		let fail = true;
+		let release!: () => void;
+		let gate = new Promise<void>((r) => (release = r));
+		const host = {
+			async commitIdentity(id: { tokenRef?: string }) {
+				lookups.push(id.tokenRef ?? "");
+				await gate;
+				if (fail) throw new Error("GET /user failed: 502 Bad Gateway");
+				return { name: "octocat", email: "583231+octocat@users.noreply.github.com" };
+			},
+		} as unknown as GitHubHost;
+		const gh = new GitHub(host);
+		const rc = (tokenRef: string) => ({ runId: "r", config: { github: { identity: { kind: "pat", tokenRef } } } }) as any;
+		// a failure is shared by the concurrent callers, then dropped
+		const a = gh.commitIdentity(rc("env:A"));
+		const b = gh.commitIdentity(rc("env:A"));
+		release();
+		await expect(a).rejects.toThrow("cannot resolve the commit identity for github.identity (kind pat, tokenRef env:A): GET /user failed: 502 Bad Gateway");
+		await expect(b).rejects.toThrow(/502 Bad Gateway/);
+		expect(lookups).toEqual(["env:A"]);
+		// the next call retries; concurrent first calls share one lookup; later calls hit the cache
+		fail = false;
+		gate = new Promise<void>((r) => (release = r));
+		const c1 = gh.commitIdentity(rc("env:A"));
+		const c2 = gh.commitIdentity(rc("env:A"));
+		release();
+		expect(await c1).toEqual({ name: "octocat", email: "583231+octocat@users.noreply.github.com" });
+		expect(await c2).toEqual(await c1);
+		expect(await gh.commitIdentity(rc("env:A"))).toEqual(await c1);
+		expect(lookups).toEqual(["env:A", "env:A"]);
+		// a different github.identity is its own lookup
+		await gh.commitIdentity(rc("env:B"));
+		expect(lookups).toEqual(["env:A", "env:A", "env:B"]);
+		await gh.commitIdentity(rc("env:B"));
+		expect(lookups).toHaveLength(3);
+	});
+});

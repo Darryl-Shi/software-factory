@@ -243,6 +243,37 @@ A token needs enough access to create private repos and push. With a fine-graine
 
 With a classic PAT, grant `repo`, plus `workflow` if workflows will be pushed.
 
+#### Commit identity
+
+Every commit the factory makes is authored **and** committed by the GitHub account behind the effective (pinned)
+`github.identity`, the same identity that pushes. This covers the core's own commits (the initial commit, the spec
+commit, review snapshots, "factory: commit uncommitted builder changes", delivery notes, bundle merges) and the commits
+agents make inside their environments (the builder, its helpers and the integrator). GitHub then links them to that
+account. The identity is derived from the account and can't be configured (there is no `git.author` setting):
+
+| `kind` | Lookup | Name | Email |
+|---|---|---|---|
+| `pat`, `bot` | `GET /user` with the token → `id`, `login` | `<login>` | `<id>+<login>@users.noreply.github.com` |
+| `app` | `GET /app` with the App's JWT → `slug`; then `GET /users/<slug>%5Bbot%5D` with the installation token → `id` | `<slug>[bot]` | `<id>+<slug>[bot]@users.noreply.github.com` |
+
+- The email is always GitHub's ID-based no-reply address (`<id>+<login>@users.noreply.github.com`), never the
+  account's real email.
+- **Known limitation:** an account created before July 2017 that never switched to the ID-based no-reply address may
+  only link commits through `<login>@users.noreply.github.com`; its factory commits then show up unlinked.
+- An App needs no extra permission: `/app` is read with the App's own JWT, and the bot user is public. Installation
+  tokens never call `/user` or `/app`.
+- The lookup fails if the response lacks a numeric `id` or a login/slug; there is no partial identity. A failed lookup
+  fails the step that needed it (a new run in `PREPARING`, a bundle step, opening a discussion) with a message naming
+  the identity and the failing call, never the secret, e.g. `cannot resolve the commit identity for github.identity
+  (kind pat, tokenRef env:GH_TOKEN): GET /user failed: 401 Bad credentials`. No commit is made with another identity.
+- The lookup is cached per process and per identity settings (`kind`, `tokenRef`, `appId`, `installationId`,
+  `privateKeyRef`); a project with its own `github.identity` gets its own lookup, and failures are retried on the next
+  use. Pointing the same `tokenRef` at another account's token takes effect for commits **after a restart**.
+- Commits are unsigned (`commit.gpgsign=false`). The operator's `~/.gitconfig` and the system git config never supply
+  the identity.
+- `factory doctor` prints `commits as: <name> <<email>>` for each distinct effective identity (global, and per project
+  where it differs), or a `FAIL` line with the lookup's error.
+
 ### Secret references
 
 Secret settings (`github.identity.tokenRef`, `github.identity.privateKeyRef`, `boat.apiKey`, `webSearch.apiKey`) are

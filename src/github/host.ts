@@ -8,7 +8,34 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import YAML from "yaml";
 import { expandHome, resolveSecret } from "../core/settings.ts";
-import { baseEnv, git, run } from "./git.ts";
+import type { SecretStore } from "../secrets/store.ts";
+import { baseEnv, type CommitIdentity, git, run } from "./git.ts";
+
+export type { CommitIdentity } from "./git.ts";
+
+/** Commits GitHub itself makes (the fake host's seed, PR merges and squashes): GitHub's, not the factory's. */
+export const GITHUB_SIDE_IDENTITY: CommitIdentity = { name: "GitHub", email: "noreply@github.com" };
+
+/** The identity settings that name an account, without the secret: `kind pat, tokenRef env:GH_TOKEN` or `kind app, appId 1, installationId 2`. */
+export function describeIdentity(id: Identity): string {
+	const kind = id.kind ?? "pat";
+	return kind === "app" ? `kind app, appId ${id.appId ?? "(unset)"}, installationId ${id.installationId ?? "(unset)"}` : `kind ${kind}, tokenRef ${id.tokenRef ?? "env:GH_TOKEN"}`;
+}
+
+/** The error for a failed commit-identity lookup: names the identity (never its secret) and the failing call. */
+export function commitIdentityError(id: Identity, cause: unknown): Error {
+	return new Error(`cannot resolve the commit identity for github.identity (${describeIdentity(id)}): ${cause instanceof Error ? cause.message : String(cause)}`);
+}
+
+/** The commit identity of a user account (`pat`, `bot`): `<login> <id+login@users.noreply.github.com>`. */
+export function userCommitIdentity(login: string, id: number): CommitIdentity {
+	return { name: login, email: `${id}+${login}@users.noreply.github.com` };
+}
+
+/** The commit identity of a GitHub App's bot user: `<slug>[bot] <id+slug[bot]@users.noreply.github.com>`. */
+export function appCommitIdentity(slug: string, id: number): CommitIdentity {
+	return { name: `${slug}[bot]`, email: `${id}+${slug}[bot]@users.noreply.github.com` };
+}
 
 export interface PrInfo {
 	number: number;
@@ -58,6 +85,11 @@ export interface GitHubHost {
 	jobLog?(repo: string, jobId: number, id: Identity): Promise<string>;
 	/** Delete a branch on the host. Returns false when it was already gone (a missing ref counts as success). */
 	deleteBranch(repo: string, branch: string, id: Identity): Promise<boolean>;
+	/**
+	 * The account behind `id` as a commit identity (author and committer of every factory-made commit). Throws when the
+	 * lookup fails (message: the failing call and its status or network error); there is no partial identity.
+	 */
+	commitIdentity(id: Identity): Promise<CommitIdentity>;
 }
 
 // ------------------------------------------------------------------ secrets (references only, resolved at use)
@@ -66,31 +98,112 @@ export { resolveSecret } from "../core/settings.ts";
 // ------------------------------------------------------------------ real GitHub over `gh api`
 export class GhApiHost implements GitHubHost {
 	readonly name = "github.com";
-	private appToken?: { token: string; expires: number };
+	/** Installation tokens per `<appId>/<installationId>`. */
+	private appTokens = new Map<string, { token: string; expires: number }>();
 
-	constructor(private apiBase = "https://api.github.com") {}
+	/** `store`: where `store:` refs resolve (default: the process's secret store). */
+	constructor(
+		private apiBase = "https://api.github.com",
+		private store?: SecretStore,
+	) {}
+
+	/** A GitHub App JWT (RS256, 9 minutes), signed with the App's private key. */
+	protected appJwt(id: Identity): string {
+		const key = resolveSecret(id.privateKeyRef, this.store);
+		if (!key || !id.appId || !id.installationId) throw new Error("GitHub App identity needs appId, installationId and privateKeyRef");
+		const now = Math.floor(Date.now() / 1000);
+		const b64 = (o: object) => Buffer.from(JSON.stringify(o)).toString("base64url");
+		const unsigned = `${b64({ alg: "RS256", typ: "JWT" })}.${b64({ iat: now - 60, exp: now + 540, iss: String(id.appId) })}`;
+		const sig = createSign("RSA-SHA256").update(unsigned).sign(key).toString("base64url");
+		return `${unsigned}.${sig}`;
+	}
 
 	async token(id: Identity): Promise<string> {
 		if (id.kind === "app") {
-			if (this.appToken && this.appToken.expires > Date.now() + 60_000) return this.appToken.token;
-			const key = resolveSecret(id.privateKeyRef);
-			if (!key || !id.appId || !id.installationId) throw new Error("GitHub App identity needs appId, installationId and privateKeyRef");
-			const now = Math.floor(Date.now() / 1000);
-			const b64 = (o: object) => Buffer.from(JSON.stringify(o)).toString("base64url");
-			const unsigned = `${b64({ alg: "RS256", typ: "JWT" })}.${b64({ iat: now - 60, exp: now + 540, iss: String(id.appId) })}`;
-			const sig = createSign("RSA-SHA256").update(unsigned).sign(key).toString("base64url");
+			const tokenKey = `${id.appId}/${id.installationId}`;
+			const cached = this.appTokens.get(tokenKey);
+			if (cached && cached.expires > Date.now() + 60_000) return cached.token;
+			const jwt = this.appJwt(id);
 			const res = await fetch(`${this.apiBase}/app/installations/${id.installationId}/access_tokens`, {
 				method: "POST",
-				headers: { authorization: `Bearer ${unsigned}.${sig}`, accept: "application/vnd.github+json" },
+				headers: { authorization: `Bearer ${jwt}`, accept: "application/vnd.github+json" },
 			});
 			if (!res.ok) throw new Error(`GitHub App token request failed: ${res.status} ${await res.text()}`);
 			const body = (await res.json()) as { token: string; expires_at: string };
-			this.appToken = { token: body.token, expires: Date.parse(body.expires_at) };
+			this.appTokens.set(tokenKey, { token: body.token, expires: Date.parse(body.expires_at) });
 			return body.token;
 		}
-		const t = resolveSecret(id.tokenRef ?? "env:GH_TOKEN");
+		const t = resolveSecret(id.tokenRef ?? "env:GH_TOKEN", this.store);
 		if (!t) throw new Error(`no GitHub token: set ${id.tokenRef ?? "env:GH_TOKEN"} (github.identity.tokenRef)`);
 		return t;
+	}
+
+	/**
+	 * A direct HTTPS GET to `apiBase` (not through `gh api`, like the installation token request). Throws
+	 * `GET <path> failed: <status> <message>` or `GET <path> failed: <network error>`; returns the JSON body.
+	 */
+	private async getJson(path: string, bearer: string): Promise<any> {
+		let res: Response;
+		try {
+			res = await fetch(`${this.apiBase}${path}`, {
+				headers: { authorization: `Bearer ${bearer}`, accept: "application/vnd.github+json", "user-agent": "software-factory" },
+				signal: AbortSignal.timeout(30_000),
+			});
+		} catch (e) {
+			const cause = (e as any)?.cause;
+			throw new Error(`GET ${path} failed: ${e instanceof Error ? e.message : String(e)}${cause?.code ? ` (${cause.code})` : ""}`);
+		}
+		const text = await res.text().catch(() => "");
+		let json: any;
+		try {
+			json = text ? JSON.parse(text) : undefined;
+		} catch {
+			json = undefined;
+		}
+		if (!res.ok) {
+			const msg = typeof json?.message === "string" ? json.message : text.slice(0, 200);
+			throw new Error(`GET ${path} failed: ${res.status}${msg ? ` ${msg}` : ""}`);
+		}
+		return json;
+	}
+
+	/**
+	 * `pat`/`bot`: `GET /user` with the token. `app`: `GET /app` with the App JWT (the slug), then
+	 * `GET /users/<slug>%5Bbot%5D` with the installation token (the bot user's id). Installation tokens never call
+	 * `/user` or `/app`.
+	 */
+	async commitIdentity(id: Identity): Promise<CommitIdentity> {
+		if (id.kind === "app") {
+			let jwt: string;
+			try {
+				jwt = this.appJwt(id);
+			} catch (e) {
+				throw new Error(`GET /app failed: ${e instanceof Error ? e.message : String(e)}`);
+			}
+			const app = await this.getJson("/app", jwt);
+			const slug = app?.slug;
+			if (typeof slug !== "string" || !slug) throw new Error("GET /app failed: the response has no slug");
+			const path = `/users/${encodeURIComponent(slug)}%5Bbot%5D`;
+			let token: string;
+			try {
+				token = await this.token(id);
+			} catch (e) {
+				throw new Error(`GET ${path} failed: ${e instanceof Error ? e.message : String(e)}`);
+			}
+			const user = await this.getJson(path, token);
+			if (typeof user?.id !== "number") throw new Error(`GET ${path} failed: the response has no numeric id`);
+			return appCommitIdentity(slug, user.id);
+		}
+		let token: string;
+		try {
+			token = await this.token(id);
+		} catch (e) {
+			throw new Error(`GET /user failed: ${e instanceof Error ? e.message : String(e)}`);
+		}
+		const user = await this.getJson("/user", token);
+		if (typeof user?.id !== "number") throw new Error("GET /user failed: the response has no numeric id");
+		if (typeof user?.login !== "string" || !user.login) throw new Error("GET /user failed: the response has no login");
+		return userCommitIdentity(user.login, user.id);
 	}
 
 	/** The token's login, and its classic-token scopes from `X-OAuth-Scopes` (undefined when the header is absent). */
@@ -251,7 +364,14 @@ type LocalState = {
 	forced: Record<string, CheckRun[][]>; // repo → queue of check results for the next new commits
 	created: string[];
 	calls: { op: string; repo: string; at: number; detail?: unknown }[];
+	/** Test control: the account behind every identity (default: user `factory-dev`, id 1); a `slug` makes it an App. */
+	account?: { login: string; id: number } | { slug: string; id: number };
+	/** Test control: commit-identity lookups fail with this message (e.g. "401 Bad credentials"). */
+	identityFailure?: string;
 };
+
+/** The fake host's default account: `factory-dev <1+factory-dev@users.noreply.github.com>`. */
+export const FAKE_ACCOUNT = { login: "factory-dev", id: 1 } as const;
 
 export class LocalGitHubHost implements GitHubHost {
 	readonly name = "local";
@@ -297,6 +417,31 @@ export class LocalGitHubHost implements GitHubHost {
 		});
 	}
 
+	/** Test control: the account every identity resolves to (`{ login, id }` or an App's `{ slug, id }`). */
+	setAccount(account: { login: string; id: number } | { slug: string; id: number }) {
+		this.mutate((s) => {
+			s.account = account;
+		});
+	}
+
+	/** Test control: make commit-identity lookups fail with `message` (undefined: succeed again). */
+	failIdentity(message: string | undefined) {
+		this.mutate((s) => {
+			if (message === undefined) delete s.identityFailure;
+			else s.identityFailure = message;
+		});
+	}
+
+	/** The account in the state file (default `factory-dev`, id 1). Every lookup is logged as `commitIdentity`. */
+	async commitIdentity(id: Identity): Promise<CommitIdentity> {
+		const kind = id.kind ?? "pat";
+		this.log("commitIdentity", "", { kind, ...(kind === "app" ? { appId: id.appId, installationId: id.installationId } : { tokenRef: id.tokenRef ?? "env:GH_TOKEN" }) });
+		const s = this.state();
+		if (s.identityFailure !== undefined) throw new Error(`${kind === "app" ? "GET /app" : "GET /user"} failed: ${s.identityFailure}`);
+		const a = s.account ?? FAKE_ACCOUNT;
+		return "slug" in a ? appCommitIdentity(a.slug, a.id) : userCommitIdentity(a.login, a.id);
+	}
+
 	/** Test/dry-run setup: an existing repo with some content on main. */
 	async seedRepo(repo: string, files: Record<string, string>) {
 		await this.createRepo(repo, { private: true });
@@ -307,7 +452,7 @@ export class LocalGitHubHost implements GitHubHost {
 			writeFileSync(join(work, p), c);
 		}
 		await git(work, ["add", "-A"]);
-		await git(work, ["commit", "-q", "-m", "seed"]);
+		await git(work, ["commit", "-q", "-m", "seed"], { identity: GITHUB_SIDE_IDENTITY });
 		await git(work, ["push", "-q", this.bare(repo), "main"]);
 		rmSync(work, { recursive: true, force: true });
 	}
@@ -393,7 +538,7 @@ export class LocalGitHubHost implements GitHubHost {
 				writeFileSync(join(work, p), c);
 			}
 			await git(work, ["add", "-A"]);
-			await git(work, ["commit", "-q", "-m", message]);
+			await git(work, ["commit", "-q", "-m", message], { identity: GITHUB_SIDE_IDENTITY });
 			await git(work, ["push", "-q", "origin", `HEAD:${branch}`]);
 		} finally {
 			rmSync(work, { recursive: true, force: true });
@@ -413,10 +558,10 @@ export class LocalGitHubHost implements GitHubHost {
 			await git(work, ["fetch", "-q", "origin", pr.head]);
 			const merged =
 				how === "squash"
-					? await git(work, ["merge", "-q", "--squash", "FETCH_HEAD"], { allowFail: true })
-					: await git(work, ["merge", "-q", "--no-ff", "-m", `Merge PR #${number}${how === "rebase" ? " (rebase)" : ""}`, "FETCH_HEAD"], { allowFail: true });
+					? await git(work, ["merge", "-q", "--squash", "FETCH_HEAD"], { allowFail: true, identity: GITHUB_SIDE_IDENTITY })
+					: await git(work, ["merge", "-q", "--no-ff", "-m", `Merge PR #${number}${how === "rebase" ? " (rebase)" : ""}`, "FETCH_HEAD"], { allowFail: true, identity: GITHUB_SIDE_IDENTITY });
 			if (merged.code !== 0) throw new Error(`PR #${number} is not mergeable (merge conflict with ${pr.base})`);
-			if (how === "squash") await git(work, ["commit", "-q", "-m", `Merge PR #${number} (squash)`]);
+			if (how === "squash") await git(work, ["commit", "-q", "-m", `Merge PR #${number} (squash)`], { identity: GITHUB_SIDE_IDENTITY });
 			await git(work, ["push", "-q", "origin", `HEAD:${pr.base}`]);
 		} finally {
 			rmSync(work, { recursive: true, force: true });
