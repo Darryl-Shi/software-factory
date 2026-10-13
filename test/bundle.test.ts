@@ -432,6 +432,28 @@ describe("new repo", () => {
 		expect((await until(t!.factory, a, inState("DELIVERED"))).artifacts.delivery?.kind).toBe("repo");
 		expect((await until(t!.factory, b, inState("DELIVERED"))).state).toBe("DELIVERED");
 	});
+
+	test("red CI after the push to main: the fix goes by PR against the pushed main, and Merge merges it (the factory's own push is not a moved default branch)", async () => {
+		await setup([], { seed: false });
+		const a = await start("alpha");
+		expect((await ready(a)).state).toBe("READY");
+		t!.host.forceChecks("me/p", [{ name: "test", status: "completed", conclusion: "failure", summary: "boom" }], [{ name: "test", status: "completed", conclusion: "success" }]);
+		const id = await t!.factory.createBundle("p", [a]);
+		let v = await waitMerge(id);
+		expect(v.state).toBe("AWAITING_MERGE");
+		expect(states(v)).toEqual(["INTEGRATING", "DELIVERING", "AWAITING_CI", "FIXING", "REVIEWING", "DELIVERING", "AWAITING_CI", "AWAITING_MERGE"]);
+		const pushed = (await git(t!.host.bare("me/p"), ["rev-parse", "main"])).stdout.trim();
+		expect(v.integration!.base).toBe(pushed);
+		expect(v.delivery?.kind).toBe("pr");
+		expect(await remoteFile("main", "integrated.txt")).toBeUndefined();
+		await t!.factory.mergeBundle(id);
+		v = await untilBundle(t!.factory, id, bundleIn("MERGED", "FAILED", "CANCELLED", "ESCALATED"));
+		expect(v.state).toBe("MERGED");
+		expect(v.notices.some((n) => /default branch moved/.test(n.text))).toBe(false);
+		expect(states(v).slice(-2)).toEqual(["AWAITING_MERGE", "MERGED"]);
+		expect(await remoteFile("main", "integrated.txt")).toBe("fix 1\n");
+		expect((await until(t!.factory, a, inState("DELIVERED"))).state).toBe("DELIVERED");
+	});
 });
 
 describe("failure and retry", () => {

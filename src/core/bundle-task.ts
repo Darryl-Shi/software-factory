@@ -531,11 +531,19 @@ export function createBundleTask(svc: CoreServices) {
 			}
 			const runs = await memberRuns(rt, c, d);
 			const out = await svc.github.deliverBundle(ws, deliveryContext(d, runs), rc(d));
+			// A new repo's push makes `main` the pushed commit: later fixes go by PR against it, so it is the base from here on
+			// (left at the pre-push commit, Merge took the factory's own push for a moved default branch and re-integrated,
+			// discarding the fixes).
+			const pushed = out.kind === "repo" ? await svc.github.diff(ws, out.sha) : undefined;
 			await transition(rt, c, d.id, (doc): Phase => {
 				doc.delivery = out;
+				if (pushed) {
+					doc.integration = { ...doc.integration!, base: out.sha };
+					doc.workspace = { ...doc.workspace!, baseRef: out.sha, newRepo: false };
+					doc.lastFingerprint = pushed.fingerprint;
+				}
 				doc.deliveredBase = doc.integration!.base;
 				delete doc.noCi;
-				if (out.kind === "repo") doc.workspace = { ...doc.workspace!, newRepo: false };
 				notice(doc, { level: "info", text: `${out.kind === "pr" ? "PR" : "Pushed to main"}: ${out.url} @ ${out.sha.slice(0, 12)}`, url: out.url });
 				if ((doc.pinned.config.ci?.mode ?? "if-present") === "off") return afterCi(doc);
 				doc.ci = { startedAt: svc.now(), sha: out.sha };
