@@ -282,11 +282,22 @@ stops `serve` with an error naming the new paths.
   It opens per-run worktrees from a shared clone per project, commits spec artifacts, pushes branches, integrates
   bundle branches, creates repos, opens and updates PRs, reads checks, merges and closes PRs. Calls are idempotent
   per run or bundle. The GitHub credential never enters a sandbox or VM.
+  - **Commit identity** ([`docs/specs/run-mv6dwfsi-7xli.md`](specs/run-mv6dwfsi-7xli.md)): every commit the factory
+    makes, host-side or by an agent in its environment, is authored and committed by the GitHub account behind the
+    pinned `github.identity`: `<login> <id+login@users.noreply.github.com>` (`pat`, `bot`; `GET /user`) or
+    `<slug>[bot] <id+slug[bot]@users.noreply.github.com>` (`app`; `GET /app` with the App JWT, then
+    `GET /users/<slug>%5Bbot%5D`). The seam is `GitHubHost.commitIdentity(identity)`; `GitHub.commitIdentity(rc)`
+    caches it per process and identity settings (failures not cached). There is no configured author and no
+    placeholder: a failed lookup fails the step (run `PREPARING`, a bundle step, discussion open) with a message naming
+    the identity and the failing call, and nothing is committed. Commits are unsigned; commits GitHub makes itself
+    (API merges and squashes) are GitHub's. The fake host's account is `factory-dev <1+factory-dev@users.noreply.github.com>`.
 - **Sandbox** (`src/sandbox/`): every command a role runs goes through `@anthropic-ai/sandbox-runtime` (bubblewrap on
   Linux, Seatbelt on macOS). Writes are denied except the role's own write roots (the builder's and integrator's
   worktree and git dirs) and a per-environment scratch dir; reads of the factory home and secret paths are denied;
   network only to `allowedDomains` through the host proxy; commands start from an empty environment. Setup scripts run
-  at provision.
+  at provision. Each environment record carries the owner's commit identity (`EnvRecord.commitIdentity`), which sets
+  `GIT_AUTHOR_*` and `GIT_COMMITTER_*` in its commands; a record written before it existed gets it from the owner's
+  pinned config when it is next opened (the environment isn't recreated).
 - **Boat** (`src/boat/`, `@boatdev/sdk`): one VM per review round, created with an idempotency key so a resume finds
   the same VM; a stopped VM is resumed, a lost one replaced, and boat calls retry 3 times. `LocalBoatBackend`
   (`--fake-boat`) fakes it offline.
@@ -481,7 +492,8 @@ rejected.
   that factory's `/api/update/*` (so it restarts the same way), prints the incoming commits and the active work, asks
   for confirmation (`--yes` skips it; without a terminal `--yes` is required) and waits for `done`, `failed` or
   `rolled-back`. With no factory running it only pulls and installs.
-- `factory doctor`: checks the config, model credentials for every role, the sandbox, the GitHub identity and `gh`,
+- `factory doctor`: checks the config, model credentials for every role, the sandbox, the GitHub identity (and prints
+  the account commits are made as, `commits as: <name> <<email>>`, per distinct effective identity) and `gh`,
   the boat key wherever QA is on (`FAIL` if unresolved), and reports model-host diagnostics as warnings.
 - `factory setup [section]`: an interactive wizard with sections `prereqs`, `github`, `models`, `roles`, `qa`,
   `search`, `service`. It stores credentials in the factory (no env vars needed), installs pi provider packages and

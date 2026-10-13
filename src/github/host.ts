@@ -98,7 +98,8 @@ export { resolveSecret } from "../core/settings.ts";
 // ------------------------------------------------------------------ real GitHub over `gh api`
 export class GhApiHost implements GitHubHost {
 	readonly name = "github.com";
-	private appToken?: { token: string; expires: number };
+	/** Installation tokens per `<appId>/<installationId>`. */
+	private appTokens = new Map<string, { token: string; expires: number }>();
 
 	/** `store`: where `store:` refs resolve (default: the process's secret store). */
 	constructor(
@@ -119,7 +120,9 @@ export class GhApiHost implements GitHubHost {
 
 	async token(id: Identity): Promise<string> {
 		if (id.kind === "app") {
-			if (this.appToken && this.appToken.expires > Date.now() + 60_000) return this.appToken.token;
+			const tokenKey = `${id.appId}/${id.installationId}`;
+			const cached = this.appTokens.get(tokenKey);
+			if (cached && cached.expires > Date.now() + 60_000) return cached.token;
 			const jwt = this.appJwt(id);
 			const res = await fetch(`${this.apiBase}/app/installations/${id.installationId}/access_tokens`, {
 				method: "POST",
@@ -127,7 +130,7 @@ export class GhApiHost implements GitHubHost {
 			});
 			if (!res.ok) throw new Error(`GitHub App token request failed: ${res.status} ${await res.text()}`);
 			const body = (await res.json()) as { token: string; expires_at: string };
-			this.appToken = { token: body.token, expires: Date.parse(body.expires_at) };
+			this.appTokens.set(tokenKey, { token: body.token, expires: Date.parse(body.expires_at) });
 			return body.token;
 		}
 		const t = resolveSecret(id.tokenRef ?? "env:GH_TOKEN", this.store);
