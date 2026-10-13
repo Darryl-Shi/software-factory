@@ -9,8 +9,8 @@ import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
 import { Factory } from "./core/core.ts";
 import { assertNoLegacySections, expandHome, resolveSecret } from "./core/settings.ts";
 import { run } from "./github/git.ts";
-import { GitHub } from "./github/github.ts";
-import { GhApiHost } from "./github/host.ts";
+import { GitHub, identityKey } from "./github/github.ts";
+import { commitIdentityError, describeIdentity, GhApiHost, type Identity } from "./github/host.ts";
 import { createBoat, factoryHome } from "./main.ts";
 import { createModelHost, type ModelHost } from "./models/host.ts";
 import { Sandbox } from "./sandbox/sandbox.ts";
@@ -36,7 +36,10 @@ export function authSource(a: AuthCheck): string | undefined {
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
-export async function runDoctorChecks(configPath: string, opts: { scripted?: boolean; host?: ModelHost } = {}): Promise<DoctorLine[]> {
+/**
+ * `githubApi`: the GitHub API base the commit-identity lookups go to (default `SF_TEST_GITHUB_API`, else api.github.com).
+ */
+export async function runDoctorChecks(configPath: string, opts: { scripted?: boolean; host?: ModelHost; githubApi?: string } = {}): Promise<DoctorLine[]> {
 	configPath = expandHome(configPath);
 	const home = factoryHome(configPath);
 	const lines: DoctorLine[] = [];
@@ -109,9 +112,35 @@ export async function runDoctorChecks(configPath: string, opts: { scripted?: boo
 	else if (gh.value) line("ok", `GitHub identity (${kind}): credential found (${ghRef})`);
 	else line("warn", `GitHub identity (${kind}): no credential at ${ghRef ?? "github.identity.privateKeyRef (unset)"}`, "github");
 
-	// AQ testing: a FAIL for every scope where QA is on and the boat key does not resolve; a warn if boat's limits call fails
 	const scopes: { label: string; eff: any }[] = [{ label: "global", eff }];
 	if (hasConfig) for (const p of f.config.projects()) scopes.push({ label: `project ${p.name}`, eff: f.config.effective({ project: p.name }) });
+
+	// The commit identity (author and committer of every factory-made commit) of each distinct effective github.identity.
+	const api = new GhApiHost(opts.githubApi ?? (process.env.SF_TEST_GITHUB_API || undefined), store);
+	const seenIdentities = new Set<string>();
+	for (const s of scopes) {
+		const sid = (s.eff.github?.identity ?? {}) as Identity;
+		const key = identityKey(sid);
+		if (seenIdentities.has(key)) continue;
+		seenIdentities.add(key);
+		const label = s.label === "global" ? "" : `${s.label}, `;
+		const sref = (sid.kind ?? "pat") === "app" ? sid.privateKeyRef : (sid.tokenRef ?? "env:GH_TOKEN");
+		const cred = secret(sref);
+		if (s.label !== "global") {
+			// the global identity's credential line is above
+			if (cred.error) line("FAIL", `GitHub identity (${label}${describeIdentity(sid)}): ${sref}: ${cred.error}`);
+			else if (!cred.value) line("warn", `GitHub identity (${label}${describeIdentity(sid)}): no credential at ${sref ?? "github.identity.privateKeyRef (unset)"}`, "github");
+		}
+		if (!cred.value) continue;
+		try {
+			const who = await api.commitIdentity(sid);
+			line("ok", `GitHub identity (${label}${describeIdentity(sid)}): commits as: ${who.name} <${who.email}>`);
+		} catch (e) {
+			line("FAIL", commitIdentityError(sid, e).message, "github");
+		}
+	}
+
+	// AQ testing: a FAIL for every scope where QA is on and the boat key does not resolve; a warn if boat's limits call fails
 	const checkedRefs = new Set<string>();
 	for (const s of scopes) {
 		if (s.eff.qa?.enabled !== true) {

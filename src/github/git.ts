@@ -10,18 +10,33 @@ export interface GitResult {
 
 const SAFE_ENV_KEYS = ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "SHELL", "TERM"];
 
+/** Who a commit is authored and committed by: the GitHub account behind `github.identity` (never configured). */
+export interface CommitIdentity {
+	name: string;
+	email: string;
+}
+
+/** The four git env vars that make `id` the author and the committer of a commit. */
+export function identityEnv(id: CommitIdentity): Record<string, string> {
+	return { GIT_AUTHOR_NAME: id.name, GIT_AUTHOR_EMAIL: id.email, GIT_COMMITTER_NAME: id.name, GIT_COMMITTER_EMAIL: id.email };
+}
+
+/** A safe environment for host-side commands. It carries no commit identity: commits pass theirs to `git()`. */
 export function baseEnv(extra: Record<string, string> = {}): Record<string, string> {
 	const env: Record<string, string> = {};
 	for (const k of SAFE_ENV_KEYS) if (process.env[k] !== undefined) env[k] = process.env[k]!;
 	return {
 		...env,
 		GIT_TERMINAL_PROMPT: "0",
-		GIT_AUTHOR_NAME: "software-factory",
-		GIT_AUTHOR_EMAIL: "factory@localhost",
-		GIT_COMMITTER_NAME: "software-factory",
-		GIT_COMMITTER_EMAIL: "factory@localhost",
 		...extra,
 	};
+}
+
+/** Subcommands that may create a commit: they need an explicit identity (never the operator's ~/.gitconfig). */
+function createsCommit(args: string[]): boolean {
+	const sub = args[0];
+	if (sub === "commit" || sub === "commit-tree" || sub === "cherry-pick" || sub === "revert" || sub === "am" || sub === "pull" || sub === "rebase") return true;
+	return sub === "merge" && !args.includes("--abort");
 }
 
 export function run(cmd: string, args: string[], opts: { cwd?: string; env?: Record<string, string>; input?: string; timeoutMs?: number } = {}): Promise<GitResult> {
@@ -42,11 +57,20 @@ export function run(cmd: string, args: string[], opts: { cwd?: string; env?: Rec
 	});
 }
 
-/** git with hooks disabled and a fixed identity. `extraArgs` go before the subcommand (e.g. credential config). */
-export async function git(cwd: string, args: string[], opts: { env?: Record<string, string>; extraArgs?: string[]; allowFail?: boolean } = {}): Promise<GitResult> {
+/**
+ * git with hooks disabled and unsigned commits. `extraArgs` go before the subcommand (e.g. credential config). A
+ * subcommand that creates a commit must be given its `identity` (author and committer); without one it throws, so a
+ * commit never takes its identity from the operator's git config.
+ */
+export async function git(
+	cwd: string,
+	args: string[],
+	opts: { env?: Record<string, string>; extraArgs?: string[]; allowFail?: boolean; identity?: CommitIdentity } = {},
+): Promise<GitResult> {
+	if (createsCommit(args) && !opts.identity) throw new Error(`git ${args.join(" ")}: no commit identity given (a host-side commit is authored by the GitHub identity)`);
 	const r = await run("git", ["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", ...(opts.extraArgs ?? []), ...args], {
 		cwd,
-		env: baseEnv(opts.env),
+		env: baseEnv({ ...(opts.env ?? {}), ...(opts.identity ? identityEnv(opts.identity) : {}) }),
 	});
 	if (r.code !== 0 && !opts.allowFail) throw new Error(`git ${args.join(" ")} failed in ${cwd}: ${r.stderr.trim() || r.stdout.trim()}`);
 	return r;

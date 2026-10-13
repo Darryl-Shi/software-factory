@@ -340,7 +340,7 @@ export function createBundleTask(svc: CoreServices) {
 		const r = await runAgent(rt, c, d, "integrator", conv, key, conflictInput(d, runs), ["report_done"], []);
 		let st = await svc.github.mergeState(ws);
 		if (st.inProgress && st.conflicted.length === 0) {
-			await svc.github.concludeMerge(ws);
+			await svc.github.concludeMerge(ws, rc(d));
 			st = await svc.github.mergeState(ws);
 		}
 		const done = !st.inProgress && st.conflicted.length === 0 && (await svc.github.contains(ws, m.branch));
@@ -349,7 +349,7 @@ export function createBundleTask(svc: CoreServices) {
 			// The merge was aborted or left conflicted: set the conflicted merge up again and give it another attempt.
 			let files = st.conflicted;
 			if (!st.inProgress) {
-				const again = await svc.github.mergeMember(ws, m.branch, `Merge ${m.branch} (${m.title}) into ${ws.branch}`);
+				const again = await svc.github.mergeMember(ws, m.branch, `Merge ${m.branch} (${m.title}) into ${ws.branch}`, rc(d));
 				files = again.clean ? [] : again.files;
 			}
 			await rt.commit(async (tx) => {
@@ -387,9 +387,11 @@ export function createBundleTask(svc: CoreServices) {
 	const handlers: Record<Phase, (rt: RT, c: Context, d: BundleDocState) => Promise<void>> = {
 		INTEGRATING: async (rt, c, d) => {
 			if (!d.workspace) {
+				// The commit identity before any work: a failed lookup fails the step here.
+				const who = await svc.github.commitIdentity(rc(d));
 				const ws = await svc.github.openBundle(d.repo, rc(d));
 				const envs: BundleDocState["envs"] = {};
-				for (const role of ["integrator", "reviewer"] as Role[]) envs[role] = await svc.sandbox.provision(ws, role, rc(d));
+				for (const role of ["integrator", "reviewer"] as Role[]) envs[role] = await svc.sandbox.provision(ws, role, rc(d), who);
 				await rt.commit(async (tx) => {
 					const doc = await docIn(tx, d.id);
 					doc.workspace = ws;
@@ -430,11 +432,11 @@ export function createBundleTask(svc: CoreServices) {
 					// a crash between the merge and its record: the conflicted merge is still there
 					if (st.conflicted.length) res = { clean: false, files: st.conflicted };
 					else {
-						await svc.github.concludeMerge(ws);
+						await svc.github.concludeMerge(ws, rc(d));
 						res = { clean: true };
 					}
 				} else if (await svc.github.contains(ws, m.branch)) res = { clean: true };
-				else res = await svc.github.mergeMember(ws, m.branch, `Merge ${m.branch} (${m.title}) into ${ws.branch}`);
+				else res = await svc.github.mergeMember(ws, m.branch, `Merge ${m.branch} (${m.title}) into ${ws.branch}`, rc(d));
 				await rt.commit(async (tx) => {
 					const x = await docIn(tx, d.id);
 					if (res.clean) x.integration!.next += 1;
