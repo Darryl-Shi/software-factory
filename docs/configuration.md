@@ -196,8 +196,10 @@ themselves.
 | `if-present` | Wait for the repo's checks. If none appear within `noChecksTimeout`, finish anyway and note in the PR description or `docs/delivery-notes.md` that there was no CI. |
 | `required` | Checks must pass. If none appear, escalate to the human. |
 
-When CI is red, the failure goes back to the bundle's integrator. After `fixRounds` failed rounds, the bundle
-escalates. (Legacy runs still wait for CI themselves, and a red CI goes to their builder.)
+When CI is red, the failure goes back to the bundle's integrator. The finding names each failed check once, and its
+evidence is the check's output: for a GitHub Actions job, the failed step's command and the end of its log up to the
+error (about 3,000 characters; the sandbox cannot reach GitHub to read the log itself). After `fixRounds` failed
+rounds, the bundle escalates. (Legacy runs still wait for CI themselves, and a red CI goes to their builder.)
 
 Delivery itself is not a setting: a new repo is always pushed to `main`, and an existing repo always gets a pull
 request.

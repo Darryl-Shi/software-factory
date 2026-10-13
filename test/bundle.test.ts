@@ -193,6 +193,8 @@ describe("CI", () => {
 		expect(v.state).toBe("ESCALATED");
 		expect(states(v)).toEqual(["INTEGRATING", "REVIEWING", "DELIVERING", "AWAITING_CI", "FIXING", "REVIEWING", "DELIVERING", "AWAITING_CI", "ESCALATED"]);
 		expect(v.findingsLog.filter((e) => e.kind === "ci").length).toBe(2);
+		// the description names the failed checks; their output (an Actions job's log excerpt) is the evidence
+		expect(v.findingsLog.find((e) => e.kind === "ci")!.findings[0]).toMatchObject({ description: expect.stringMatching(/: test: failure$/), evidence: "test: failure\nboom" });
 		expect(t!.control.integratorInputs[0]).toContain("(ci, BLOCKING");
 		expect(t!.control.integratorInputs[0]).toContain("boom");
 		expect(v.escalation).toMatchObject({ cap: "ciFix", from: "AWAITING_CI" });

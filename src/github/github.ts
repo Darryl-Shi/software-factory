@@ -28,6 +28,38 @@ export type CheckoutArea = "runs" | "bundles" | "discussions";
 const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 /**
+ * The part of a GitHub Actions job log that says why it failed, at most `max` characters: for each failed step (a
+ * `##[error]` line), its command and the end of its output up to the error. Timestamps and colour codes are dropped;
+ * a log without an error marker gives its tail.
+ */
+export function ciLogExcerpt(log: string, max = 3000): string {
+	const lines = log
+		.split(/\r?\n/)
+		.map((l) => l.replace(/^\uFEFF?\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z ?/, "").replace(/\x1b\[[0-9;]*[A-Za-z]/g, ""));
+	const tail = (text: string, n: number) => (text.length > n ? `…${text.slice(text.length - n + 1)}` : text);
+	const errors = lines.flatMap((l, i) => (l.startsWith("##[error]") ? [i] : []));
+	if (!errors.length) return tail(lines.join("\n").trim(), max);
+	// the failed steps (by the line of their `##[group]Run ...`), each up to its last error line
+	const steps = new Map<number, number>();
+	for (const e of errors) {
+		let s = e;
+		while (s >= 0 && !lines[s]!.startsWith("##[group]Run ")) s--;
+		steps.set(s, e);
+	}
+	const picked = [...steps].slice(0, 3);
+	const budget = Math.floor(max / picked.length);
+	return picked
+		.map(([start, end]) => {
+			if (start < 0) return tail(lines.slice(0, end + 1).join("\n").trim(), budget);
+			const head = `step: ${lines[start]!.slice("##[group]".length)}`;
+			const close = lines.findIndex((l, i) => i > start && l.startsWith("##[endgroup]"));
+			const from = close > start && close < end ? close + 1 : start + 1;
+			return `${head}\n${tail(lines.slice(from, end + 1).join("\n").trim(), Math.max(200, budget - head.length - 1))}`;
+		})
+		.join("\n\n");
+}
+
+/**
  * Remove a checkout and its manifest: the git worktree (from `clone`, if that clone exists), the directory, `git
  * worktree prune`, the local branch and the manifest. Every step is attempted and idempotent (a missing thing counts as
  * success); failures are reported, never thrown. A branch that can't be deleted is reset by the next `open` of a
@@ -441,9 +473,25 @@ export class GitHub {
 		const checks = counted.map((r) => ({ name: r.name, state: r.status === "completed" ? (r.conclusion ?? "unknown") : r.status }));
 		if (counted.length === 0) return { state: "none", checks };
 		if (counted.some((r) => r.status !== "completed")) return { state: "pending", checks };
-		const failed = counted.filter((r) => !OK_CONCLUSIONS.includes(r.conclusion ?? ""));
-		if (failed.length) return { state: "red", failures: failed.map((r) => `${r.name}: ${r.conclusion}${r.summary ? `\n${r.summary}` : ""}`), checks };
-		return { state: "green", checks };
+		// one per name: a workflow on both push and pull_request reports the same job twice for the sha
+		const failed = counted.filter((r) => !OK_CONCLUSIONS.includes(r.conclusion ?? "")).filter((r, i, all) => all.findIndex((x) => x.name === r.name) === i);
+		if (!failed.length) return { state: "green", checks };
+		const failures = await Promise.all(
+			failed.map(async (r) => {
+				const detail = [r.summary];
+				// GitHub Actions leaves the summary empty: the error is in the job's log
+				if (r.jobId !== undefined && this.host.jobLog)
+					detail.push(
+						await this.host.jobLog(repo, r.jobId, identityOf(rc)).then(
+							(log) => ciLogExcerpt(log),
+							(e) => `(the job log could not be fetched: ${errText(e)})`,
+						),
+					);
+				const text = detail.filter(Boolean).join("\n");
+				return `${r.name}: ${r.conclusion}${text ? `\n${text}` : ""}`;
+			}),
+		);
+		return { state: "red", failures, checks };
 	}
 
 	/** Deviation (DEVIATIONS.md): add a note (e.g. "no CI") to the PR description / delivery note. Idempotent. */

@@ -7,7 +7,8 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { GhApiHost } from "../src/github/host.ts";
+import { ciLogExcerpt, GitHub } from "../src/github/github.ts";
+import { type CheckRun, GhApiHost, type GitHubHost } from "../src/github/host.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "fake-gh-"));
 const routes: Record<string, { status: number; body?: unknown }> = {};
@@ -166,5 +167,107 @@ describe("GhApiHost: deleting branches (disk cleanup)", () => {
 		expect(await h.deleteBranch("me/del", "factory/run-3", pat)).toBe(false); // unrouted: 404
 		route("DELETE /repos/me/del/git/refs/heads/factory/run-4", 403, { message: "Forbidden" });
 		await expect(h.deleteBranch("me/del", "factory/run-4", pat)).rejects.toThrow(/403/);
+	});
+});
+
+// A GitHub Actions job log as the logs endpoint returns it: a timestamp on every line, colour codes, one group per step.
+const T = "2026-10-12T23:53:49.4764151Z ";
+const ACTIONS_LOG = [
+	"##[group]Run actions/checkout@v4",
+	"Syncing repository: me/todo",
+	"##[endgroup]",
+	"##[group]Run cargo clippy --workspace -- -D warnings",
+	"\x1b[36;1mcargo clippy --workspace -- -D warnings\x1b[0m",
+	"shell: /usr/bin/bash -e {0}",
+	"##[endgroup]",
+	...Array.from({ length: 300 }, (_, i) => `    Checking dep-${i} v0.1.0`),
+	"\x1b[1m\x1b[91merror\x1b[0m: this `if let` can be collapsed into the outer `if let`",
+	"   --> crates/app/src/setup.rs:345:13",
+	"error: could not compile `app` due to 1 previous error",
+	"##[error]Process completed with exit code 101.",
+	"Post job cleanup.",
+	"Cleaning up orphan processes",
+]
+	.map((l) => T + l)
+	.join("\n");
+
+describe("CI failure logs", () => {
+	test("ciLogExcerpt: the failed step's command and the end of its output up to the error, without timestamps, colours or later steps", () => {
+		const x = ciLogExcerpt(ACTIONS_LOG, 600);
+		expect(x.startsWith("step: Run cargo clippy --workspace -- -D warnings\n")).toBe(true);
+		expect(x).toContain("error: this `if let` can be collapsed into the outer `if let`\n   --> crates/app/src/setup.rs:345:13");
+		expect(x.endsWith("##[error]Process completed with exit code 101.")).toBe(true);
+		expect(x).not.toMatch(/2026-10-12T|\x1b|shell: |Post job cleanup|Syncing repository|dep-0 /);
+		expect(x.length).toBeLessThanOrEqual(600);
+		// a second failed step (a workflow that keeps going after a failure) gets its own section
+		const two = ciLogExcerpt(`${ACTIONS_LOG}\n${T}##[group]Run cargo test\n${T}##[endgroup]\n${T}test x ... FAILED\n${T}##[error]Process completed with exit code 101.`, 1200);
+		expect(two).toContain("step: Run cargo clippy");
+		expect(two).toContain("step: Run cargo test\ntest x ... FAILED\n##[error]");
+		// no error marker: the log's tail
+		expect(ciLogExcerpt(`${T}one\n${T}two\n${T}three`, 10)).toBe("…two\nthree");
+	});
+
+	test("GhApiHost: Actions check runs carry their job id; jobLog fetches the job's log with the token, following the redirect", async () => {
+		route("GET /repos/me/todo/commits/def/check-runs", 200, {
+			check_runs: [
+				{ id: 77, name: "build", status: "completed", conclusion: "failure", app: { slug: "github-actions" }, output: { summary: null } },
+				{ id: 78, name: "scan", status: "completed", conclusion: "success", app: { slug: "gitguardian" }, output: { summary: "ok" } },
+			],
+		});
+		route("GET /repos/me/todo/commits/def/status", 200, { statuses: [] });
+		let auth = "";
+		const srv = createServer((req, res) => {
+			if (req.url === "/repos/me/todo/actions/jobs/77/logs") {
+				auth = String(req.headers.authorization);
+				res.writeHead(302, { location: "/blob/77.txt" });
+				return res.end();
+			}
+			if (req.url === "/blob/77.txt") {
+				res.writeHead(200, { "content-type": "text/plain" });
+				return res.end(ACTIONS_LOG);
+			}
+			res.writeHead(404);
+			res.end();
+		});
+		await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()));
+		try {
+			const h = new GhApiHost(`http://127.0.0.1:${(srv.address() as any).port}`);
+			expect(await h.checks("me/todo", "def", pat)).toEqual([
+				{ name: "build", status: "completed", conclusion: "failure", jobId: 77 },
+				{ name: "scan", status: "completed", conclusion: "success", summary: "ok" },
+			]);
+			expect(await h.jobLog("me/todo", 77, pat)).toBe(ACTIONS_LOG);
+			expect(auth).toBe("Bearer ghp_test_token_123");
+			await expect(h.jobLog("me/todo", 99, pat)).rejects.toThrow(/actions\/jobs\/99\/logs: 404/);
+		} finally {
+			srv.close();
+		}
+	});
+
+	test("red CI: each failed check once, with its job log's excerpt (or why the log is missing)", async () => {
+		const runs: CheckRun[] = [
+			{ name: "build", status: "completed", conclusion: "failure", jobId: 77 },
+			{ name: "build", status: "completed", conclusion: "failure", jobId: 79 }, // the same job for the pull_request event
+			{ name: "lint", status: "completed", conclusion: "failure", jobId: 80 },
+			{ name: "legacy", status: "completed", conclusion: "failure", summary: "1 failing" },
+			{ name: "ok", status: "completed", conclusion: "success" },
+		];
+		const fetched: number[] = [];
+		const host = {
+			checks: async () => runs,
+			jobLog: async (_repo: string, jobId: number) => {
+				fetched.push(jobId);
+				if (jobId === 80) throw new Error("GitHub GET /repos/me/todo/actions/jobs/80/logs: 410");
+				return ACTIONS_LOG;
+			},
+		} as unknown as GitHubHost;
+		const gh = new GitHub(host);
+		const st = await gh.checks({ kind: "pr", url: "https://github.com/me/todo/pull/1", ref: "factory/bundle-1", sha: "abc", pr: { repo: "me/todo", number: 1, url: "u" } }, undefined, { config: { github: { identity: pat } } } as any);
+		expect(st.state).toBe("red");
+		expect(fetched).toEqual([77, 80]);
+		expect(st.failures).toHaveLength(3);
+		expect(st.failures![0]).toMatch(/^build: failure\nstep: Run cargo clippy[\s\S]*setup\.rs:345:13[\s\S]*exit code 101\.$/);
+		expect(st.failures![1]).toBe("lint: failure\n(the job log could not be fetched: GitHub GET /repos/me/todo/actions/jobs/80/logs: 410)");
+		expect(st.failures![2]).toBe("legacy: failure\n1 failing");
 	});
 });

@@ -24,6 +24,8 @@ export interface CheckRun {
 	status: "queued" | "in_progress" | "completed";
 	conclusion?: string;
 	summary?: string;
+	/** A GitHub Actions check run: its job id, whose log `jobLog` fetches (Actions leaves `summary` empty). */
+	jobId?: number;
 }
 
 export interface Identity {
@@ -52,6 +54,8 @@ export interface GitHubHost {
 	getPr(repo: string, number: number, id: Identity): Promise<PrInfo>;
 	mergePr(repo: string, number: number, how: "merge" | "squash" | "rebase", id: Identity): Promise<void>;
 	checks(repo: string, sha: string, id: Identity): Promise<CheckRun[]>;
+	/** The full log of a GitHub Actions job (a check run's `jobId`). */
+	jobLog?(repo: string, jobId: number, id: Identity): Promise<string>;
 	/** Delete a branch on the host. Returns false when it was already gone (a missing ref counts as success). */
 	deleteBranch(repo: string, branch: string, id: Identity): Promise<boolean>;
 }
@@ -215,6 +219,7 @@ export class GhApiHost implements GitHubHost {
 			status: c.status === "completed" ? "completed" : c.status === "queued" ? "queued" : "in_progress",
 			...(c.conclusion ? { conclusion: c.conclusion } : {}),
 			...(c.output?.summary ? { summary: c.output.summary } : {}),
+			...(c.app?.slug === "github-actions" && typeof c.id === "number" ? { jobId: c.id } : {}),
 		}));
 		for (const s of status.statuses ?? [])
 			out.push({
@@ -224,6 +229,18 @@ export class GhApiHost implements GitHubHost {
 				...(s.description ? { summary: s.description } : {}),
 			});
 		return out;
+	}
+
+	// Not through `gh api`: the endpoint redirects to blob storage with the raw log, which recent gh refuses to print
+	// (terminal escape sequences). fetch follows the redirect and drops the Authorization header across origins.
+	async jobLog(repo: string, jobId: number, id: Identity): Promise<string> {
+		const path = `/repos/${repo}/actions/jobs/${jobId}/logs`;
+		const res = await fetch(`${this.apiBase}${path}`, {
+			headers: { authorization: `Bearer ${await this.token(id)}`, accept: "application/vnd.github+json" },
+			signal: AbortSignal.timeout(60_000),
+		});
+		if (!res.ok) throw new Error(`GitHub GET ${path}: ${res.status}`);
+		return res.text();
 	}
 }
 

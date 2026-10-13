@@ -661,7 +661,7 @@ export function createBundleTask(svc: CoreServices) {
 				severity: "major",
 				blocking: true,
 				source: "ci",
-				description: `CI failed on the delivered commit ${dl.sha.slice(0, 12)}: ${(st.failures ?? []).join("; ") || "checks failed"}`,
+				description: `CI failed on the delivered commit ${dl.sha.slice(0, 12)}: ${(st.failures ?? []).map((f) => f.split("\n")[0]).join("; ") || "checks failed"}`,
 				evidence: (st.failures ?? []).join("\n"),
 			},
 		]);
