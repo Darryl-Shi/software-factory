@@ -5,7 +5,7 @@
 
 // ===================================================================== core client
 class FactoryError extends Error {
-  constructor(code, message) { super(message); this.code = code; this.name = "FactoryError"; }
+  constructor(code, message, details) { super(message); this.code = code; this.name = "FactoryError"; if (details !== undefined) this.details = details; }
 }
 async function call(op, args) {
   let res;
@@ -17,7 +17,7 @@ async function call(op, args) {
   if (res.status === 401) { location.reload(); throw new FactoryError("unauthorized", "Your session expired."); }
   let body;
   try { body = await res.json(); } catch { throw new FactoryError("http", `HTTP ${res.status}`); }
-  if (!body.ok) throw new FactoryError(body.code ?? "error", body.error ?? `HTTP ${res.status}`);
+  if (!body.ok) throw new FactoryError(body.code ?? "error", body.error ?? `HTTP ${res.status}`, body.details);
   return body.result;
 }
 function subscribe(filter, on) {
@@ -491,6 +491,58 @@ function renderProjectFilter() {
   sel.value = ui.filter.project;
 }
 
+// ===================================================================== deleted projects (project.deleted, and links to purged items)
+const NOT_FOUND_TEXT = "Not found (its project was deleted or it never existed)";
+/** The message for a failed open of a run, bundle or discussion: a purged (or unknown) id reads as not found. */
+const openErrorText = (e) => (e?.code === "not_found" ? NOT_FOUND_TEXT : String(e?.message ?? e));
+/**
+ * A project was deleted (the `project.deleted` event, or this tab's own deleteProject): drop its runs, bundles and
+ * discussions from every cache, the project from every list and dropdown, and close an open view of it. Idempotent:
+ * the deleting tab applies it from the operation's result and again from the event.
+ */
+async function projectDeleted(e) {
+  const name = e.project;
+  const runs = new Set(e.runs ?? []), bundles = new Set(e.bundles ?? []), discs = new Set(e.discussions ?? []);
+  for (const r of ui.runs.values()) if (r.project === name) runs.add(r.id);
+  for (const b of ui.bundles.values()) if (b.project === name) bundles.add(b.id);
+  for (const d of ui.discs.values()) if (d.project === name) discs.add(d.id);
+  // the open view of one of its items: a run, a bundle, or a discussion (a blank new chat on it only switches project)
+  const openHit = !!ui.open && (ui.mode === "bundle" ? bundles.has(ui.open) : ui.mode === "discussion" ? discs.has(ui.open) : runs.has(ui.open));
+  runs.forEach((id) => { ui.runs.delete(id); ui.keys.delete(id); ui.sel.delete(id); pendingRuns.delete(id); });
+  bundles.forEach((id) => { ui.bundles.delete(id); pendingBundles.delete(id); });
+  discs.forEach((id) => ui.discs.delete(id));
+  ui.ship = ui.ship.filter((id) => !runs.has(id));
+  ui.projects = ui.projects.filter((p) => p.name !== name);
+  if (ui.filter.project === name) ui.filter.project = "";
+  renderProjectFilter();
+  // the Create dialog's project dropdown, if it is open
+  const cp = $("#c-project");
+  if (cp) { const o = [...cp.options].find((x) => x.value === name); if (o) { const was = cp.value === name; o.remove(); if (was) { cp.selectedIndex = 0; cp.dispatchEvent(new Event("change")); } } }
+  // a confirmation to delete this very project (another tab did it first)
+  [...document.querySelectorAll("#modal-root [data-delete-project]")].filter((m) => m.dataset.deleteProject === name).forEach((m) => { const i = modalStack.indexOf(m.closest(".scrim")); if (i >= 0) { modalStack.splice(i, 1)[0].remove(); } });
+  if (ui.setScope === name) ui.setScope = "global";
+  if (!$("#view-settings").hidden) renderSettings();
+  if (!$("#view-board").hidden) renderBoard();
+  if (ui.mode === "discussion" && typeof renderRail === "function") {
+    if (!openHit && ui.chat && ui.chat.project === name && isNewChat()) { ui.chat.project = ui.projects[0]?.name ?? "__new"; prefillChat(); }
+    if (!openHit) { renderChatbar(); renderRail(); }
+  }
+  if (openHit) {
+    await closeRun();
+    toast(`Project ${name} was deleted`);
+  }
+}
+/** Open a run by id (a link): fetch it if the board's cache lacks it; a purged id says so. */
+async function openRunById(id) {
+  if (!ui.runs.has(id)) {
+    try { ui.runs.set(id, await core.getRun(id)); } catch (e) { toast(openErrorText(e), "error"); return; }
+  }
+  if (ui.open) await closeRun();
+  if (ui.open) return;
+  if ($("#view-board").hidden) showView("board");
+  openRun(id, cardEl(id));
+}
+
 // ===================================================================== events → client cache
 const pendingRuns = new Set(); let flushTimer = 0;
 function refreshRun(id) { pendingRuns.add(id); if (!flushTimer) flushTimer = setTimeout(flush, 60); }
@@ -555,6 +607,7 @@ function refreshConv(run, cid) {
   }, 120);
 }
 function onEvent(e) {
+  if (e.type === "project.deleted") { projectDeleted(e); return; }
   if (e.type.startsWith("discussion.")) return withDiscussions(() => onDiscussionEvent(e));
   if (e.type.startsWith("bundle.")) return onBundleEvent(e);
   if (e.type === "conversation.updated") {
@@ -1260,6 +1313,7 @@ function groupOf(path) {
 const GROUP_NAME = (g) => { const [a, b] = g.split("."); return b ? `${cap1(a)} · ${b}` : cap1(a); };
 const GROUP_ORDER = ["policy", "roles", "github", "ci", "sandbox", "qa", "boat", "webSearch", "web", "workdir", "storage"];
 async function renderSettings() {
+  if (ui.setScope !== "global" && !ui.projects.some((p) => p.name === ui.setScope)) ui.setScope = "global"; // a deleted project
   const scope = ui.setScope === "global" ? { global: true } : { project: ui.setScope };
   let eff;
   try {
@@ -1285,7 +1339,77 @@ async function renderSettings() {
     </div>`);
   }
   $("#set-main").innerHTML = `<h2>${scope.project ? `${esc(scope.project)} overrides` : "Global settings"}</h2>
-    <p class="set-intro">Every value resolves default → global → project. ${scope.project ? "Values you set here override the global ones for this project only; Inherit removes the override." : "Pick a project on the left to override values for it."} Changes apply to new runs; running ones stay pinned to the config they started with. Interface settings (like this page's port) apply when the factory restarts.</p>${rows.join("")}`;
+    <p class="set-intro">Every value resolves default → global → project. ${scope.project ? "Values you set here override the global ones for this project only; Inherit removes the override." : "Pick a project on the left to override values for it."} Changes apply to new runs; running ones stay pinned to the config they started with. Interface settings (like this page's port) apply when the factory restarts.</p>${rows.join("")}${scope.project ? deleteSectionHtml(scope.project) : ""}`;
+}
+// ---------------------------------------------------------------- Delete project (the bottom of a project's scope)
+const DELETE_REMOVES = "its tickets (runs), bundles and discussions with all their history and conversations, their worktrees, the factory/&lt;id&gt; branches (local and on GitHub), QA screenshots, and this project's settings";
+const DELETE_KEEPS = "the GitHub repo itself, its default branch and its pull requests, and the global settings";
+function deleteSectionHtml(name) {
+  return `<section class="set-danger" aria-label="Delete project">
+    <h3>Delete project</h3>
+    <p>Deleting <b>${esc(name)}</b> removes ${DELETE_REMOVES}. It keeps ${DELETE_KEEPS}. It can't be undone.</p>
+    <p class="hint">Cancel its running tickets and bundles and close its open discussions first.</p>
+    <button type="button" class="btn danger" data-delete-project="${esc(name)}">Delete project</button>
+  </section>`;
+}
+const LIVE_KIND = { run: "Ticket", bundle: "Bundle", discussion: "Discussion" };
+const liveHash = (x) => `#${x.kind === "bundle" ? "bundle" : x.kind === "discussion" ? "disc" : "run"}=${encodeURIComponent(x.id)}`;
+function liveLabel(x) {
+  if (x.kind === "run") { const r = ui.runs.get(x.id); return r ? `${keyOf(x.id)} · ${r.request.title}` : keyOf(x.id); }
+  if (x.kind === "discussion") { const d = ui.discs.get(x.id); return d ? d.title : x.id; }
+  return x.id;
+}
+function openLiveItem(kind, id) {
+  if (kind === "bundle") return openBundleById(id);
+  if (kind === "discussion") { if ($("#view-board").hidden) showView("board"); return withDiscussions(() => openDiscussion(id)); }
+  return openRunById(id);
+}
+/** The confirmation: type the project's name exactly; on conflict, the live items as links. */
+function openDeleteProject(name) {
+  const root = openModal(`<form class="modal delete-project" data-delete-project="${esc(name)}" novalidate>
+    <div class="modal-head"><h2>Delete project ${esc(name)}?</h2><button type="button" class="icon-btn" data-close aria-label="Close">${CLOSE_SVG}</button></div>
+    <div class="modal-body">
+      <p style="margin:0">This removes ${DELETE_REMOVES}.</p>
+      <p style="margin:0">Kept: ${DELETE_KEEPS}.</p>
+      <div class="field"><label for="dp-name">Type <b class="mono">${esc(name)}</b> to confirm</label><input id="dp-name" autocomplete="off" spellcheck="false" autocapitalize="off"></div>
+      <div class="dp-live" id="dp-live" hidden></div>
+    </div>
+    <div class="modal-foot"><button type="button" class="btn" data-close>Cancel</button><button type="submit" class="btn dangerfill" id="dp-go" disabled>Delete project</button></div>
+  </form>`);
+  const form = $("form", root), input = $("#dp-name", root), go = $("#dp-go", root), live = $("#dp-live", root);
+  let busy = false;
+  const gate = () => (go.disabled = busy || input.value !== name);
+  input.addEventListener("input", gate);
+  root.querySelectorAll("[data-close]").forEach((b) => b.addEventListener("click", closeModal));
+  live.addEventListener("click", (e) => {
+    const a = e.target.closest("[data-live-kind]"); if (!a) return;
+    e.preventDefault();
+    closeModal();
+    openLiveItem(a.dataset.liveKind, a.dataset.liveId);
+  });
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (busy || input.value !== name) return;
+    busy = true; gate();
+    let res;
+    try { res = await core.deleteProject(name); }
+    catch (err) {
+      busy = false; gate();
+      if (err instanceof FactoryError && err.code === "conflict") {
+        const items = Array.isArray(err.details?.live) ? err.details.live : [];
+        live.hidden = false;
+        live.innerHTML = `<p class="dp-live-h">${esc(name)} still has live work, so nothing was deleted. Cancel or close these first:</p>`
+          + (items.length ? `<ul>${items.map((x) => `<li><span class="dp-kind">${esc(LIVE_KIND[x.kind] ?? x.kind)}</span> <a href="${esc(liveHash(x))}" data-live-kind="${esc(x.kind)}" data-live-id="${esc(x.id)}">${esc(liveLabel(x))}</a> <span class="lozenge">${esc(x.state)}</span></li>`).join("")}</ul>` : `<p class="hint">${esc(err.message)}</p>`);
+        return;
+      }
+      toast(err instanceof FactoryError && !["offline", "http", "error"].includes(err.code) ? `${err.message} (${err.code})` : String(err.message ?? err), "error");
+      return;
+    }
+    if (root.isConnected) { const i = modalStack.indexOf(root); if (i >= 0) modalStack.splice(i, 1); root.remove(); }
+    ui.setScope = "global";
+    toast(`Deleted project ${name}`);
+    await projectDeleted({ project: name, runs: res?.runs ?? [], bundles: res?.bundles ?? [], discussions: res?.discussions ?? [] });
+  });
 }
 function control(path, fld, v) {
   const id = `set-${path.replace(/[^a-z0-9]/gi, "-")}`;
@@ -1421,6 +1545,7 @@ function wire() {
   $("#set-main").addEventListener("change", (e) => { if (e.target.matches("select[data-set], input[data-set]")) saveSetting(e.target); });
   $("#set-main").addEventListener("click", (e) => {
     const t = e.target.closest("button[data-set]"); if (t) return saveSetting(t);
+    const dp = e.target.closest("[data-delete-project]"); if (dp) return openDeleteProject(dp.dataset.deleteProject);
     const u = e.target.closest("[data-unset]");
     if (u) act(() => core.unsetSetting(ui.setScope === "global" ? { global: true } : { project: ui.setScope }, u.dataset.unset), `Removed ${u.dataset.unset}`).then(renderSettings);
   });
@@ -1453,12 +1578,31 @@ async function boot() {
     for (const b of bundles) ui.bundles.set(b.id, b);
   } catch (e) { toast(String(e.message ?? e), "error"); }
   renderProjectFilter(); renderBoard();
-  // #run=, #disc= and #bundle=<id> reopen a run, a discussion or a bundle; #chat a blank new chat; anything else is the board.
+  openFromHash();
+  // a link followed within the page (e.g. pasted into the address bar) opens like one loaded with the page
+  addEventListener("hashchange", openFromHash);
+}
+// #run=, #disc= and #bundle=<id> open a run, a discussion or a bundle; #chat a blank new chat; anything else is the board.
+// A purged (or unknown) id shows NOT_FOUND_TEXT.
+function openFromHash() {
   const m = /^#run=(.+)$/.exec(location.hash), d = /^#disc=(.+)$/.exec(location.hash), b = /^#bundle=(.+)$/.exec(location.hash);
-  if (m && ui.runs.has(decodeURIComponent(m[1]))) openRun(decodeURIComponent(m[1]), null);
+  const clear = () => { try { history.replaceState(null, "", location.pathname); } catch {} };
+  if (m) {
+    const id = decodeURIComponent(m[1]);
+    if (ui.open === id && !ui.mode) return;
+    if (ui.runs.has(id) && !ui.open) return openRun(id, null);
+    (async () => {
+      if (!ui.runs.has(id)) {
+        try { ui.runs.set(id, await core.getRun(id)); }
+        catch (e) { toast(openErrorText(e), "error"); if (!ui.open) clear(); return; }
+      }
+      if (ui.open) await closeRun();
+      if (!ui.open) openRun(id, cardEl(id));
+    })();
+  }
   else if (d) withDiscussions(() => openDiscussion(decodeURIComponent(d[1])));
   else if (b) withBundles(() => openBundle(decodeURIComponent(b[1]), null));
   else if (location.hash === "#chat") withDiscussions(() => openChat({ blank: true }));
-  else if (location.hash) try { history.replaceState(null, "", location.pathname); } catch {}
+  else if (location.hash) clear();
 }
 boot();

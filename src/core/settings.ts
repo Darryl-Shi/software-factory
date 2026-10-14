@@ -497,6 +497,21 @@ export class ConfigStore {
 		return this.project(name);
 	}
 
+	/**
+	 * Remove the whole `projects.<name>` block (repo and every override); an emptied `projects` map goes too. Returns
+	 * whether a block was removed (false: already gone). No validation: removing a project never breaks another scope.
+	 */
+	removeProject(name: string): boolean {
+		this.refresh(true);
+		const doc = this.doc.clone();
+		if (!doc.hasIn(["projects", name])) return false;
+		doc.deleteIn(["projects", name]);
+		const node = doc.getIn(["projects"]) as YAML.YAMLMap | undefined;
+		if (node && YAML.isMap(node) && node.items.length === 0) doc.deleteIn(["projects"]);
+		this.commit(doc);
+		return true;
+	}
+
 	// ---- set/unset with validate-on-save
 	private resolvePath(scope: Scope, path: string): string[] {
 		const parts = path.split(".").filter(Boolean);

@@ -65,7 +65,7 @@ async function showChat(id, fromEl, opts = {}) {
   if (id) {
     try { d = await core.getDiscussion(id); }
     catch (e) {
-      toast(String(e.message ?? e), "error");
+      toast(openErrorText(e), "error");
       if (/^#disc=/.test(location.hash) && !ui.open) try { history.replaceState(null, "", location.pathname); } catch {}
       return;
     }
@@ -563,7 +563,7 @@ function saveDraftField(f) {
 }
 async function openRunFromDiscussion(runId) {
   if (!ui.runs.has(runId)) {
-    try { ui.runs.set(runId, await core.getRun(runId)); } catch (e) { toast(String(e.message ?? e), "error"); return; }
+    try { ui.runs.set(runId, await core.getRun(runId)); } catch (e) { toast(openErrorText(e), "error"); return; }
   }
   await closeRun();
   openRun(runId, cardEl(runId));

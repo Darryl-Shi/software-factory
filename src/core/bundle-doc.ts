@@ -111,7 +111,7 @@ export const BundleDoc = defineDocFamily<Record<string, any>, any>({
 	initial: (seed) => seed,
 });
 
-export const BundleIndex = defineDoc<{ ids: string[] }>({
+export const BundleIndex = defineDoc<{ ids: string[]; seq?: number }>({
 	kind: "factory.bundles",
 	version: 1,
 	scope: "session",

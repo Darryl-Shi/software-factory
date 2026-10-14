@@ -52,7 +52,7 @@ async function openBundle(id, fromEl) {
   let b;
   try { b = await core.getBundle(id); }
   catch (e) {
-    toast(String(e.message ?? e), "error");
+    toast(openErrorText(e), "error");
     if (/^#bundle=/.test(location.hash)) try { history.replaceState(null, "", location.pathname); } catch {}
     return;
   }
@@ -86,7 +86,7 @@ function resyncBundle() {
 }
 async function openRunFromBundle(runId) {
   if (!ui.runs.has(runId)) {
-    try { ui.runs.set(runId, await core.getRun(runId)); } catch (e) { toast(String(e.message ?? e), "error"); return; }
+    try { ui.runs.set(runId, await core.getRun(runId)); } catch (e) { toast(openErrorText(e), "error"); return; }
   }
   await closeRun();
   openRun(runId, cardEl(runId));
