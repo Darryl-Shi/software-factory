@@ -1348,7 +1348,7 @@ function deleteSectionHtml(name) {
   return `<section class="set-danger" aria-label="Delete project">
     <h3>Delete project</h3>
     <p>Deleting <b>${esc(name)}</b> removes ${DELETE_REMOVES}. It keeps ${DELETE_KEEPS}. It can't be undone.</p>
-    <p class="hint">Cancel its running tickets and bundles and close its open discussions first.</p>
+    <p class="hint">Cancel its running tickets and bundles first; its open discussions are ended.</p>
     <button type="button" class="btn danger" data-delete-project="${esc(name)}">Delete project</button>
   </section>`;
 }
@@ -1371,6 +1371,7 @@ function openDeleteProject(name) {
     <div class="modal-body">
       <p style="margin:0">This removes ${DELETE_REMOVES}.</p>
       <p style="margin:0">Kept: ${DELETE_KEEPS}.</p>
+      <p class="dp-discs" id="dp-discs" style="margin:0" hidden></p>
       <div class="field"><label for="dp-name">Type <b class="mono">${esc(name)}</b> to confirm</label><input id="dp-name" autocomplete="off" spellcheck="false" autocapitalize="off"></div>
       <div class="dp-live" id="dp-live" hidden></div>
     </div>
@@ -1379,6 +1380,13 @@ function openDeleteProject(name) {
   const form = $("form", root), input = $("#dp-name", root), go = $("#dp-go", root), live = $("#dp-live", root);
   let busy = false;
   const gate = () => (go.disabled = busy || input.value !== name);
+  // The project's PREPARING / OPEN discussions are ended by the deletion: say how many.
+  const discsLine = $("#dp-discs", root);
+  core.listDiscussions({ project: name }).then((list) => {
+    const n = (Array.isArray(list) ? list : []).filter((d) => d.project === name && (d.state === "PREPARING" || d.state === "OPEN")).length;
+    discsLine.hidden = n === 0;
+    discsLine.textContent = n ? `${n} open discussion${n === 1 ? "" : "s"} will be ended` : "";
+  }).catch(() => undefined);
   input.addEventListener("input", gate);
   root.querySelectorAll("[data-close]").forEach((b) => b.addEventListener("click", closeModal));
   live.addEventListener("click", (e) => {
@@ -1398,7 +1406,7 @@ function openDeleteProject(name) {
       if (err instanceof FactoryError && err.code === "conflict") {
         const items = Array.isArray(err.details?.live) ? err.details.live : [];
         live.hidden = false;
-        live.innerHTML = `<p class="dp-live-h">${esc(name)} still has live work, so nothing was deleted. Cancel or close these first:</p>`
+        live.innerHTML = `<p class="dp-live-h">${esc(name)} still has live work, so nothing was deleted. Cancel these first:</p>`
           + (items.length ? `<ul>${items.map((x) => `<li><span class="dp-kind">${esc(LIVE_KIND[x.kind] ?? x.kind)}</span> <a href="${esc(liveHash(x))}" data-live-kind="${esc(x.kind)}" data-live-id="${esc(x.id)}">${esc(liveLabel(x))}</a> <span class="lozenge">${esc(x.state)}</span></li>`).join("")}</ul>` : `<p class="hint">${esc(err.message)}</p>`);
         return;
       }

@@ -15,7 +15,8 @@ one project together as a **bundle**: one PR (or a push to `main` for a new repo
   mode: [`docs/specs/run-mv545v95-rg77.md`](docs/specs/run-mv545v95-rg77.md); disk cleanup and
   `gc`: [`docs/specs/run-mv58bn4q-q2zs.md`](docs/specs/run-mv58bn4q-q2zs.md), product spec §8.1; commits authored by
   the GitHub identity's account: [`docs/specs/run-mv6dwfsi-7xli.md`](docs/specs/run-mv6dwfsi-7xli.md); deleting a
-  project (purge): [`docs/specs/run-mv86f7vs-jif2.md`](docs/specs/run-mv86f7vs-jif2.md), product spec §5, §8.1).
+  project (purge): [`docs/specs/run-mv86f7vs-jif2.md`](docs/specs/run-mv86f7vs-jif2.md), product spec §5, §8.1; open
+  discussions ended by the deletion: [`docs/specs/run-mv89bw5w-pykq.md`](docs/specs/run-mv89bw5w-pykq.md)).
 - **Design and deviations:** `docs/design-spec.md`, `docs/superpowers/specs/*`, `DEVIATIONS.md`.
 - **How it fits together:** `docs/architecture.md`; settings: `docs/configuration.md`.
 

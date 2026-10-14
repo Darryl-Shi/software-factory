@@ -657,19 +657,61 @@ export class Factory implements FactoryCore {
 		return { runs, bundles, discussions };
 	}
 
-	/** The live work (spec A1) among a project's owners. */
-	private liveItems(o: { runs: RunDocState[]; bundles: BundleDocState[]; discussions: DiscussionDocState[] }): LiveItem[] {
+	/**
+	 * The live work (spec A1) among a project's owners: runs not DELIVERED/FAILED/CANCELLED and bundles not
+	 * MERGED/CANCELLED. Discussions are never live: deleteProject ends them itself (docs/specs/run-mv89bw5w-pykq.md).
+	 */
+	private liveItems(o: { runs: RunDocState[]; bundles: BundleDocState[] }): LiveItem[] {
 		return [
 			...o.runs.filter((d) => !TERMINAL_STATES.includes(d.state)).map((d) => ({ kind: "run" as const, id: d.id, state: d.state })),
 			...o.bundles.filter((d) => d.state !== "MERGED" && d.state !== "CANCELLED").map((d) => ({ kind: "bundle" as const, id: d.id, state: d.state })),
-			...o.discussions.filter((d) => d.state === "PREPARING" || d.state === "OPEN").map((d) => ({ kind: "discussion" as const, id: d.id, state: d.state })),
 		];
 	}
 
+	/**
+	 * End every PREPARING/OPEN discussion of the project by aborting its Task (the Task's abort path stops the
+	 * Conversation's work, cleans the checkout, branch, scratch and environment, and commits FAILED). All are aborted
+	 * first, then waited for (10 s); one whose Task has not ended makes the deletion fail with `conflict`.
+	 */
+	private async endDiscussions(name: string, discussions: DiscussionDocState[]): Promise<void> {
+		const live = discussions.filter((d) => d.state === "PREPARING" || d.state === "OPEN");
+		if (!live.length) return;
+		const aborted: DiscussionDocState[] = [];
+		for (const d of live) {
+			if (d.taskId === undefined) continue;
+			const task = await this.harness.getTask(d.taskId as never, this.ctx);
+			if (!task || task.state.status === "terminal") continue;
+			await this.harness.abortTask(d.taskId as never, this.ctx);
+			aborted.push(d);
+		}
+		// The 10 s limit covers everything below: the Conversation aborts are started, not awaited (an abort resolves
+		// only once the Conversation's work is idle, which a stuck tool or provider may never be).
+		const deadline = withAbortSignal(AbortSignal.timeout(10_000), this.ctx);
+		// A running turn (mid-reply, drafting) holds the Task's invocation until the Conversation's work ends: stop that
+		// work, as Stop does, so that the aborted Task gets to its abort (cleanup, FAILED).
+		for (const d of aborted) {
+			const now = (await this.harness.snapshot(DiscussionDoc, d.id, this.ctx)) as DiscussionDocState | undefined;
+			if (!now?.turn || now.conversationId === undefined) continue;
+			void this.harness
+				.conversation(now.conversationId as never, this.ctx)
+				.then((conv) => conv?.abort(this.ctx))
+				.catch((e) => this.log(`project deletion ${name}: could not stop discussion ${d.id}'s turn: ${e instanceof Error ? e.message : String(e)}`));
+		}
+		await Promise.all(aborted.map((d) => this.harness.waitForTask(d.taskId as never, deadline).catch(() => undefined)));
+		const finishing: LiveItem[] = [];
+		for (const d of aborted) {
+			const again = await this.harness.getTask(d.taskId as never, this.ctx);
+			if (again && again.state.status !== "terminal") finishing.push({ kind: "discussion", id: d.id, state: `${d.state} (still finishing)` });
+		}
+		if (finishing.length) throw this.liveConflict(name, finishing);
+	}
+
 	private liveConflict(name: string, live: LiveItem[]): FactoryError {
+		// Only discussions still finishing (they were ended by this deletion): nothing to cancel, try again.
+		const hint = live.every((l) => l.kind === "discussion") ? "try again in a moment" : "cancel it first (Cancel, Cancel bundle)";
 		return new FactoryError(
 			"conflict",
-			`project ${name} has live work: ${live.map((l) => `${l.id} is ${l.state}`).join(", ")}; cancel or close it first (Cancel, Cancel bundle, Close discussion)`,
+			`project ${name} has live work: ${live.map((l) => `${l.id} is ${l.state}`).join(", ")}; ${hint}`,
 			{ live },
 		);
 	}
@@ -685,6 +727,9 @@ export class Factory implements FactoryCore {
 		let owners = await this.projectOwners(name);
 		const live = this.liveItems(owners);
 		if (live.length) throw this.liveConflict(name, live);
+		// Runs and bundles allow it: end the live discussions (nothing was touched on a refusal above).
+		await this.endDiscussions(name, owners.discussions);
+		owners = await this.projectOwners(name);
 		// A finished owner's Task may still be ending (its last cleanup and commit): wait for it briefly.
 		const all = [...owners.runs, ...owners.bundles, ...owners.discussions] as { id: string; state: string; taskId?: string }[];
 		const finishing: LiveItem[] = [];
@@ -760,7 +805,7 @@ export class Factory implements FactoryCore {
 				const d = (await tx.doc(DiscussionDoc, id, null as never)) as unknown as DiscussionDocState;
 				if (d?.project === name) discussions.push(d);
 			}
-			const live = this.liveItems({ runs, bundles, discussions });
+			const live = this.liveItems({ runs, bundles });
 			if (live.length) throw this.liveConflict(name, live);
 			// Something created meanwhile has no captured repo check: it is checked at cleanup.
 			const capture = (kind: CapturedOwner["kind"], d: RunDocState | BundleDocState | DiscussionDocState): CapturedOwner => {
@@ -1875,11 +1920,14 @@ export class Factory implements FactoryCore {
 	}
 
 	async reopenDiscussion(id: DiscussionId): Promise<void> {
-		await this.restartDiscussion(id, "CLOSED", "reopened");
+		const { project } = await this.discussionDoc(id); // not_found
+		// Serialised with deleteProject: an ended discussion can't come back before the purge commit.
+		await this.withProject(project, () => this.restartDiscussion(id, "CLOSED", "reopened"));
 	}
 
 	async retryDiscussion(id: DiscussionId): Promise<void> {
-		await this.restartDiscussion(id, "FAILED", "retried");
+		const { project } = await this.discussionDoc(id); // not_found
+		await this.withProject(project, () => this.restartDiscussion(id, "FAILED", "retried"));
 	}
 
 	/** Reopen or retry: back to PREPARING with a new Task (the Conversation is kept), like `retryRun`. */
