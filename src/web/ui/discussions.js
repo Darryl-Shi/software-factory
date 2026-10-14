@@ -575,14 +575,21 @@ function refreshDisc(id) { pendingDiscs.add(id); if (!discFlushTimer) discFlushT
 async function flushDiscs() {
   discFlushTimer = 0;
   const ids = [...pendingDiscs]; pendingDiscs.clear();
+  const gone = new Map(); // id → project of a discussion that no longer exists (only a project deletion retires one)
   await Promise.all(ids.map(async (id) => {
-    try { ui.discs.set(id, await core.getDiscussion(id)); } catch (e) { if (e.code === "not_found") ui.discs.delete(id); }
+    try { ui.discs.set(id, await core.getDiscussion(id)); } catch (e) { if (e.code === "not_found") { gone.set(id, ui.discs.get(id)?.project); ui.discs.delete(id); } }
   }));
   if (ui.mode !== "discussion") return;
   renderRail();
   if (!ids.includes(ui.open)) return;
   const d = openDisc();
-  if (!d) return closeRun();
+  if (!d) {
+    // Its project was deleted (the purge came before project.deleted reached this tab): say so, as projectDeleted does.
+    const project = gone.get(ui.open);
+    await closeRun();
+    if (project) toast(`Project ${project} was deleted`);
+    return;
+  }
   renderDiscussionView();
   // The conversation exists now (its updates may have come before this view of the discussion did).
   if (d.conversationId != null && !ui.dtx) loadDiscTranscript(false);
@@ -595,7 +602,9 @@ function onDiscussionEvent(e) {
   const title = ui.discs.get(e.discussion)?.title ?? e.discussion;
   const go = () => openDiscussion(e.discussion);
   if (e.type === "discussion.updated" && e.what === "drafts" && e.submission) toast(`Draft tickets are ready in "${title}"`, "", go);
-  if (e.type === "discussion.state" && e.to === "FAILED") toast(`The discussion "${title}" failed`, "error", go);
+  // Not when its project is being deleted (deleteProject ends open discussions just before the purge): wait for that.
+  if (e.type === "discussion.state" && e.to === "FAILED")
+    setTimeout(() => { if (ui.discs.has(e.discussion) && ui.projects.some((p) => p.name === e.project)) toast(`The discussion "${ui.discs.get(e.discussion)?.title ?? title}" failed`, "error", go); }, 1500);
 }
 // Runs changed (app.js's flush): their state chips in the open discussion's drafts.
 function discussionRunsChanged(ids) {

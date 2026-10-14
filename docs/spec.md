@@ -203,16 +203,28 @@ The core's whole outside surface is `FactoryCore` (`src/core/types.ts`). Every o
   - `deleteProject(name)` (spec `docs/specs/run-mv86f7vs-jif2.md`) deletes a project and **purges** its history; it
     returns `{ project, runs, bundles, discussions }`, the purged ids. Checked before anything changes: a name that is
     not a non-empty string is `invalid`, an unknown project `not_found`, and **live work** `conflict`: any run not
-    `DELIVERED` / `FAILED` / `CANCELLED` (`READY` counts), any bundle not `MERGED` / `CANCELLED` (`FAILED` counts),
-    any discussion `PREPARING` / `OPEN`. The message names each live item with its id and state (`bundle-3 is
-    FAILED`); the error carries them as `details.live: { kind, id, state }[]` (sent in the 409 body). Nothing is
-    cancelled or closed for you. A finished owner whose Task is still ending is waited for (10 s), else it counts as
-    live (`CANCELLED (still finishing)`).
-  - A per-project in-process lock serialises it with `startRun`, `createTicket`, `startDiscussion`, `createBundle`,
-    `setSetting` / `unsetSetting` on that project scope and `createProject` with that name: they wait for a deletion
-    in progress and then fail with `not_found` (`createProject` makes a fresh project). The deletion also waits for
-    any in-flight cleanup of the project's owners. Steps: (1) one commit re-checks liveness, captures what each
-    owner's cleanup needs, retires every Document (`tx.retireDoc`), removes the ids from `RunIndex` / `BundleIndex` /
+    `DELIVERED` / `FAILED` / `CANCELLED` (`READY` counts), any bundle not `MERGED` / `CANCELLED` (`FAILED` counts).
+    A discussion is never live work (spec `docs/specs/run-mv89bw5w-pykq.md`). The message names each live item with
+    its id and state (`project p has live work: run-x is READY, bundle-2 is FAILED; cancel it first (Cancel, Cancel
+    bundle)`); the error carries them as `details.live: { kind, id, state }[]` (sent in the 409 body). Runs and
+    bundles are never cancelled for you, and on a refusal nothing changes (an `OPEN` discussion stays `OPEN`).
+  - **Open discussions are ended by the deletion.** Once runs and bundles allow it, every discussion of the project in
+    `PREPARING` or `OPEN` (a turn running, mid-reply or drafting, included; one still preparing its checkout too) is
+    ended without asking: its discussion Task is aborted through the Task's `abort` path (a running turn's
+    Conversation work is stopped, as Stop does, so the Task gets there; the abort cleans the checkout, local branch,
+    scratch and environment and commits `FAILED`). All are aborted first, then waited for (10 s); one whose Task has
+    not ended fails the deletion with `conflict`, its live item `{ kind: "discussion", id, state: "OPEN (still
+    finishing)" }` (the discussions already ended stay `FAILED`, retryable). Subscribers may see `discussion.state`
+    move to `FAILED` before `project.deleted`; the returned `discussions` include them. A finished owner whose Task is
+    still ending is then waited for (10 s), else it counts as live (`CANCELLED (still finishing)`).
+  - A per-project in-process lock serialises it with `startRun`, `createTicket`, `startDiscussion`,
+    `reopenDiscussion`, `retryDiscussion`, `createBundle`, `setSetting` / `unsetSetting` on that project scope and
+    `createProject` with that name: they wait for a deletion in progress and then fail with `not_found`
+    (`createProject` makes a fresh project), so an ended discussion can't come back before the purge. A turn op (`say`,
+    `requestDrafts`, `stopTurn`) racing with it fails with `conflict` (no longer `OPEN`) or `not_found` (purged), or
+    is cut off by the abort. The deletion also waits for any in-flight cleanup of the project's owners. Steps: (1) one
+    commit re-checks liveness (runs and bundles), captures what each owner's cleanup needs, retires every Document
+    (every discussion, whatever its state) (`tx.retireDoc`), removes the ids from `RunIndex` / `BundleIndex` /
     `DiscussionIndex` and records the deletion in `factory.projectDeletions` (§8.1); (2) the `projects.<name>` block
     leaves the config file; (3) `project.deleted` is emitted; (4) the disk is cleaned in the background.
   - Afterwards `getProject`, `getSettings({ project })`, `getRun`, `getBundle`, `getDiscussion`, their conversations
@@ -515,8 +527,10 @@ rejected.
     what is removed (runs, bundles, discussions and their history, worktrees, `factory/<id>` branches, screenshots,
     the project's settings) and what is kept (the GitHub repo, its default branch and PRs, global settings). Its
     button opens a confirmation that requires typing the project name exactly (the confirm button stays disabled until
-    it matches). On `conflict` the dialog lists the live items, each a link to its run, bundle or discussion, with the
-    hint to cancel or close them first; nothing is deleted. On success: toast "Deleted project <name>", the scope goes
+    it matches). The confirmation warns about the project's `PREPARING` / `OPEN` discussions (from
+    `listDiscussions({ project })`): "2 open discussions will be ended" (no line when there are none); deleting ends
+    them. On `conflict` the dialog lists the live items (runs and bundles, or a discussion "still finishing"), each a
+    link to its run, bundle or discussion, with the hint "Cancel these first"; nothing is deleted. On success: toast "Deleted project <name>", the scope goes
     back to Global and the project leaves the scope list.
   - **Live removal, in every open tab** (`project.deleted`): the project's run and bundle cards and discussions leave
     the board, the counts, the Chat history rail and the project dropdowns (board filter, Create, Chat); a board filter
