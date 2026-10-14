@@ -481,7 +481,8 @@ export interface FactoryCore {
 	listProjects(): Promise<Project[]>;
 	/**
 	 * Delete a project and purge its history (docs/specs/run-mv86f7vs-jif2.md): refused (`conflict`, `details.live`)
-	 * while it has live work; else its runs', bundles' and discussions' Documents are retired, its config block removed,
+	 * while it has live work (runs and bundles only); its PREPARING/OPEN discussions are ended (their Tasks aborted,
+	 * docs/specs/run-mv89bw5w-pykq.md); then its runs', bundles' and discussions' Documents are retired, its config block removed,
 	 * `project.deleted` emitted, and their disk cleaned in the background. Returns the purged ids.
 	 */
 	deleteProject(name: string): Promise<DeletedProject>;

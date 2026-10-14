@@ -1,4 +1,5 @@
-// Deleting a project (docs/specs/run-mv86f7vs-jif2.md): refused while live (A1); otherwise one commit retires every
+// Deleting a project (docs/specs/run-mv86f7vs-jif2.md): refused while runs or bundles are live (A1); open discussions
+// are ended by the deletion (docs/specs/run-mv89bw5w-pykq.md); otherwise one commit retires every
 // Document of the project's runs, bundles and discussions, the config block goes, `project.deleted` is emitted and the
 // disk is cleaned in the background; interrupted deletions are finished by the startup sweep / gc. Acceptance 1-7.
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -99,16 +100,17 @@ describe("deleteProject", () => {
 		expect(err).toMatchObject({ code: "conflict" });
 		expect(err.message).toContain(`${a} is READY`);
 		expect(err.message).toContain(`${bundle} is FAILED`);
-		expect(err.message).toContain(`${disc} is OPEN`);
+		expect(err.message).not.toContain(disc); // a discussion is never live work
+		expect(err.message).toContain("cancel it first (Cancel, Cancel bundle)");
+		expect(err.message).not.toContain("Close discussion");
 		expect(err.details.live).toEqual(
 			expect.arrayContaining([
 				{ kind: "run", id: a, state: "READY" },
 				{ kind: "run", id: b, state: "READY" },
 				{ kind: "bundle", id: bundle, state: "FAILED" },
-				{ kind: "discussion", id: disc, state: "OPEN" },
 			]),
 		);
-		expect(err.details.live).toHaveLength(4);
+		expect(err.details.live).toHaveLength(3);
 		const { url, stop } = await startWebServer(f().as("web"), { host: "127.0.0.1", port: 0, tokenFile: join(t!.dir, "home", "web-token") });
 		try {
 			const u = new URL(url);
@@ -120,7 +122,7 @@ describe("deleteProject", () => {
 			expect(res.status).toBe(409);
 			const body = (await res.json()) as any;
 			expect(body).toMatchObject({ ok: false, code: "conflict" });
-			expect(body.details.live).toHaveLength(4);
+			expect(body.details.live).toHaveLength(3);
 		} finally {
 			await stop();
 		}
@@ -303,5 +305,136 @@ describe("deleteProject", () => {
 		expect((await f().listRuns()).length).toBe(2);
 		expect(config().projects.p).toBeDefined();
 		expect(await f().projectDeletionsForTests()).toEqual([]);
+	});
+
+	// docs/specs/run-mv89bw5w-pykq.md: open discussions no longer block the deletion; it ends them itself.
+	describe("open discussions are ended by the deletion", () => {
+		const open = (v: { state: string; turn?: unknown }) => v.state === "OPEN" && !v.turn;
+
+		test("1: an idle OPEN discussion: the deletion succeeds, the discussion is gone and its checkout removed", async () => {
+			await setup();
+			const disc = await f().startDiscussion("p", { title: "t", message: "m" });
+			await untilDiscussion(f(), disc, open);
+			expect(existsSync(join(t!.dir, "work", "discussions", disc))).toBe(true);
+			const states: string[] = [];
+			const order: string[] = [];
+			f().subscribe({}, (e) => {
+				if (e.type === "discussion.state" && e.discussion === disc) { states.push(e.to); order.push(`state:${e.to}`); }
+				if (e.type === "project.deleted") order.push("deleted");
+			});
+			const r = await f().deleteProject("p");
+			expect(r.discussions).toEqual([disc]);
+			await f().cleanupsSettledForTests();
+			await expect(f().getDiscussion(disc)).rejects.toMatchObject({ code: "not_found" });
+			expect(await f().listDiscussions()).toEqual([]);
+			expect(existsSync(join(t!.dir, "work", "discussions", disc))).toBe(false);
+			expect(await things(disc)).toEqual(GONE);
+			expect(config().projects?.p).toBeUndefined();
+			// subscribers may see FAILED before project.deleted
+			if (states.length) expect(order.indexOf("state:FAILED")).toBeLessThan(order.indexOf("deleted"));
+		});
+
+		test("2: a discussion mid-reply: the deletion succeeds, the reply stops, nothing is left running or on disk", async () => {
+			await setup();
+			const disc = await f().startDiscussion("p", { title: "t", message: "m" });
+			await untilDiscussion(f(), disc, open);
+			t!.control.discussantHang = true;
+			await f().say(disc, "slow");
+			for (let i = 0; i < 100 && !t!.control.discussantHeard.includes("slow"); i++) await new Promise((r) => setTimeout(r, 20));
+			expect(t!.control.discussantHeard).toContain("slow");
+			const view = await f().getDiscussion(disc);
+			expect(view.turn).toBeTruthy();
+			const taskId = (await (f() as any).discussionDoc(disc)).taskId as string | undefined;
+			// the scripted provider cannot observe the abort signal; release it shortly after
+			setTimeout(() => (t!.control.discussantHang = false), 300);
+			const startedAt = Date.now();
+			const r = await f().deleteProject("p");
+			expect(Date.now() - startedAt).toBeLessThan(10_000);
+			expect(r.discussions).toEqual([disc]);
+			await f().cleanupsSettledForTests();
+			await expect(f().getDiscussion(disc)).rejects.toMatchObject({ code: "not_found" });
+			expect(await things(disc)).toEqual(GONE);
+			if (taskId) expect((await (f() as any).harness.getTask(taskId, (f() as any).ctx))?.state.status ?? "terminal").toBe("terminal");
+			// the Conversation's work was stopped: its reply never lands
+			expect(t!.control.discussantHeard.filter((x) => x === "slow")).toHaveLength(1);
+		});
+
+		test("3: a discussion still PREPARING: the deletion succeeds and leaves no checkout", async () => {
+			await setup();
+			const disc = await f().startDiscussion("p", { title: "t", message: "m" });
+			expect((await f().getDiscussion(disc)).state).toBe("PREPARING");
+			const r = await f().deleteProject("p");
+			expect(r.discussions).toEqual([disc]);
+			await f().cleanupsSettledForTests();
+			await expect(f().getDiscussion(disc)).rejects.toMatchObject({ code: "not_found" });
+			expect(await things(disc)).toEqual(GONE);
+			expect(existsSync(join(t!.dir, "work", "discussions", disc))).toBe(false);
+		});
+
+		test("4: a READY run still blocks: 409 lists only the run; the OPEN discussion is untouched and usable", async () => {
+			await setup();
+			const a = await start("alpha");
+			expect((await settled(a)).state).toBe("READY");
+			const disc = await f().startDiscussion("p", { title: "t", message: "m" });
+			await untilDiscussion(f(), disc, open);
+			const err = await f().deleteProject("p").catch((e) => e);
+			expect(err).toMatchObject({ code: "conflict" });
+			expect(err.details.live).toEqual([{ kind: "run", id: a, state: "READY" }]);
+			expect(err.message).toBe(`project p has live work: ${a} is READY; cancel it first (Cancel, Cancel bundle)`);
+			const v = await f().getDiscussion(disc);
+			expect(v.state).toBe("OPEN");
+			expect(v.error).toBeUndefined();
+			await f().say(disc, "still here?");
+			const after = await untilDiscussion(f(), disc, open);
+			expect(after.state).toBe("OPEN");
+			expect(t!.control.discussantHeard).toContain("still here?");
+		});
+
+		test("7: reopen / retry sent during a deletion wait for it and then fail with not_found", async () => {
+			await setup();
+			const closed = await f().startDiscussion("p", { title: "c", message: "m" });
+			const live = await f().startDiscussion("p", { title: "o", message: "m" });
+			await untilDiscussion(f(), closed, open);
+			await untilDiscussion(f(), live, open);
+			await f().closeDiscussion(closed);
+			await untilDiscussion(f(), closed, (v) => v.state === "CLOSED");
+			const deleting = f().deleteProject("p");
+			const reopen = f().reopenDiscussion(closed);
+			// the live one is FAILED once the deletion ended it: a retry queued behind the deletion must not bring it back
+			const retry = f().retryDiscussion(live);
+			const r = await deleting;
+			expect(r.discussions.sort()).toEqual([closed, live].sort());
+			await expect(reopen).rejects.toMatchObject({ code: "not_found" });
+			await expect(retry).rejects.toMatchObject({ code: "not_found" });
+			expect(await f().listDiscussions()).toEqual([]);
+			expect(config().projects?.p).toBeUndefined();
+			await expect(f().getProject("p")).rejects.toMatchObject({ code: "not_found" });
+		});
+
+		test("a discussion whose Task does not end in time fails the deletion with 'still finishing'; nothing is purged", async () => {
+			await setup();
+			const disc = await f().startDiscussion("p", { title: "t", message: "m" });
+			await untilDiscussion(f(), disc, open);
+			const h = (f() as any).harness;
+			const origWait = h.waitForTask.bind(h);
+			const origGet = h.getTask.bind(h);
+			let ended = false;
+			vi.spyOn(h, "waitForTask").mockImplementation(async (...args: unknown[]) => { await origWait(...args); ended = true; });
+			// as if the Task were still running after the wait
+			vi.spyOn(h, "getTask").mockImplementation(async (...args: unknown[]) => {
+				const task = await origGet(...args);
+				return ended && task ? { ...task, state: { ...task.state, status: "running" } } : task;
+			});
+			const err = await f().deleteProject("p").catch((e) => e);
+			vi.restoreAllMocks();
+			expect(err).toMatchObject({ code: "conflict" });
+			expect(err.details.live).toEqual([{ kind: "discussion", id: disc, state: "OPEN (still finishing)" }]);
+			expect(config().projects.p).toBeDefined();
+			// the ended discussion stays FAILED; the human can retry it
+			const v = await untilDiscussion(f(), disc, (x) => x.state === "FAILED");
+			expect(v.state).toBe("FAILED");
+			await f().retryDiscussion(disc);
+			await untilDiscussion(f(), disc, open);
+		});
 	});
 });

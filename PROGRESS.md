@@ -241,3 +241,21 @@ Decisions:
 - Clones are removed only after every owner of the entry succeeded and the config block is gone.
 - Config removal is finished in `start()` before the web server can call in, so a same-name createProject after a
   crash never races the resumption.
+
+## Open discussions no longer block project deletion (run run-mv89bw5w-pykq; spec docs/specs/run-mv89bw5w-pykq.md)
+
+- [x] core: liveItems = runs + bundles only; message "cancel it first (Cancel, Cancel bundle)"; endDiscussions
+      (abortTask every PREPARING/OPEN discussion's Task, then wait 10 s together; "<state> (still finishing)" conflict);
+      purge re-checks runs/bundles only; reopen/retryDiscussion under withProject.
+- [x] discussion Task abort: also aborts a running turn's Conversation (best effort) and disposes the environment.
+- [x] tests: project-delete.test.ts (acceptance 1-4, 7, still finishing), web-delete-project.test.ts (5, 6, 8).
+- [x] UI: dialog line "N open discussions will be ended"; conflict hint "Cancel these first"; a FAILED toast is
+      delayed and skipped when the discussion/project is gone; an open chat purged before project.deleted arrives
+      closes with "Project <name> was deleted".
+- [x] docs/spec.md §5 / §9, types.ts comment, AGENTS.md pointer.
+
+Decisions:
+- A running turn holds the Task's invocation until the Conversation's work ends (abortTask signals and joins; the
+  invocation's context is dead, so the Task can't abort the Conversation itself). deleteProject therefore aborts the
+  Conversation (as Stop does) right after aborting each Task, so the abort path gets to run. The scripted test provider
+  ignores aborts (like the Stop test), so test 2 releases its hang shortly after.

@@ -129,10 +129,11 @@ describe("Settings → Delete project", () => {
 
 	test("conflict: nothing deleted, the live items listed as links that open them", async () => {
 		const ready = run("READY"), d = disc("disc-1", "todo", "Talk about due dates");
-		const live = [{ kind: "run", id: ready.id, state: "READY" }, { kind: "bundle", id: "bundle-2", state: "FAILED" }, { kind: "discussion", id: "disc-1", state: "OPEN" }];
+		// docs/specs/run-mv89bw5w-pykq.md: discussions are never live work; only one "still finishing" can be listed
+		const live = [{ kind: "run", id: ready.id, state: "READY" }, { kind: "bundle", id: "bundle-2", state: "FAILED" }, { kind: "discussion", id: "disc-1", state: "OPEN (still finishing)" }];
 		const w = await load({
 			runs: [ready], bundles: [bundle("bundle-2", "todo", [], { state: "FAILED" })], discs: [d],
-			handlers: { deleteProject: () => ({ ok: false, status: 409, code: "conflict", error: "todo has live work: run-1 (READY), bundle-2 (FAILED), disc-1 (OPEN)", details: { live } }) },
+			handlers: { deleteProject: () => ({ ok: false, status: 409, code: "conflict", error: "todo has live work: run-1 (READY), bundle-2 (FAILED), disc-1 (OPEN (still finishing))", details: { live } }) },
 		});
 		const { input, go } = await openDeleteDialog(w);
 		type(w, input, "todo");
@@ -141,14 +142,15 @@ describe("Settings → Delete project", () => {
 		expect(w.__calls.filter((c) => c.op === "deleteProject").map((c) => c.args)).toEqual([["todo"]]);
 		const box = $(w, "#dp-live")!;
 		expect(box.hidden).toBe(false);
-		expect(box.textContent).toContain("Cancel or close these first");
+		expect(box.textContent).toContain("Cancel these first");
+		expect(box.textContent).not.toContain("close");
 		const links = [...box.querySelectorAll<HTMLAnchorElement>("a[data-live-kind]")];
 		expect(links.map((a) => a.getAttribute("href"))).toEqual([`#run=${ready.id}`, "#bundle=bundle-2", "#disc=disc-1"]);
 		expect(links[0]!.textContent).toContain(ready.request.title);
 		expect(links[2]!.textContent).toBe("Talk about due dates");
 		expect(box.textContent).toContain("READY");
 		expect(box.textContent).toContain("FAILED");
-		expect(box.textContent).toContain("OPEN");
+		expect(box.textContent).toContain("OPEN (still finishing)");
 		// nothing changed: the project, its cards and the dialog are all still there
 		expect(scopes(w)).toEqual(["global", "todo", "other"]);
 		expect((w as unknown as { __t: { ui: { runs: Map<string, unknown> } } }).__t.ui.runs.has(ready.id)).toBe(true);
@@ -160,6 +162,59 @@ describe("Settings → Delete project", () => {
 		expect($(w, "#dp-live")).toBeNull();
 		expect($(w, "#runview")!.hidden).toBe(false);
 		expect($(w, "#rv-title")!.textContent).toBe(ready.request.title);
+	});
+
+	test("5: a FAILED bundle refuses: the dialog lists the bundle with \"Cancel these first\" and no discussion", async () => {
+		const d = { ...disc("disc-1", "todo", "Open chat"), state: "OPEN" };
+		const live = [{ kind: "bundle", id: "bundle-2", state: "FAILED" }];
+		const w = await load({
+			bundles: [bundle("bundle-2", "todo", [], { state: "FAILED" })], discs: [d],
+			handlers: { deleteProject: () => ({ ok: false, status: 409, code: "conflict", error: "project todo has live work: bundle-2 is FAILED; cancel it first (Cancel, Cancel bundle)", details: { live } }) },
+		});
+		const { input, go } = await openDeleteDialog(w);
+		type(w, input, "todo");
+		go.click();
+		await tick();
+		const box = $(w, "#dp-live")!;
+		expect(box.hidden).toBe(false);
+		expect(box.querySelector(".dp-live-h")!.textContent).toContain("Cancel these first");
+		const links = [...box.querySelectorAll<HTMLAnchorElement>("a[data-live-kind]")];
+		expect(links.map((a) => a.getAttribute("href"))).toEqual(["#bundle=bundle-2"]);
+		expect(box.textContent).not.toContain("Discussion");
+		expect(box.textContent).not.toContain("Open chat");
+	});
+
+	test("6: the dialog warns how many open discussions will be ended; no line when there are none", async () => {
+		const discs = [
+			{ ...disc("disc-1", "todo", "One"), state: "OPEN" },
+			{ ...disc("disc-2", "todo", "Two"), state: "PREPARING" },
+			disc("disc-3", "todo", "Closed"),
+			{ ...disc("disc-4", "todo", "Failed"), state: "FAILED" },
+			{ ...disc("disc-5", "other", "Elsewhere"), state: "OPEN" },
+		];
+		const w = await load({ discs, handlers: { listDiscussions: ([f]) => discs.filter((d) => !(f as { project?: string })?.project || d.project === (f as { project: string }).project) } });
+		await openDeleteDialog(w);
+		await tick();
+		expect(w.__calls.some((c) => c.op === "listDiscussions" && JSON.stringify(c.args) === JSON.stringify([{ project: "todo" }]))).toBe(true);
+		const line = $(w, "#dp-discs")!;
+		expect(line.hidden).toBe(false);
+		expect(line.textContent).toBe("2 open discussions will be ended");
+		// the rest of the dialog is unchanged
+		const body = $(w, "form.delete-project .modal-body")!.textContent!;
+		expect(body).toContain("This removes its tickets (runs), bundles and discussions");
+		expect(body).toContain("Kept: the GitHub repo itself");
+		expect($<HTMLButtonElement>(w, "#dp-go")!.disabled).toBe(true);
+
+		const one = await load({ discs: [{ ...disc("disc-1", "todo", "One"), state: "OPEN" }] });
+		await openDeleteDialog(one);
+		await tick();
+		expect($(one, "#dp-discs")!.textContent).toBe("1 open discussion will be ended");
+
+		const none = await load({ discs: [disc("disc-3", "todo", "Closed"), { ...disc("disc-5", "other", "Elsewhere"), state: "OPEN" }] });
+		await openDeleteDialog(none);
+		await tick();
+		expect($(none, "#dp-discs")!.hidden).toBe(true);
+		expect($(none, "form.delete-project")!.textContent).not.toContain("will be ended");
 	});
 
 	test("success: toast, the scope back to Global, the project gone from the scope list and the dropdowns", async () => {
@@ -229,6 +284,43 @@ describe("project.deleted: live in every tab", () => {
 		await tick();
 		expect($(w, "#runview")!.hidden).toBe(true);
 		expect(toasts(w)).toContain("Project todo was deleted");
+	});
+
+	test("8: an open discussion ended by another tab's deletion (FAILED, then purged) closes with the deletion's toast only", async () => {
+		const d = { ...disc("disc-1", "todo", "Live chat"), state: "OPEN" };
+		let purged = false;
+		const w = await load({
+			discs: [d],
+			handlers: {
+				getDiscussion: () => (purged ? { ok: false, status: 404, code: "not_found", error: "discussion disc-1 does not exist" } : d),
+				getDiscussionConversation: () => ({ conversationId: "c", items: [], helpers: [], busy: false, queued: [] }),
+			},
+		});
+		w.eval("openDiscussion('disc-1')");
+		await tick(40);
+		expect($(w, "#runview")!.hidden).toBe(false);
+		// the deletion ends it (FAILED) and purges it before project.deleted reaches this tab
+		purged = true;
+		w.__emit({ type: "discussion.state", discussion: "disc-1", project: "todo", from: "OPEN", to: "FAILED" });
+		await tick(150);
+		expect($(w, "#runview")!.hidden).toBe(true);
+		expect(toasts(w)).toContain("Project todo was deleted");
+		w.__emit({ type: "project.deleted", project: "todo", runs: [], bundles: [], discussions: ["disc-1"] });
+		await tick(1700);
+		expect(toasts(w).filter((t) => t?.includes("was deleted"))).toEqual(["Project todo was deleted"]);
+		expect(toasts(w).some((t) => t?.includes("failed"))).toBe(false);
+	});
+
+	test("a discussion that fails on its own (its project stays) still toasts; one ended by a deletion does not", async () => {
+		const d1 = { ...disc("disc-1", "todo", "Lives"), state: "OPEN" }, d2 = { ...disc("disc-2", "other", "Purged"), state: "OPEN" };
+		const w = await load({
+			discs: [d1, d2],
+			handlers: { getDiscussion: ([id]) => (id === "disc-1" ? { ...d1, state: "FAILED" } : { ok: false, status: 404, code: "not_found", error: "gone" }) },
+		});
+		w.__emit({ type: "discussion.state", discussion: "disc-1", project: "todo", from: "OPEN", to: "FAILED" });
+		w.__emit({ type: "discussion.state", discussion: "disc-2", project: "other", from: "OPEN", to: "FAILED" });
+		await tick(1700);
+		expect(toasts(w).filter((t) => t?.includes("failed"))).toEqual(['The discussion "Lives" failed']);
 	});
 
 	test("an open discussion of the project closes with a toast; its Chat history is gone", async () => {
