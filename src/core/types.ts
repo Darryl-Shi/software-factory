@@ -464,7 +464,9 @@ export type FactoryEvent =
 	| { type: "bundle.ask"; bundle: BundleId; ask: AskId; question: BundleQuestion }
 	| { type: "bundle.askResolved"; bundle: BundleId; ask: AskId; by: string }
 	| { type: "bundle.notice"; bundle: BundleId; notice: Notice }
-	| { type: "bundle.conversation.updated"; bundle: BundleId; conversationId: string; role: Role };
+	| { type: "bundle.conversation.updated"; bundle: BundleId; conversationId: string; role: Role }
+	/** A project was deleted (`deleteProject`): its runs, bundles and discussions were purged. */
+	| { type: "project.deleted"; project: string; runs: RunId[]; bundles: BundleId[]; discussions: DiscussionId[] };
 
 /** A model `listModels` reports: `id` is `provider/modelId`. */
 export interface ModelInfo {
@@ -477,6 +479,12 @@ export interface FactoryCore {
 	createProject(name: string, repo: RepoRef): Promise<Project>;
 	getProject(name: string): Promise<Project>;
 	listProjects(): Promise<Project[]>;
+	/**
+	 * Delete a project and purge its history (docs/specs/run-mv86f7vs-jif2.md): refused (`conflict`, `details.live`)
+	 * while it has live work; else its runs', bundles' and discussions' Documents are retired, its config block removed,
+	 * `project.deleted` emitted, and their disk cleaned in the background. Returns the purged ids.
+	 */
+	deleteProject(name: string): Promise<DeletedProject>;
 	/** The models the model host reports as available (with credentials). Read-only; needs no project. */
 	listModels(): Promise<ModelInfo[]>;
 	startRun(project: string, request: Omit<Request, "id" | "project">): Promise<RunId>;
@@ -558,6 +566,7 @@ export const CORE_OPS = [
 	"createProject",
 	"getProject",
 	"listProjects",
+	"deleteProject",
 	"listModels",
 	"startRun",
 	"getRun",
@@ -614,10 +623,27 @@ export interface GcResult {
 	summary: string;
 }
 
+/** What `deleteProject` purged. */
+export interface DeletedProject {
+	project: string;
+	runs: RunId[];
+	bundles: BundleId[];
+	discussions: DiscussionId[];
+}
+
+/** A live item that keeps a project from being deleted. */
+export interface LiveItem {
+	kind: "run" | "bundle" | "discussion";
+	id: string;
+	state: string;
+}
+
 export class FactoryError extends Error {
 	constructor(
 		public code: "not_found" | "invalid" | "conflict" | "not_pending",
 		message: string,
+		/** Structured data for interfaces (e.g. `deleteProject`'s `{ live: LiveItem[] }`). */
+		public details?: Record<string, unknown>,
 	) {
 		super(message);
 		this.name = "FactoryError";

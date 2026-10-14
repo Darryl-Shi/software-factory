@@ -158,7 +158,7 @@ export async function startWebServer(core: FactoryCore, opts: WebOptions): Promi
 					return json(res, 200, { ok: true, result: result ?? null });
 				} catch (e: any) {
 					const code = e?.code as FactoryError["code"] | undefined;
-					return json(res, (code && STATUS[code]) ?? 500, { ok: false, error: e?.message ?? String(e), ...(code ? { code } : {}) });
+					return json(res, (code && STATUS[code]) ?? 500, { ok: false, error: e?.message ?? String(e), ...(code ? { code } : {}), ...(code && e?.details ? { details: e.details } : {}) });
 				}
 			}
 			return json(res, 404, { ok: false, error: "not found" });
