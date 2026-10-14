@@ -359,6 +359,31 @@ describe("deleteProject", () => {
 			expect(t!.control.discussantHeard.filter((x) => x === "slow")).toHaveLength(1);
 		});
 
+		test("a turn whose work outlasts 10 s: the deletion returns conflict (still finishing) at about 10 s; nothing is purged", async () => {
+			await setup();
+			const disc = await f().startDiscussion("p", { title: "t", message: "m" });
+			await untilDiscussion(f(), disc, open);
+			t!.control.discussantHang = true; // the scripted provider ignores the abort: the turn's work never ends by itself
+			await f().say(disc, "slow");
+			for (let i = 0; i < 100 && !t!.control.discussantHeard.includes("slow"); i++) await new Promise((r) => setTimeout(r, 20));
+			const startedAt = Date.now();
+			const err = await f().deleteProject("p").catch((e) => e);
+			const took = Date.now() - startedAt;
+			expect(err).toMatchObject({ code: "conflict" });
+			expect(err.details.live).toEqual([{ kind: "discussion", id: disc, state: "OPEN (still finishing)" }]);
+			expect(err.message).toBe(`project p has live work: ${disc} is OPEN (still finishing); try again in a moment`);
+			expect(took).toBeGreaterThanOrEqual(9_500);
+			expect(took).toBeLessThan(13_000);
+			expect(config().projects.p).toBeDefined();
+			// once the work ends, the Task's abort ends the discussion (FAILED, retryable) and the deletion goes through
+			t!.control.discussantHang = false;
+			expect((await untilDiscussion(f(), disc, (v) => v.state === "FAILED")).state).toBe("FAILED");
+			const r = await f().deleteProject("p");
+			expect(r.discussions).toEqual([disc]);
+			await f().cleanupsSettledForTests();
+			expect(await things(disc)).toEqual(GONE);
+		}, 40_000);
+
 		test("3: a discussion still PREPARING: the deletion succeeds and leaves no checkout", async () => {
 			await setup();
 			const disc = await f().startDiscussion("p", { title: "t", message: "m" });

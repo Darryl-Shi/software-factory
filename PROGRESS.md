@@ -259,3 +259,6 @@ Decisions:
   invocation's context is dead, so the Task can't abort the Conversation itself). deleteProject therefore aborts the
   Conversation (as Stop does) right after aborting each Task, so the abort path gets to run. The scripted test provider
   ignores aborts (like the Stop test), so test 2 releases its hang shortly after.
+- Round 2: the Conversation aborts are fired, not awaited, inside the single 10 s deadline (an abort resolves only
+  when the work is idle); test for a hang > 10 s → conflict (still finishing) at ~10 s. A discussions-only conflict
+  says "try again in a moment". The delayed FAILED toast reads the title at toast time.

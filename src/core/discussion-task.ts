@@ -378,8 +378,8 @@ export function createDiscussionTask(svc: DiscussionServices) {
 			]),
 		) as any,
 		// The turn operations never abort the Task (Stop aborts the Conversation's work); deleteProject does (it ends the
-		// project's live discussions). The discussion goes to
-		// FAILED so that Retry brings it back.
+		// project's live discussions).
+		// The discussion goes to FAILED so that Retry brings it back.
 		abort: async (task, rt, c) => {
 			// The discussion leaves OPEN (to FAILED, unless it is already CLOSED or FAILED): clean it before the commit.
 			const before = await read(rt, task.input.discussionId, c).catch(() => undefined);

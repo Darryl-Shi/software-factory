@@ -684,18 +684,19 @@ export class Factory implements FactoryCore {
 			await this.harness.abortTask(d.taskId as never, this.ctx);
 			aborted.push(d);
 		}
+		// The 10 s limit covers everything below: the Conversation aborts are started, not awaited (an abort resolves
+		// only once the Conversation's work is idle, which a stuck tool or provider may never be).
+		const deadline = withAbortSignal(AbortSignal.timeout(10_000), this.ctx);
 		// A running turn (mid-reply, drafting) holds the Task's invocation until the Conversation's work ends: stop that
 		// work, as Stop does, so that the aborted Task gets to its abort (cleanup, FAILED).
 		for (const d of aborted) {
 			const now = (await this.harness.snapshot(DiscussionDoc, d.id, this.ctx)) as DiscussionDocState | undefined;
 			if (!now?.turn || now.conversationId === undefined) continue;
-			try {
-				await (await this.harness.conversation(now.conversationId as never, this.ctx))?.abort(this.ctx);
-			} catch (e) {
-				this.log(`project deletion ${name}: could not stop discussion ${d.id}'s turn: ${e instanceof Error ? e.message : String(e)}`);
-			}
+			void this.harness
+				.conversation(now.conversationId as never, this.ctx)
+				.then((conv) => conv?.abort(this.ctx))
+				.catch((e) => this.log(`project deletion ${name}: could not stop discussion ${d.id}'s turn: ${e instanceof Error ? e.message : String(e)}`));
 		}
-		const deadline = withAbortSignal(AbortSignal.timeout(10_000), this.ctx);
 		await Promise.all(aborted.map((d) => this.harness.waitForTask(d.taskId as never, deadline).catch(() => undefined)));
 		const finishing: LiveItem[] = [];
 		for (const d of aborted) {
@@ -706,9 +707,11 @@ export class Factory implements FactoryCore {
 	}
 
 	private liveConflict(name: string, live: LiveItem[]): FactoryError {
+		// Only discussions still finishing (they were ended by this deletion): nothing to cancel, try again.
+		const hint = live.every((l) => l.kind === "discussion") ? "try again in a moment" : "cancel it first (Cancel, Cancel bundle)";
 		return new FactoryError(
 			"conflict",
-			`project ${name} has live work: ${live.map((l) => `${l.id} is ${l.state}`).join(", ")}; cancel it first (Cancel, Cancel bundle)`,
+			`project ${name} has live work: ${live.map((l) => `${l.id} is ${l.state}`).join(", ")}; ${hint}`,
 			{ live },
 		);
 	}

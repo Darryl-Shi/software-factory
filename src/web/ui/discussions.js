@@ -604,7 +604,7 @@ function onDiscussionEvent(e) {
   if (e.type === "discussion.updated" && e.what === "drafts" && e.submission) toast(`Draft tickets are ready in "${title}"`, "", go);
   // Not when its project is being deleted (deleteProject ends open discussions just before the purge): wait for that.
   if (e.type === "discussion.state" && e.to === "FAILED")
-    setTimeout(() => { if (ui.discs.has(e.discussion) && ui.projects.some((p) => p.name === e.project)) toast(`The discussion "${title}" failed`, "error", go); }, 1500);
+    setTimeout(() => { if (ui.discs.has(e.discussion) && ui.projects.some((p) => p.name === e.project)) toast(`The discussion "${ui.discs.get(e.discussion)?.title ?? title}" failed`, "error", go); }, 1500);
 }
 // Runs changed (app.js's flush): their state chips in the open discussion's drafts.
 function discussionRunsChanged(ids) {
