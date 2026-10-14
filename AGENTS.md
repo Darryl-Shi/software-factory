@@ -14,7 +14,8 @@ one project together as a **bundle**: one PR (or a push to `main` for a new repo
   clean multi-ticket bundles: [`docs/specs/run-mv4vd9xu-g2si.md`](docs/specs/run-mv4vd9xu-g2si.md); bulk cancel and clear from the board's select
   mode: [`docs/specs/run-mv545v95-rg77.md`](docs/specs/run-mv545v95-rg77.md); disk cleanup and
   `gc`: [`docs/specs/run-mv58bn4q-q2zs.md`](docs/specs/run-mv58bn4q-q2zs.md), product spec §8.1; commits authored by
-  the GitHub identity's account: [`docs/specs/run-mv6dwfsi-7xli.md`](docs/specs/run-mv6dwfsi-7xli.md)).
+  the GitHub identity's account: [`docs/specs/run-mv6dwfsi-7xli.md`](docs/specs/run-mv6dwfsi-7xli.md); deleting a
+  project (purge): [`docs/specs/run-mv86f7vs-jif2.md`](docs/specs/run-mv86f7vs-jif2.md), product spec §5, §8.1).
 - **Design and deviations:** `docs/design-spec.md`, `docs/superpowers/specs/*`, `DEVIATIONS.md`.
 - **How it fits together:** `docs/architecture.md`; settings: `docs/configuration.md`.
 
@@ -26,7 +27,7 @@ through `tsx`).
 Test: `npm test`
 
 - Typecheck: `npm run typecheck`
-- One file: `npx vitest run test/bundle.test.ts` (the board's layout, columns and select mode: `test/web-board.test.ts`, jsdom; bulk cancel: `test/cancel-runs.test.ts`)
+- One file: `npx vitest run test/bundle.test.ts` (the board's layout, columns and select mode: `test/web-board.test.ts`, jsdom; bulk cancel: `test/cancel-runs.test.ts`; deleting a project: `test/project-delete.test.ts`, its UI `test/web-delete-project.test.ts`)
 - `test/sandbox.test.ts` and `test/sandbox-write.test.ts` need a working bubblewrap + socat (they fail where user
   namespaces are not available, e.g. inside another sandbox).
 - Dry run (end to end through the HTTP API, scripted agents, fake GitHub): `DRYRUN_SANDBOX=0 npm run dry-run`
@@ -60,6 +61,7 @@ src/core/
   task-kit.ts            shared by run and bundle Tasks: role Conversations, runAgent, review rounds + QA, CI wait
   discussion-task.ts     discussions (pre-ticket chats), discussion-doc.ts its Document
   cleanup.ts             disk cleanup: cleanupScope rules, Cleaner (per-owner), startup sweep / gc
+  project-deletion.ts    deleteProject's factory.projectDeletions record (resumed by the sweep), monotonic index ids
   bridge.ts              agent → core tools (ask_human, submit_spec, report_done, submit_review, submit_qa, submit_tickets)
   findings.ts            submission validation; messages.ts human messages (runs and bundles); usage.ts costs
   settings.ts            layered config + schema (bundle.mergeMethod, roles.integrator, ...)

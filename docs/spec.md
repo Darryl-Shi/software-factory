@@ -199,7 +199,27 @@ The core's whole outside surface is `FactoryCore` (`src/core/types.ts`). Every o
 `CORE_OPS` and served as `POST /api/op/<op>`; errors are `not_found` (404), `invalid` (400), `conflict` and
 `not_pending` (409).
 
-- **Projects:** `createProject`, `getProject`, `listProjects`.
+- **Projects:** `createProject`, `getProject`, `listProjects`, `deleteProject`.
+  - `deleteProject(name)` (spec `docs/specs/run-mv86f7vs-jif2.md`) deletes a project and **purges** its history; it
+    returns `{ project, runs, bundles, discussions }`, the purged ids. Checked before anything changes: a name that is
+    not a non-empty string is `invalid`, an unknown project `not_found`, and **live work** `conflict`: any run not
+    `DELIVERED` / `FAILED` / `CANCELLED` (`READY` counts), any bundle not `MERGED` / `CANCELLED` (`FAILED` counts),
+    any discussion `PREPARING` / `OPEN`. The message names each live item with its id and state (`bundle-3 is
+    FAILED`); the error carries them as `details.live: { kind, id, state }[]` (sent in the 409 body). Nothing is
+    cancelled or closed for you. A finished owner whose Task is still ending is waited for (10 s), else it counts as
+    live (`CANCELLED (still finishing)`).
+  - A per-project in-process lock serialises it with `startRun`, `createTicket`, `startDiscussion`, `createBundle`,
+    `setSetting` / `unsetSetting` on that project scope and `createProject` with that name: they wait for a deletion
+    in progress and then fail with `not_found` (`createProject` makes a fresh project). The deletion also waits for
+    any in-flight cleanup of the project's owners. Steps: (1) one commit re-checks liveness, captures what each
+    owner's cleanup needs, retires every Document (`tx.retireDoc`), removes the ids from `RunIndex` / `BundleIndex` /
+    `DiscussionIndex` and records the deletion in `factory.projectDeletions` (§8.1); (2) the `projects.<name>` block
+    leaves the config file; (3) `project.deleted` is emitted; (4) the disk is cleaned in the background.
+  - Afterwards `getProject`, `getSettings({ project })`, `getRun`, `getBundle`, `getDiscussion`, their conversations
+    and screenshots are `not_found`, and the lists leave the purged items out (`listRuns` with `includeCleared` too).
+    The same name can be created again and starts empty (no overrides, ticket keys from `<PREFIX>-1`, no Chat
+    history). `bundle-N` and `disc-N` never repeat: the indexes keep a monotonic counter (`seq`), seeded from the
+    existing ids on first use.
 - **Runs:** `startRun`, `getRun`, `listRuns`, `getConversation`, `cancelRun`, `retryRun`, `answer`, `approve`,
   `reject`, `submitHumanFindings`, `resolveEscalation`, `message`, `getScreenshot`, `clearRuns`, `cancelRuns`.
   - `cancelRuns(runs, reason?)` cancels several live runs at once (spec `docs/specs/run-mv545v95-rg77.md`), with the
@@ -231,7 +251,8 @@ The core's whole outside surface is `FactoryCore` (`src/core/types.ts`). Every o
 - **Events** (`subscribe` over `GET /api/events`, server-sent): `run.state`, `run.cleared`, `run.ask`, `run.askResolved`,
   `run.notice`, `run.message`, `conversation.updated`, `settings.changed`, `discussion.state`, `discussion.updated`,
   `discussion.conversation.updated`, `bundle.state`, `bundle.ask`, `bundle.askResolved`, `bundle.notice`,
-  `bundle.conversation.updated`. Filters: `project` (matches run, discussion and bundle events), `run`, `discussion`,
+  `bundle.conversation.updated`, `project.deleted { project, runs, bundles, discussions }` (to unfiltered subscribers
+  and those filtering on that project). Filters: `project` (matches run, discussion and bundle events), `run`, `discussion`,
   `bundle`. Member runs emit their own `run.state` as they change.
 - **Views:** `RunView` (state, gate, rounds and caps, pending ask, spec and delivery artifacts, conversations, reviews
   with QA status and VM, findings log, advisory and accepted findings, notices, messages, history, cost, `specPath`,
@@ -377,7 +398,36 @@ dirs on next use). One pure function, `cleanupScope(owner)`, decides:
 
   A second sweep over the same data removes nothing. `gc` runs the same sweep on demand.
 - **Never deleted:** QA screenshots (`<factory home>/artifacts`), conversations and the storage records; views load in
-  every state. A closed PR whose head branch was deleted can't be reopened.
+  every state. A closed PR whose head branch was deleted can't be reopened. **Exceptions, for a deleted project
+  only:** its owners' `artifacts/<id>/` dirs are deleted, their Documents are retired, and their Conversations become
+  unreachable (below).
+
+#### Deleting a project (purge)
+
+Spec: `docs/specs/run-mv86f7vs-jif2.md` (`deleteProject`, §5; `src/core/project-deletion.ts`). The purge is logical,
+through Pi Durable's API only: every `factory.run` / `factory.bundle` / `factory.discussion` Document of the project is
+retired and its id leaves its index, in one commit; nothing in the factory can read that history afterwards. Pi
+Durable has no delete for Conversations, entries, tasks or document revisions: those stay in `factory.sqlite` / the
+JSONL files as unreachable rows (the store does not shrink). No raw SQL, no `VACUUM`; SQLite and JSONL behave alike.
+
+- **The record:** the purge commit appends `{ id, project, repo, at, by, owners: [{ kind, id, repo, workdir, github,
+  repoExists }], configRemoved: false, clone: <global workdir's clone>|null, otherClones: [...] }` to the session
+  Document `factory.projectDeletions`. `configRemoved` turns true once the `projects.<name>` block is gone; each owner
+  leaves `owners` once its cleanup succeeded, each clone once removed (or kept); the entry is dropped when empty.
+- **Disk, in the background:** each captured owner gets a full cleanup in the order above (remote branch skipped
+  when the repo did not exist on the host), driven from the captured data, then `<factory home>/artifacts/<id>/` is
+  deleted. After all owners, the shared clone `<workdir>/repos/<owner>__<repo>` goes in the global workdir and in
+  each workdir the owners pinned, **only if no remaining project binds the same repo** (otherwise it stays, logged,
+  and only the project's `factory/<id>` branches went). A failed step is logged with its owner and step and stays in
+  the entry.
+- **Never touched:** the GitHub repo, its default branch, PRs (open or closed) and their descriptions, merged
+  history, global settings and other projects' settings. Only the project's own `factory/<run-id>` and
+  `factory/<bundle-id>` branches are removed on the host.
+- **Resuming:** `Factory.start()` finishes any missing config removal before serving; the startup sweep and `gc`
+  first finish every unfinished entry (owners, then clones). Their items count in the summary line (worktrees,
+  manifests and artifacts dirs under runs / bundles / discussions, a removed clone under local branches). A factory
+  killed at any point after the purge commit ends with the project fully deleted; a crash before it changes nothing.
+  The orphan and clone sweeps treat purged ids as having no record.
 
 ## 9. The web UI
 
@@ -461,6 +511,18 @@ rejected.
   header, transcript and composer in explicit rows, so hiding the header in chat mode cannot shift them.)
 - **Settings:** a form generated from `settingsSchema()`, global or per project, each field with its source and a
   Reset/Inherit button.
+  - **Delete project** (spec `docs/specs/run-mv86f7vs-jif2.md`): a section at the bottom of a project's scope says
+    what is removed (runs, bundles, discussions and their history, worktrees, `factory/<id>` branches, screenshots,
+    the project's settings) and what is kept (the GitHub repo, its default branch and PRs, global settings). Its
+    button opens a confirmation that requires typing the project name exactly (the confirm button stays disabled until
+    it matches). On `conflict` the dialog lists the live items, each a link to its run, bundle or discussion, with the
+    hint to cancel or close them first; nothing is deleted. On success: toast "Deleted project <name>", the scope goes
+    back to Global and the project leaves the scope list.
+  - **Live removal, in every open tab** (`project.deleted`): the project's run and bundle cards and discussions leave
+    the board, the counts, the Chat history rail and the project dropdowns (board filter, Create, Chat); a board filter
+    on that project resets to "All projects"; an open run, bundle or discussion view of it closes with the toast
+    "Project <name> was deleted". A link (`#run=`, `#bundle=`, `#disc=`) to a purged item shows "Not found (its project
+    was deleted or it never existed)". No CLI command; `factory gc` finishes interrupted deletions.
 - **Version and updates** (§12): a version chip in the header shows the running short SHA (tooltip: commit date and
   package version), or **Update available (N)** when the upstream has N new commits. It opens the **Update dialog**:
   running and upstream versions, the incoming commit subjects (`inline()`), **Check now** with the last check's time
@@ -604,3 +666,12 @@ downgrades from the UI, and no automatic updates.
     `cancelRuns` call; they move to Done as Cancelled. A selection mixing live and finished runs shows both **Cancel
     K** and **Clear M**, each acting only on its own subset; a run inside a bundle cannot be selected, and
     `cancelRuns` with it is refused (409, naming the bundle) without cancelling anything.
+22. A project with a `READY` run, a `FAILED` bundle or an `OPEN` discussion can't be deleted: `deleteProject` answers
+    409 naming each live item and its state, nothing changes, and the Settings dialog lists them as links. After
+    cancelling and closing everything, deleting it (typing its name) purges it: its cards, bundles and Chat history
+    leave the board in every open tab, its former ids are 404 everywhere, `projects.<name>` leaves the config (other
+    projects untouched), its worktrees, manifests, scratch, environment records, artifacts and `factory/<id>` branches
+    (local and remote) are gone while the repo, its default branch and PRs remain, and the shared clone goes unless
+    another project binds the repo. A `kill -9` right after the purge commit is finished by the startup sweep (a
+    second `gc` removes nothing); a project created again under that name starts empty, and new bundle and discussion
+    ids are never reused.
