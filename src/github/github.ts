@@ -15,6 +15,8 @@ const OK_CONCLUSIONS = ["success", "neutral", "skipped"];
 const identityOf = (rc: RunCtx): Identity => (rc.config.github?.identity ?? {}) as Identity;
 const workdirOf = (rc: RunCtx): string => expandHome(rc.config.workdir ?? "~/factory/work");
 const cloneOf = (workdir: string, ref: RepoRef): string => join(workdir, "repos", ref.replace("/", "__"));
+/** The shared clone of `ref` under a workdir: `<workdir>/repos/<owner>__<repo>`. */
+export const clonePath = cloneOf;
 const gitReason = (r: { stderr: string; stdout: string }) => r.stderr.trim() || r.stdout.trim() || "no output from git";
 
 /** What a cleanup step did: what it removed (paths/refs that existed) and what it could not remove ("<step>: <why>"). */
@@ -279,6 +281,26 @@ export class GitHub {
 			}
 			return out;
 		}).catch((e) => ({ removed: [], failures: [`clone sweep: ${clone}: ${errText(e)}`] }));
+	}
+
+	/** Whether `repo` exists on the host (a new-repo project's repo does not until its first delivery). Throws on a host error. */
+	repoExists(repo: RepoRef, rc: RunCtx): Promise<boolean> {
+		return this.host.repoExists(repo, identityOf(rc));
+	}
+
+	/**
+	 * Delete a shared clone `<workdir>/repos/<owner>__<repo>` (`clonePath`; a deleted project's, when no remaining project binds the
+	 * repo). Under the clone's lock; idempotent; never throws.
+	 */
+	removeClone(clone: string): Promise<StepResult> {
+		return withClone(clone, async () => {
+			const out: StepResult = { removed: [], failures: [] };
+			if (!existsSync(clone)) return out;
+			rmSync(clone, { recursive: true, force: true });
+			if (existsSync(clone)) out.failures.push(`clone: ${clone} is still there`);
+			else out.removed.push(`clone ${clone}`);
+			return out;
+		}).catch((e) => ({ removed: [], failures: [`clone: ${clone}: ${errText(e)}`] }));
 	}
 
 	/** The shared clones under `<workdir>/repos`. */

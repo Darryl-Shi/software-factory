@@ -23,7 +23,9 @@ import { AGENT_EXTENSIONS, ROLE_TOOLS } from "../agents/tools.ts";
 import { type Boat, boatProblems } from "../boat/boat.ts";
 import { type GitHub, githubProblems } from "../github/github.ts";
 import { type Sandbox, sandboxProblems } from "../sandbox/sandbox.ts";
-import { bundleOwner, type CleanedUp, Cleaner, discussionOwner, type Owner, runOwner, type SweepSource } from "./cleanup.ts";
+import { bundleOwner, type CleanedUp, Cleaner, discussionOwner, type Item, type Owner, runOwner, type SweepSource, workdirOf } from "./cleanup.ts";
+import { type CapturedOwner, maxIndexSeq, nextIndexId, type ProjectDeletion, ProjectDeletions } from "./project-deletion.ts";
+import { clonePath } from "../github/github.ts";
 import { Bridge, BridgeDoc, bridgeToolsNotFor, EnvDoc } from "./bridge.ts";
 import { DiscussionDoc, type DiscussionDocState, DiscussionIndex, deriveTitle, toDiscussionView } from "./discussion-doc.ts";
 import { createDiscussionTask, draftInstructions, takeCheckoutNote } from "./discussion-task.ts";
@@ -47,6 +49,7 @@ import {
 	type BundleMember,
 	type BundleState,
 	type BundleView,
+	type DeletedProject,
 	type DiscussionId,
 	type DiscussionLink,
 	type DiscussionState,
@@ -60,6 +63,7 @@ import {
 	type Gate,
 	type HumanFinding,
 	type HumanMessage,
+	type LiveItem,
 	type ModelInfo,
 	type Project,
 	type Request,
@@ -136,6 +140,12 @@ export class Factory implements FactoryCore {
 	private by = "core";
 	/** Disk cleanup of finished runs, bundles and discussions (src/core/cleanup.ts). */
 	private cleaner: Cleaner;
+	/** Ids purged by a project deletion in this process: a late commit notification never brings them back. */
+	private purged = new Set<string>();
+	/** Per-project serialisation of deleteProject with the ops that create things in (or change) a project. */
+	private projectLocks = new Map<string, Promise<unknown>>();
+	/** Test hook: deleteProject stops right after its purge commit (as if the process were killed there). */
+	haltDeletionAfterCommitForTests = false;
 
 	constructor(private opts: CoreOptions) {
 		this.now = opts.now ?? Date.now;
@@ -237,6 +247,8 @@ export class Factory implements FactoryCore {
 		this.root = await this.harness.root(this.ctx);
 		await this.migrateRuns();
 		await this.loadCache();
+		// An interrupted deletion's config removal is finished before any interface can call in (a same-name createProject).
+		await this.finishConfigRemovals();
 		this.harness.subscribeCommits((pub) => {
 			for (const ch of pub.changes) {
 				if (ch.type === "document" && ch.record.kind === "factory.run" && ch.record.key && ch.value) {
@@ -381,7 +393,8 @@ export class Factory implements FactoryCore {
 			},
 			commit: (o, m) => this.commitCleanedUp(o.kind, o.id, m),
 			known: (id) => this.ownerOf("run", id) ?? this.ownerOf("bundle", id) ?? this.ownerOf("discussion", id),
-			globalWorkdir: () => expandHome(this.config.effective({ global: true }).workdir ?? "~/factory/work"),
+			globalWorkdir: () => this.globalWorkdir(),
+			deletions: () => this.finishDeletions(),
 		};
 	}
 
@@ -470,11 +483,13 @@ export class Factory implements FactoryCore {
 	}
 
 	private indexDiscussion(d: DiscussionDocState) {
+		if (this.purged.has(d.id)) return;
 		this.discussions.set(d.id, structuredClone(d));
 		if (d.conversationId !== undefined) this.discussionConvs.set(String(d.conversationId), d.id);
 	}
 
 	private onDiscussionChange(v: DiscussionDocState) {
+		if (this.purged.has(v.id)) return;
 		const prev = this.discussions.get(v.id);
 		this.indexDiscussion(v);
 		const ws = this.waiters.get(v.id);
@@ -493,6 +508,7 @@ export class Factory implements FactoryCore {
 	}
 
 	private indexRun(d: RunDocState) {
+		if (this.purged.has(d.id)) return;
 		this.cache.set(d.id, structuredClone(d));
 		if (d.conversations.architect) this.convIndex.set(d.conversations.architect, { run: d.id, role: "architect" });
 		if (d.conversations.builder) this.convIndex.set(d.conversations.builder, { run: d.id, role: "builder" });
@@ -501,6 +517,7 @@ export class Factory implements FactoryCore {
 	}
 
 	private onRunChange(v: RunDocState) {
+		if (this.purged.has(v.id)) return;
 		const prev = this.cache.get(v.id);
 		this.indexRun(v);
 		const ws = this.waiters.get(v.id);
@@ -586,7 +603,7 @@ export class Factory implements FactoryCore {
 
 	// ------------------------------------------------------------------ projects
 	async createProject(name: string, repo: string): Promise<Project> {
-		return this.config.createProject(name, repo);
+		return this.withProject(name, async () => this.config.createProject(name, repo));
 	}
 	async getProject(name: string): Promise<Project> {
 		return this.config.project(name);
@@ -600,15 +617,307 @@ export class Factory implements FactoryCore {
 		return this.config.projects();
 	}
 
+	// ------------------------------------------------------------------ deleting a project (docs/specs/run-mv86f7vs-jif2.md)
+
+	/** Run `f` while no deletion of the project runs (and none starts): deleteProject and the ops that act in a project. */
+	private withProject<T>(name: string, f: () => Promise<T>): Promise<T> {
+		const key = String(name);
+		const prev = this.projectLocks.get(key) ?? Promise.resolve();
+		const next = prev.catch(() => undefined).then(f);
+		this.projectLocks.set(key, next);
+		void next
+			.finally(() => {
+				if (this.projectLocks.get(key) === next) this.projectLocks.delete(key);
+			})
+			.catch(() => undefined);
+		return next;
+	}
+
+	private globalWorkdir(): string {
+		return expandHome(this.config.effective({ global: true }).workdir ?? "~/factory/work");
+	}
+
+	/** A project's runs, bundles and discussions as committed (from storage, not the caches). */
+	private async projectOwners(name: string): Promise<{ runs: RunDocState[]; bundles: BundleDocState[]; discussions: DiscussionDocState[] }> {
+		const runs: RunDocState[] = [];
+		for (const id of (await this.harness.snapshot(RunIndex, this.ctx))?.runs ?? []) {
+			const d = (await this.harness.snapshot(RunDoc, id, this.ctx)) as RunDocState | undefined;
+			if (d?.project === name) runs.push(d);
+		}
+		const bundles: BundleDocState[] = [];
+		for (const id of (await this.harness.snapshot(BundleIndex, this.ctx))?.ids ?? []) {
+			const d = (await this.harness.snapshot(BundleDoc, id, this.ctx)) as BundleDocState | undefined;
+			if (d?.project === name) bundles.push(d);
+		}
+		const discussions: DiscussionDocState[] = [];
+		for (const id of (await this.harness.snapshot(DiscussionIndex, this.ctx))?.ids ?? []) {
+			const d = (await this.harness.snapshot(DiscussionDoc, id, this.ctx)) as DiscussionDocState | undefined;
+			if (d?.project === name) discussions.push(d);
+		}
+		return { runs, bundles, discussions };
+	}
+
+	/** The live work (spec A1) among a project's owners. */
+	private liveItems(o: { runs: RunDocState[]; bundles: BundleDocState[]; discussions: DiscussionDocState[] }): LiveItem[] {
+		return [
+			...o.runs.filter((d) => !TERMINAL_STATES.includes(d.state)).map((d) => ({ kind: "run" as const, id: d.id, state: d.state })),
+			...o.bundles.filter((d) => d.state !== "MERGED" && d.state !== "CANCELLED").map((d) => ({ kind: "bundle" as const, id: d.id, state: d.state })),
+			...o.discussions.filter((d) => d.state === "PREPARING" || d.state === "OPEN").map((d) => ({ kind: "discussion" as const, id: d.id, state: d.state })),
+		];
+	}
+
+	private liveConflict(name: string, live: LiveItem[]): FactoryError {
+		return new FactoryError(
+			"conflict",
+			`project ${name} has live work: ${live.map((l) => `${l.id} is ${l.state}`).join(", ")}; cancel or close it first (Cancel, Cancel bundle, Close discussion)`,
+			{ live },
+		);
+	}
+
+	async deleteProject(name: string): Promise<DeletedProject> {
+		const by = this.by; // before any await (see startRun)
+		if (typeof name !== "string" || !name) throw new FactoryError("invalid", "deleteProject needs a project name");
+		return this.withProject(name, () => this.deleteProjectLocked(name, by));
+	}
+
+	private async deleteProjectLocked(name: string, by: string): Promise<DeletedProject> {
+		const project = this.config.project(name); // not_found
+		let owners = await this.projectOwners(name);
+		const live = this.liveItems(owners);
+		if (live.length) throw this.liveConflict(name, live);
+		// A finished owner's Task may still be ending (its last cleanup and commit): wait for it briefly.
+		const all = [...owners.runs, ...owners.bundles, ...owners.discussions] as { id: string; state: string; taskId?: string }[];
+		const finishing: LiveItem[] = [];
+		for (const d of all) {
+			if (d.taskId === undefined) continue;
+			const task = await this.harness.getTask(d.taskId as never, this.ctx);
+			if (!task || task.state.status === "terminal") continue;
+			await this.harness.waitForTask(d.taskId as never, withAbortSignal(AbortSignal.timeout(10_000), this.ctx)).catch(() => undefined);
+			const again = await this.harness.getTask(d.taskId as never, this.ctx);
+			if (again && again.state.status !== "terminal") {
+				const kind = d.id.startsWith("bundle-") ? "bundle" : d.id.startsWith("disc-") ? "discussion" : "run";
+				finishing.push({ kind, id: d.id, state: `${d.state} (still finishing)` });
+			}
+		}
+		if (finishing.length) throw this.liveConflict(name, finishing);
+		owners = await this.projectOwners(name);
+		// Whether each repo exists on the host (for the remote branch step), asked once per repo and identity.
+		const exists = new Map<string, Promise<boolean | null>>();
+		const repoExists = (repo: string, config: Record<string, any>) => {
+			const key = JSON.stringify([repo, config.github?.identity ?? null]);
+			let p = exists.get(key);
+			if (!p) {
+				p = this.opts.github.repoExists(repo, { runId: name, config }).catch((e) => {
+					this.log(`project deletion ${name}: checking whether ${repo} exists failed (checked again at cleanup): ${e instanceof Error ? e.message : e}`);
+					return null;
+				});
+				exists.set(key, p);
+			}
+			return p;
+		};
+		const ownerRepo = (d: { repo: string; workspace?: { repo: string } }) => d.workspace?.repo ?? d.repo;
+		const known = new Map<string, boolean | null>();
+		for (const d of [...owners.runs, ...owners.bundles, ...owners.discussions] as RunDocState[]) known.set(d.id, await repoExists(ownerRepo(d), d.pinned.config));
+		const ids = [...owners.runs, ...owners.bundles, ...owners.discussions].map((d) => d.id);
+		const result: DeletedProject = { project: name, runs: [], bundles: [], discussions: [] };
+		// After any in-flight cleanup of the owners, and none starts until committed.
+		const locked = ids.reduceRight<() => Promise<void>>((inner, id) => () => this.cleaner.exclusive(id, inner), () => this.purgeCommit(name, project.repo, by, known, result));
+		await locked();
+		for (const id of [...result.runs, ...result.bundles, ...result.discussions]) this.forget(id);
+		if (this.haltDeletionAfterCommitForTests) return result;
+		// 2. config
+		await this.finishConfigRemovals();
+		// 3. event
+		this.emit({ type: "project.deleted", ...result }, { project: name });
+		// 4. disk, in the background
+		this.cleaner.background(this.finishDeletions());
+		return result;
+	}
+
+	/** Step 1: one commit that re-checks liveness, captures and retires every owner, and records the deletion. */
+	private async purgeCommit(name: string, repo: string, by: string, known: Map<string, boolean | null>, result: DeletedProject): Promise<void> {
+		const now = this.now();
+		const global = this.globalWorkdir();
+		await this.root.commit(async (tx) => {
+			result.runs = [];
+			result.bundles = [];
+			result.discussions = [];
+			const runIdx = await tx.doc(RunIndex);
+			const bundleIdx = await tx.doc(BundleIndex);
+			const discIdx = await tx.doc(DiscussionIndex);
+			const runs: RunDocState[] = [];
+			for (const id of runIdx.runs) {
+				const d = (await tx.doc(RunDoc, id, null as never)) as unknown as RunDocState;
+				if (d?.project === name) runs.push(d);
+			}
+			const bundles: BundleDocState[] = [];
+			for (const id of bundleIdx.ids) {
+				const d = (await tx.doc(BundleDoc, id, null as never)) as unknown as BundleDocState;
+				if (d?.project === name) bundles.push(d);
+			}
+			const discussions: DiscussionDocState[] = [];
+			for (const id of discIdx.ids) {
+				const d = (await tx.doc(DiscussionDoc, id, null as never)) as unknown as DiscussionDocState;
+				if (d?.project === name) discussions.push(d);
+			}
+			const live = this.liveItems({ runs, bundles, discussions });
+			if (live.length) throw this.liveConflict(name, live);
+			// Something created meanwhile has no captured repo check: it is checked at cleanup.
+			const capture = (kind: CapturedOwner["kind"], d: RunDocState | BundleDocState | DiscussionDocState): CapturedOwner => {
+				const config = (d.pinned.config ?? {}) as Record<string, any>;
+				return {
+					kind,
+					id: d.id,
+					repo: (d as RunDocState).workspace?.repo ?? d.repo,
+					workdir: workdirOf(config),
+					...(config.github ? { github: JSON.parse(JSON.stringify(config.github)) } : {}),
+					repoExists: known.has(d.id) ? known.get(d.id)! : null,
+				};
+			};
+			const captured: CapturedOwner[] = [];
+			for (const d of runs) {
+				captured.push(capture("run", d));
+				await tx.retireDoc(RunDoc, d.id);
+				result.runs.push(d.id);
+			}
+			for (const d of bundles) {
+				captured.push(capture("bundle", d));
+				await tx.retireDoc(BundleDoc, d.id);
+				result.bundles.push(d.id);
+			}
+			for (const d of discussions) {
+				captured.push(capture("discussion", d));
+				await tx.retireDoc(DiscussionDoc, d.id);
+				result.discussions.push(d.id);
+			}
+			if (result.runs.length) runIdx.runs = runIdx.runs.filter((id) => !result.runs.includes(id));
+			// The counters keep counting from the highest id ever issued (a new bundle-N never meets an old PR or branch).
+			if (result.bundles.length) {
+				bundleIdx.seq = maxIndexSeq(bundleIdx, "bundle-");
+				bundleIdx.ids = bundleIdx.ids.filter((id) => !result.bundles.includes(id));
+			}
+			if (result.discussions.length) {
+				discIdx.seq = maxIndexSeq(discIdx, "disc-");
+				discIdx.ids = discIdx.ids.filter((id) => !result.discussions.includes(id));
+			}
+			const workdirs = [...new Set(captured.map((o) => o.workdir))].filter((w) => w !== global);
+			const entry: ProjectDeletion = {
+				id: `${name}@${now.toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+				project: name,
+				repo,
+				at: now,
+				by,
+				owners: captured,
+				configRemoved: false,
+				clone: clonePath(global, repo),
+				otherClones: workdirs.map((w) => clonePath(w, repo)),
+			};
+			(await tx.doc(ProjectDeletions)).entries.push(entry);
+		}, this.ctx);
+	}
+
+	/** Drop a purged id from every cache (its Document is retired). */
+	private forget(id: string): void {
+		this.purged.add(id);
+		this.cache.delete(id);
+		this.bundles.delete(id);
+		this.discussions.delete(id);
+		for (const [conv, m] of this.convIndex) if (m.run === id) this.convIndex.delete(conv);
+		for (const [conv, d] of this.discussionConvs) if (d === id) this.discussionConvs.delete(conv);
+	}
+
+	/** Step 2 of every recorded deletion whose config block is not removed yet (startup, deleteProject, the sweep). */
+	private async finishConfigRemovals(): Promise<void> {
+		const doc = await this.harness.snapshot(ProjectDeletions, this.ctx);
+		for (const e of doc?.entries ?? []) {
+			if (e.configRemoved) continue;
+			try {
+				this.config.removeProject(e.project);
+			} catch (err) {
+				this.log(`project deletion ${e.project}: removing projects.${e.project} from the config failed (retried by the next sweep): ${err instanceof Error ? err.message : err}`);
+				continue;
+			}
+			await this.root.commit(async (tx) => {
+				const x = (await tx.doc(ProjectDeletions)).entries.find((y) => y.id === e.id);
+				if (x) x.configRemoved = true;
+			}, this.ctx);
+		}
+	}
+
+	/**
+	 * Finish every recorded deletion (step 4, and the sweep's resumption): the config removal if missing, each owner's
+	 * full cleanup and its artifacts, then the shared clones; each removed from the entry as it succeeds, the entry
+	 * dropped once empty. Serialised; never throws (failures are returned and stay for a retry).
+	 */
+	private finishDeletions(): Promise<{ items: Item[]; failures: string[] }> {
+		return this.cleaner.exclusive("project-deletions", async () => {
+			const items: Item[] = [];
+			const failures: string[] = [];
+			await this.finishConfigRemovals().catch((e) => failures.push(`project deletions: config: ${e instanceof Error ? e.message : e}`));
+			const doc = await this.harness.snapshot(ProjectDeletions, this.ctx);
+			for (const e of doc?.entries ?? []) {
+				const update = (change: (x: ProjectDeletion) => void) =>
+					this.root.commit(async (tx) => {
+						const d = await tx.doc(ProjectDeletions);
+						const x = d.entries.find((y) => y.id === e.id);
+						if (!x) return;
+						change(x as ProjectDeletion);
+						if (x.configRemoved && x.owners.length === 0 && x.clone === null && !(x.otherClones ?? []).length) d.entries = d.entries.filter((y) => y.id !== e.id);
+					}, this.ctx);
+				let ownersLeft = 0;
+				for (const c of e.owners) {
+					this.purged.add(c.id);
+					const owner: Owner = { kind: c.kind, id: c.id, repo: c.repo, state: "", config: { workdir: c.workdir, ...(c.github ? { github: c.github } : {}) }, repoExists: c.repoExists };
+					const r = await this.cleaner.purgeOwner(owner, this.artifactsDir);
+					items.push(...r.items);
+					failures.push(...r.failures.map((f) => `project ${e.project}: ${c.kind} ${c.id}: ${f}`));
+					if (r.failures.length) ownersLeft++;
+					else await update((x) => (x.owners = x.owners.filter((o) => o.id !== c.id)));
+				}
+				const clones = [...(e.clone ? [e.clone] : []), ...(e.otherClones ?? [])];
+				if (ownersLeft || !e.configRemoved) continue;
+				// The clone goes only if no remaining project (or record) uses the same repo; else only the branches went.
+				const shared =
+					this.config.projects().some((p) => p.repo === e.repo) ||
+					[...this.cache.values(), ...this.bundles.values(), ...this.discussions.values()].some((d) => (d as RunDocState).repo === e.repo || (d as RunDocState).workspace?.repo === e.repo);
+				const done: string[] = [];
+				for (const clone of clones) {
+					if (shared) {
+						done.push(clone);
+						continue;
+					}
+					const r = await this.opts.github.removeClone(clone);
+					items.push(...r.removed.map((text) => ({ cat: "local" as const, text })));
+					for (const f of r.failures) this.log(`project deletion: ${e.project}: clone: ${f}`);
+					failures.push(...r.failures.map((f) => `project ${e.project}: ${f}`));
+					if (!r.failures.length) done.push(clone);
+				}
+				if (shared) this.log(`project deletion: ${e.project}: the shared clone of ${e.repo} stays (another project binds the repo)`);
+				await update((x) => {
+					if (x.clone && done.includes(x.clone)) x.clone = null;
+					x.otherClones = (x.otherClones ?? []).filter((c) => !done.includes(c));
+				});
+			}
+			return { items, failures };
+		});
+	}
+
+	/** Test/diagnostic hook: the recorded, unfinished project deletions. */
+	async projectDeletionsForTests(): Promise<ProjectDeletion[]> {
+		return ((await this.harness.snapshot(ProjectDeletions, this.ctx))?.entries ?? []) as ProjectDeletion[];
+	}
+
 	// ------------------------------------------------------------------ runs
 	async startRun(project: string, request: Omit<Request, "id" | "project">): Promise<RunId> {
 		const by = this.by; // before any await: `as(name)` sets `by` only for the synchronous part of the call
-		let runId!: RunId;
-		await this.root.commit(async (tx) => {
-			runId = await this.createRunIn(tx, project, request, by);
-		}, this.ctx);
-		this.harness.resume();
-		return runId;
+		return this.withProject(project, async () => {
+			let runId!: RunId;
+			await this.root.commit(async (tx) => {
+				runId = await this.createRunIn(tx, project, request, by);
+			}, this.ctx);
+			this.harness.resume();
+			return runId;
+		});
 	}
 
 	/**
@@ -1024,6 +1333,10 @@ export class Factory implements FactoryCore {
 
 	async createBundle(project: string, runs: RunId[]): Promise<BundleId> {
 		const by = this.by;
+		return this.withProject(project, () => this.createBundleIn(project, runs, by));
+	}
+
+	private async createBundleIn(project: string, runs: RunId[], by: string): Promise<BundleId> {
 		if (!Array.isArray(runs) || runs.length === 0 || !runs.every((r) => typeof r === "string")) throw new FactoryError("invalid", "a bundle needs at least one run");
 		if (new Set(runs).size !== runs.length) throw new FactoryError("invalid", "a run is listed twice");
 		this.config.project(project); // not_found
@@ -1045,7 +1358,7 @@ export class Factory implements FactoryCore {
 				members.push({ run, title: d.request.title, key: this.ticketKey(d), specPath: specPathOf(d), branch: d.workspace?.branch ?? `factory/${run}` });
 			}
 			const idx = await tx.doc(BundleIndex);
-			id = `bundle-${idx.ids.length + 1}`;
+			id = nextIndexId(idx, "bundle-");
 			idx.ids.push(id);
 			const now = this.now();
 			const seed: BundleDocState = {
@@ -1277,6 +1590,7 @@ export class Factory implements FactoryCore {
 	}
 
 	private indexBundle(d: BundleDocState) {
+		if (this.purged.has(d.id)) return;
 		this.bundles.set(d.id, structuredClone(d));
 		if (d.conversations.integrator !== undefined) this.convIndex.set(d.conversations.integrator, { run: d.id, role: "integrator" });
 		for (const r of d.conversations.reviewers) this.convIndex.set(r.id, { run: d.id, role: "reviewer" });
@@ -1284,6 +1598,7 @@ export class Factory implements FactoryCore {
 	}
 
 	private onBundleChange(v: BundleDocState) {
+		if (this.purged.has(v.id)) return;
 		const prev = this.bundles.get(v.id);
 		this.indexBundle(v);
 		const ws = this.waiters.get(v.id);
@@ -1337,6 +1652,10 @@ export class Factory implements FactoryCore {
 	// ------------------------------------------------------------------ discussions (a pre-ticket chat per project)
 	async startDiscussion(project: string, d: { title?: string; message: string; model?: { model: string; thinking: string } }): Promise<DiscussionId> {
 		const by = this.by;
+		return this.withProject(project, () => this.startDiscussionIn(project, d, by));
+	}
+
+	private async startDiscussionIn(project: string, d: { title?: string; message: string; model?: { model: string; thinking: string } }, by: string): Promise<DiscussionId> {
 		const p = this.config.project(project);
 		const message = typeof d?.message === "string" ? d.message.trim() : "";
 		if (!message) throw new FactoryError("invalid", "a discussion needs a first message");
@@ -1352,7 +1671,7 @@ export class Factory implements FactoryCore {
 		let id!: DiscussionId;
 		await this.root.commit(async (tx) => {
 			const idx = await tx.doc(DiscussionIndex);
-			id = `disc-${idx.ids.length + 1}`;
+			id = nextIndexId(idx, "disc-");
 			idx.ids.push(id);
 			const seed: DiscussionDocState = {
 				id,
@@ -1511,6 +1830,11 @@ export class Factory implements FactoryCore {
 
 	async createTicket(id: DiscussionId, draft: string): Promise<RunId> {
 		const by = this.by; // before any await (see startRun)
+		const { project } = await this.discussionDoc(id); // not_found
+		return this.withProject(project, () => this.createTicketIn(id, draft, by));
+	}
+
+	private async createTicketIn(id: DiscussionId, draft: string, by: string): Promise<RunId> {
 		// One commit: the run (index entry, seed, Task) and the draft's runId, checked inside it, so a second call is refused.
 		// Any state: a run never depends on the discussion (only a running `draft` turn locks the drafts).
 		const runId = await this.changeDiscussion(id, async (d, tx) => {
@@ -1622,13 +1946,19 @@ export class Factory implements FactoryCore {
 	}
 
 	async setSetting(scope: Scope, path: string, value: unknown): Promise<void> {
-		this.config.set(scope, path, value);
+		await this.withScope(scope, async () => this.config.set(scope, path, value));
 		this.emit({ type: "settings.changed", scope, path });
 	}
 
 	async unsetSetting(scope: Scope, path: string): Promise<void> {
-		this.config.unset(scope, path);
+		await this.withScope(scope, async () => this.config.unset(scope, path));
 		this.emit({ type: "settings.changed", scope, path });
+	}
+
+	/** A project scope's change waits for (and is serialised with) a deletion of that project. */
+	private withScope<T>(scope: Scope, f: () => Promise<T>): Promise<T> {
+		const project = scope && typeof scope === "object" && "project" in scope ? (scope as { project: unknown }).project : undefined;
+		return typeof project === "string" ? this.withProject(project, f) : f();
 	}
 
 	// ------------------------------------------------------------------ test/diagnostic helpers

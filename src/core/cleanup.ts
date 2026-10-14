@@ -26,6 +26,8 @@ export interface Owner {
 	config: Record<string, any>;
 	cleanedUp?: CleanedUp;
 	taskId?: string;
+	/** False when the repo was known not to exist on the host (the remote branch step is then skipped). */
+	repoExists?: boolean | null;
 }
 
 /** The rules (spec "Rules"): which things of an owner in its current state may go. */
@@ -69,8 +71,8 @@ export function ownerOfEnvName(name: string): string | undefined {
 	return undefined;
 }
 
-type Cat = "runs" | "bundles" | "discussions" | "scratch" | "env" | "local" | "remote";
-type Item = { cat: Cat; text: string };
+export type Cat = "runs" | "bundles" | "discussions" | "scratch" | "env" | "local" | "remote";
+export type Item = { cat: Cat; text: string };
 
 export interface CleanupResult {
 	removed: string[];
@@ -97,6 +99,8 @@ export interface SweepSource {
 	known(id: string): Owner | undefined;
 	/** The global workdir. */
 	globalWorkdir(): string;
+	/** Finish interrupted project deletions first (docs/specs/run-mv86f7vs-jif2.md "Resuming"). */
+	deletions?(): Promise<{ items: Item[]; failures: string[] }>;
 }
 
 const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -190,7 +194,7 @@ export class Cleaner {
 		};
 		if (scope === "full") {
 			// 1. the remote branch (runs and bundles: discussion branches are never pushed)
-			if (o.kind !== "discussion") {
+			if (o.kind !== "discussion" && o.repoExists !== false) {
 				const branch = `factory/${o.id}`;
 				try {
 					if (await this.o.github.deleteRemoteBranch(o.repo, branch, { runId: o.id, config: o.config })) items.push({ cat: "remote", text: `remote branch ${branch} (${o.repo})` });
@@ -221,6 +225,31 @@ export class Cleaner {
 		return { items, failures };
 	}
 
+	/**
+	 * A purged owner's full cleanup (deleteProject), driven from its captured data (no Document, no recheck): the §8.1
+	 * steps, then `<artifactsDir>/<id>/`. Serialised with any other cleanup of the id; never throws.
+	 */
+	purgeOwner(o: Owner, artifactsDir: string): Promise<{ items: Item[]; failures: string[] }> {
+		return this.exclusive(o.id, async () => {
+			const r = await this.steps(o, "full");
+			const dir = join(artifactsDir, o.id);
+			try {
+				if (existsSync(dir)) {
+					rmSync(dir, { recursive: true, force: true });
+					if (existsSync(dir)) r.failures.push(`artifacts: ${dir} is still there`);
+					else r.items.push({ cat: AREA[o.kind], text: `artifacts ${dir}` });
+				}
+			} catch (e) {
+				r.failures.push(`artifacts: ${dir}: ${errText(e)}`);
+			}
+			for (const f of r.failures) this.o.log(`project deletion: ${o.kind} ${o.id}: ${f}`);
+			return r;
+		}).catch((e) => {
+			this.o.log(`project deletion: ${o.kind} ${o.id}: ${errText(e)}`);
+			return { items: [], failures: [errText(e)] };
+		});
+	}
+
 	/** The startup sweep and `gc` (single flight: a second call waits for the running sweep and returns its result). */
 	sweep(src: SweepSource): Promise<SweepResult> {
 		if (this.sweeping) return this.sweeping;
@@ -238,6 +267,14 @@ export class Cleaner {
 			items.push(...r.items);
 			failures.push(...r.failures);
 		};
+		// 0. interrupted project deletions (their owners have no record any more)
+		if (src.deletions) {
+			try {
+				take(await src.deletions());
+			} catch (e) {
+				failures.push(`project deletions: ${errText(e)}`);
+			}
+		}
 		// 1. records: one owner at a time
 		for (const o of src.owners()) {
 			const scope = cleanupScope(o);

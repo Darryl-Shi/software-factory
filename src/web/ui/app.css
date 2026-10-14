@@ -433,6 +433,13 @@ table.cost tr.total td { font-weight: 600; border-bottom: 0; }
 .set-row .s-desc { font-size: 12.5px; color: var(--fg-3); }
 .set-ctl { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; min-width: 0; }
 .set-side { display: flex; gap: 6px; align-items: center; justify-content: flex-end; }
+.set-danger { margin: 32px 0 0; padding: 14px 16px; border: 1px solid var(--bad); border-radius: var(--radius); max-width: 70ch; display: grid; gap: 8px; justify-items: start; }
+.set-danger h3 { margin: 0; font: 600 15px/1.3 var(--f-display); color: var(--bad); }
+.set-danger p { margin: 0; }
+.dp-live { border: 1px solid var(--bad); background: var(--bad-soft); border-radius: 8px; padding: 10px 12px; font-size: 13px; }
+.dp-live-h { margin: 0 0 6px; }
+.dp-live ul { margin: 0; padding-left: 18px; display: grid; gap: 4px; }
+.dp-live .dp-kind { color: var(--fg-3); }
 .src { font: 500 10.5px/1 var(--f-mono); border-radius: 3px; padding: 3px 5px; background: var(--muted-soft); color: var(--fg-3); }
 .src.global { background: var(--accent-soft); color: var(--accent); }
 .src.project { background: var(--turn-soft); color: var(--turn); }

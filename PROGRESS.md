@@ -215,3 +215,29 @@ Decisions:
 - [x] tests: commit-identity.test.ts (acceptance 1,4,5,6), sandbox-home, github-api, doctor; dry run 105/105.
 - Decisions: whoami stays on `gh api` (setup only). Missing credential in doctor → the existing warn, no lookup.
 - Full suite: only the 8 bubblewrap tests fail (no user namespaces on this host), as before.
+
+## Delete a project (run run-mv86f7vs-jif2; spec docs/specs/run-mv86f7vs-jif2.md)
+
+- [x] types: `deleteProject` (CORE_OPS), `project.deleted` event, `FactoryError.details` (server sends it in error bodies)
+- [x] settings: `ConfigStore.removeProject`; github: `repoExists`, `removeClone`, `clonePath`
+- [x] cleanup: `Owner.repoExists` (false skips the remote step), `Cleaner.purgeOwner` (full steps + artifacts dir),
+      `SweepSource.deletions` (sweep step 0)
+- [x] project-deletion.ts: `factory.projectDeletions` doc, `nextIndexId` (monotonic `seq` on Bundle/DiscussionIndex)
+- [x] core: per-project lock (`withProject`) around startRun/createTicket/startDiscussion/createBundle/set/unset
+      (project scope)/createProject; deleteProject (checks, wait for finishing Tasks, repoExists per repo, Cleaner.exclusive
+      over all owners, purge commit with in-tx recheck, forget caches + `purged` set, config, event, background finish);
+      `finishConfigRemovals` at start(); `finishDeletions` from deleteProject and the sweep
+- [x] web UI (helper): Settings → Delete project section + type-to-confirm dialog, conflict links, live removal,
+      not-found message, hashchange links
+- [x] tests: test/project-delete.test.ts (acceptance 1-7, incl. kill-after-commit on sqlite), test/web-delete-project.test.ts
+- [x] docs: spec.md §5, §8.1 (purge subsection, never-deleted exceptions), §9, acceptance 22; AGENTS.md
+
+Decisions:
+- Entry fields beyond the spec: `id` (a name can be deleted twice), `otherClones` (pinned workdirs ≠ global),
+  owners' `github` settings (identity refs, for the remote branch).
+- A finished owner whose Task has not ended is waited for 10 s, then reported as live (`<STATE> (still finishing)`).
+- Sweep counts: artifacts dirs count under the owner's area (runs/bundles/discussions); a removed clone under local
+  branches (the summary line's format is unchanged).
+- Clones are removed only after every owner of the entry succeeded and the config block is gone.
+- Config removal is finished in `start()` before the web server can call in, so a same-name createProject after a
+  crash never races the resumption.

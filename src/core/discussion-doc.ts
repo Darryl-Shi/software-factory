@@ -69,7 +69,7 @@ export const DiscussionDoc = defineDocFamily<Record<string, any>, any>({
 	initial: (seed) => seed,
 });
 
-export const DiscussionIndex = defineDoc<{ ids: string[] }>({
+export const DiscussionIndex = defineDoc<{ ids: string[]; seq?: number }>({
 	kind: "factory.discussions",
 	version: 1,
 	scope: "session",
