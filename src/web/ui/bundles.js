@@ -116,11 +116,25 @@ function renderBundleLinks(b) {
   const d = b.delivery;
   $("#rv-links").innerHTML = b.members.map((m) => `<button type="button" class="linkish mono" data-bundle-run="${esc(m.run)}" title="${esc(m.title)}">${esc(memberKey(m))}</button>`).join("")
     + (d?.url ? `<a href="${esc(d.url)}" target="_blank" rel="noopener noreferrer">${esc(prText(d))}</a>` : "");
-  const cancellable = !BUNDLE_RELEASED.includes(b.state), extra = $("#rv-extra"), key = `bundle:${b.id}:${cancellable}`;
+  const cancellable = !BUNDLE_RELEASED.includes(b.state), checkable = canCheckPr(b), extra = $("#rv-extra"), key = `bundle:${b.id}:${cancellable}:${checkable}`;
   if (extra.dataset.key === key) return;
   extra.dataset.key = key;
-  extra.innerHTML = cancellable ? `<button type="button" class="btn small danger" id="rv-cancel-bundle" title="Close its PR and send its tickets back to Ready">Cancel bundle</button>` : "";
+  extra.innerHTML = (checkable ? `<button type="button" class="btn small" id="rv-check-pr" title="Ask GitHub now whether ${esc(prText(d))} was merged or closed outside the factory">Check PR now</button>` : "")
+    + (cancellable ? `<button type="button" class="btn small danger" id="rv-cancel-bundle" title="Close its PR and send its tickets back to Ready">Cancel bundle</button>` : "");
+  $("#rv-check-pr")?.addEventListener("click", (e) => checkPrFlow(b.id, e.currentTarget));
   $("#rv-cancel-bundle")?.addEventListener("click", () => cancelBundleFlow(b.id));
+}
+// Check PR now: while the bundle has a PR and is not Merged or Cancelled (Failed and Escalated included).
+const canCheckPr = (b) => b.delivery?.kind === "pr" && !BUNDLE_RELEASED.includes(b.state);
+async function checkPrFlow(id, btn) {
+  const b = ui.bundles.get(id), pr = prText(b?.delivery);
+  btn.disabled = true;
+  let res;
+  const ok = await act(async () => { res = await core.checkBundlePr(id); });
+  btn.disabled = false;
+  if (!ok) return;
+  toast(res?.pr === "merged" ? `${pr} was merged on GitHub — the bundle is Merged` : res?.pr === "closed" ? `${pr} was closed — the tickets are back in Ready` : `${pr} is still open`);
+  if (res?.pr !== "open") { refreshBundle(id); (b?.members ?? []).forEach((m) => refreshRun(m.run)); }
 }
 async function cancelBundleFlow(id) {
   if (!(await confirmBox(`Cancel ${id}?`, "Its PR is closed if one is open, and its tickets go back to Ready with their branches untouched.", "Cancel bundle"))) return;

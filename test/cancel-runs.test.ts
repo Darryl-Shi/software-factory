@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { FactoryEvent } from "../src/core/types.ts";
+import { GitHub } from "../src/github/github.ts";
 import { Sandbox } from "../src/sandbox/sandbox.ts";
 import { bundleIn, inState, makeFactory, type TestEnv, until, untilBundle } from "./helpers.ts";
 
@@ -48,26 +49,31 @@ describe("cancelRuns", () => {
 		expect((await until(f, live, done)).failure).toMatchObject({ state: "AWAITING_APPROVAL", reason: "bulk" });
 	});
 
-	test("a member of an active bundle → conflict naming the bundle; no other run in the call is cancelled", async () => {
+	test("a subset of an active bundle's members → conflict naming the bundle and the missing ticket; nothing changes", async () => {
 		t = await makeFactory();
 		await t.host.seedRepo("me/p", SEED);
 		await t.factory.createProject("p", "me/p");
 		const a = await start("alpha");
-		expect((await until(t.factory, a, inState("READY"))).state).toBe("READY");
+		const b = await start("beta");
+		await Promise.all([until(t.factory, a, inState("READY")), until(t.factory, b, inState("READY"))]);
 		await t.factory.setSetting({ project: "p" }, "policy.approvals", ["spec"]);
-		const live = await start("beta");
+		const live = await start("gamma");
 		await until(t.factory, live, inState("AWAITING_APPROVAL"));
-		const id = await t.factory.createBundle("p", [a]);
+		const id = await t.factory.createBundle("p", [a, b]);
 		const err = await t.factory.cancelRuns([live, a]).catch((e) => e);
 		expect(err).toMatchObject({ code: "conflict" });
-		expect(err.message).toContain(a);
 		expect(err.message).toContain(id);
+		expect(err.message).toContain(b);
+		expect(err.message).toContain("P-2");
 		await new Promise((r) => setTimeout(r, 200));
 		expect((await t.factory.getRun(live)).state).toBe("AWAITING_APPROVAL");
 		expect((await t.factory.getRun(a)).bundle).toBe(id);
+		expect((await t.factory.getRun(a)).failure).toBeUndefined();
+		expect((await t.factory.bundleDocument(id)).cancelReason).toBeUndefined();
+		expect(["MERGED", "CANCELLED"]).not.toContain((await t.factory.getBundle(id)).state);
 	});
 
-	test("a member of a FAILED bundle → conflict", async () => {
+	test("a subset of a FAILED bundle's members → conflict", async () => {
 		t = await makeFactory();
 		t.control.sharedFile = true;
 		await t.host.seedRepo("me/p", SEED);
@@ -81,7 +87,86 @@ describe("cancelRuns", () => {
 		const err = await t.factory.cancelRuns([a]).catch((e) => e);
 		expect(err).toMatchObject({ code: "conflict" });
 		expect(err.message).toContain(id);
+		expect(err.message).toContain(b);
 		expect((await t.factory.getRun(a)).state).toBe("READY");
+		expect((await t.factory.getBundle(id)).state).toBe("FAILED");
+	});
+
+	test("every member of a live bundle with an ordinary run: the bundle CANCELLED with its PR closed, every run CANCELLED", async () => {
+		t = await makeFactory();
+		await t.host.seedRepo("me/p", SEED);
+		await t.factory.createProject("p", "me/p");
+		const f = t.factory;
+		const a = await start("alpha");
+		const b = await start("beta");
+		await Promise.all([until(f, a, inState("READY")), until(f, b, inState("READY"))]);
+		await f.setSetting({ project: "p" }, "policy.approvals", ["spec"]);
+		const live = await start("gamma");
+		await until(f, live, inState("AWAITING_APPROVAL"));
+		const id = await f.createBundle("p", [a, b]);
+		const v = await untilBundle(f, id, (x) => (x.state === "AWAITING_MERGE" && !!x.pendingAsk) || bundleIn("MERGED", "FAILED", "CANCELLED", "ESCALATED")(x));
+		expect(v.state).toBe("AWAITING_MERGE");
+		const out = await f.as("web").cancelRuns([live, a, b]);
+		expect(out.cancelled.sort()).toEqual([live, a, b].sort());
+		const end = await untilBundle(f, id, bundleIn("CANCELLED", "MERGED", "FAILED"));
+		expect(end.state).toBe("CANCELLED");
+		expect(end.failure?.reason).toBe("cancelled by web");
+		expect(t.host.state().prs.find((p) => p.number === v.delivery!.pr!.number)!.state).toBe("closed");
+		for (const run of [live, a, b]) {
+			const r = await until(f, run, done);
+			expect(r.state, run).toBe("CANCELLED");
+			expect(r.failure?.reason, run).toBe("cancelled by web");
+		}
+	});
+
+	test("every member of a FAILED bundle (with a PR): the bundle CANCELLED, its PR closed, the members CANCELLED", async () => {
+		t = await makeFactory();
+		await t.host.seedRepo("me/p", SEED);
+		await t.factory.createProject("p", "me/p");
+		const f = t.factory;
+		const a = await start("alpha");
+		const b = await start("beta");
+		await Promise.all([until(f, a, inState("READY")), until(f, b, inState("READY"))]);
+		vi.spyOn(GitHub.prototype, "defaultHead").mockRejectedValueOnce(new Error("GitHub is down"));
+		const id = await f.createBundle("p", [a, b]);
+		const v = await untilBundle(f, id, (x) => (x.state === "AWAITING_MERGE" && !!x.pendingAsk) || bundleIn("MERGED", "FAILED", "CANCELLED", "ESCALATED")(x));
+		await f.mergeBundle(id);
+		expect((await untilBundle(f, id, bundleIn("FAILED", "MERGED", "CANCELLED"))).state).toBe("FAILED");
+		expect(await f.cancelRuns([b, a], "bulk")).toEqual({ cancelled: [b, a] });
+		expect((await f.getBundle(id)).state).toBe("CANCELLED");
+		expect(t.host.state().prs.find((p) => p.number === v.delivery!.pr!.number)!.state).toBe("closed");
+		for (const run of [a, b]) {
+			const r = await until(f, run, done);
+			expect(r.state).toBe("CANCELLED");
+			expect(r.failure?.reason).toBe("bulk");
+		}
+	});
+
+	test("kill -9 right after the intent commit: on restart the bundle and every listed run end CANCELLED", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "sf-cancel-runs-"));
+		t = await makeFactory({ storage: "sqlite", dir });
+		await t.host.seedRepo("me/p", SEED);
+		await t.factory.createProject("p", "me/p");
+		const a = await start("alpha");
+		const b = await start("beta");
+		await Promise.all([until(t.factory, a, inState("READY")), until(t.factory, b, inState("READY"))]);
+		await t.factory.setSetting({ project: "p" }, "policy.approvals", ["spec"]);
+		const live = await start("gamma");
+		await until(t.factory, live, inState("AWAITING_APPROVAL"));
+		const id = await t.factory.createBundle("p", [a, b]);
+		const v = await untilBundle(t.factory, id, (x) => (x.state === "AWAITING_MERGE" && !!x.pendingAsk) || bundleIn("MERGED", "FAILED", "CANCELLED", "ESCALATED")(x));
+		expect(v.state).toBe("AWAITING_MERGE");
+		t.factory.haltCancelRunsAfterCommitForTests = true;
+		await t.factory.cancelRuns([live, a, b]);
+		await new Promise((r) => setTimeout(r, 200));
+		expect((await t.factory.getBundle(id)).state).toBe("AWAITING_MERGE"); // nothing after the commit happened
+		expect((await t.factory.getRun(live)).state).toBe("AWAITING_APPROVAL");
+		await t.factory.close();
+		await t.reopen();
+		const f = t.factory;
+		expect((await untilBundle(f, id, bundleIn("CANCELLED", "MERGED", "FAILED"))).state).toBe("CANCELLED");
+		expect(t.host.state().prs.find((p) => p.number === v.delivery!.pr!.number)!.state).toBe("closed");
+		for (const run of [live, a, b]) expect((await until(f, run, done)).state, run).toBe("CANCELLED");
 	});
 
 	test("DISCUSSING and BUILDING runs end CANCELLED with their environments disposed; result, attribution and events", async () => {

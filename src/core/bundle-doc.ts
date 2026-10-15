@@ -105,6 +105,11 @@ export type BundleDocState = {
 	messages?: HumanMessage[];
 	history: { from: BundleState | null; to: BundleState; at: number; round: number }[];
 	cancelReason?: string;
+	/**
+	 * The PR was merged or closed outside the factory (the PR watcher, checkBundlePr): committed before the live task is
+	 * aborted; the abort path (or a resumed task) ends the bundle MERGED or CANCELLED by it and never closes the PR.
+	 */
+	externalEnd?: { how: "merged" | "closed"; at: number; from?: BundleState };
 	/** Disk cleanup done (src/core/cleanup.ts): set when every step of that scope succeeded; deleted by a retry. */
 	cleanedUp?: CleanedUp;
 	failure?: { state: BundleState; reason: string; pendingAsk?: BundlePendingAsk };

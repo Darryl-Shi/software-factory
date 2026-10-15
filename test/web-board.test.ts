@@ -214,20 +214,24 @@ describe("board: select mode and bulk actions", () => {
 	const calls = (w: Win, op: string) => ((w as unknown as { __calls: { op: string; args: unknown[] }[] }).__calls).filter((c) => c.op === op);
 	const selecting = async (w: Win) => { w.document.getElementById("f-select")!.click(); await tick(); };
 
-	test("a checkbox on run cards in every column, none on bundle cards or bundle members; a select-all per column", async () => {
+	test("a checkbox on run cards in every column and on bundle cards (FAILED included), none on bundle members; a select-all per column", async () => {
 		const plan = run("DISCUSSING"), build = run("BUILDING"), ready = run("READY"), legacy = run("AWAITING_CI"), done = run("DELIVERED");
-		const m1 = run("READY", { bundle: "bundle-1" }), m2 = run("READY", { bundle: "bundle-2" }); // m2: its bundle failed (still held), not on the board's bundle list
+		const m1 = run("READY", { bundle: "bundle-1" }), m2 = run("READY", { bundle: "bundle-2" }); // m2: its bundle failed (still held, still on the board)
 		const w = await load([plan, build, ready, legacy, done, m1, m2], [bundle("bundle-1", [{ run: m1.id, title: "m1" }]), bundle("bundle-2", [{ run: m2.id, title: "m2" }], { state: "FAILED" })]);
 		expect(sel(w)).toEqual([]);
 		expect(w.document.querySelector("#board input[data-sel-col]")).toBeNull();
 		expect(bar(w).hidden).toBe(true);
 		await selecting(w);
 		expect(w.document.getElementById("f-select")!.getAttribute("aria-pressed")).toBe("true");
-		expect(sel(w).sort()).toEqual([plan.id, build.id, ready.id, legacy.id, done.id].sort());
+		expect(sel(w).sort()).toEqual([plan.id, build.id, ready.id, legacy.id, done.id, "bundle-1", "bundle-2"].sort());
+		expect(sel(w)).not.toContain(m1.id);
+		expect(sel(w)).not.toContain(m2.id);
 		for (const k of ["planning", "build", "ready", "shipping", "done"]) expect(selCol(w, k), k).not.toBeNull();
 		const shipping = col(w, "shipping");
-		expect(shipping.querySelector('.card[data-bundle="bundle-1"]')!.closest(".sel-wrap")).toBeNull();
-		expect(shipping.querySelector("input[data-sel]")!.getAttribute("data-sel")).toBe(legacy.id);
+		expect(shipping.querySelector('.card[data-bundle="bundle-1"]')!.closest(".sel-wrap")).not.toBeNull();
+		expect(shipping.querySelector('.card[data-bundle="bundle-2"]')!.closest(".sel-wrap")).not.toBeNull();
+		expect([...shipping.querySelectorAll<HTMLInputElement>("input[data-sel]")].map((i) => i.dataset.sel)).toEqual(["bundle-1", "bundle-2", legacy.id]);
+		expect(cardIds(shipping)).toEqual(["bundle-1", "bundle-2", legacy.id]);
 		// the cards keep their order and the test selector still finds them
 		expect(cardIds(col(w, "planning"))).toEqual([plan.id]);
 		// ticking a card selects it; it does not open the run
@@ -353,6 +357,98 @@ describe("board: select mode and bulk actions", () => {
 		w.eval(`__t.ui.runs.set("${l2.id}", { ...__t.ui.runs.get("${l2.id}"), state: "DELIVERED" }); __t.renderBoard();`);
 		expect(bulk(w, "cancel")).toBeNull();
 		expect(bulk(w, "clear")!.textContent).toBe("Clear 1");
+	});
+
+	const pr = (n: number) => ({ delivery: { kind: "pr", url: `https://github.com/o/todo/pull/${n}`, pr: { number: n } } });
+
+	test("Shipping: ticking a bundle card selects all its tickets; counts include members; the confirmation names the bundle", async () => {
+		const m1 = run("READY", { bundle: "bundle-3" }), m2 = run("READY", { bundle: "bundle-3" }), m3 = run("READY", { bundle: "bundle-4" });
+		const plan = run("DISCUSSING"), d1 = run("DELIVERED");
+		const state = new Map<string, Record<string, unknown>>([m1, m2, m3, plan, d1].map((r) => [r.id, r]));
+		const bundles = new Map<string, Record<string, unknown>>([
+			["bundle-3", bundle("bundle-3", [{ run: m1.id, title: "m1" }, { run: m2.id, title: "m2" }], { state: "ESCALATED", ...pr(12) })],
+			["bundle-4", bundle("bundle-4", [{ run: m3.id, title: "m3" }], { state: "FAILED" })],
+		]);
+		const w = await load([...state.values()], [...bundles.values()], {
+			cancelRuns: ([ids]) => {
+				for (const b of bundles.values()) bundles.set(b.id as string, { ...b, state: "CANCELLED" });
+				for (const id of ids as string[]) state.set(id, { ...state.get(id)!, state: "CANCELLED", updatedAt: 9000 });
+				return { cancelled: ids };
+			},
+			getRun: ([id]) => state.get(id as string),
+			getBundle: ([id]) => bundles.get(id as string),
+		});
+		await selecting(w);
+		await check(w, "bundle-3");
+		expect(bar(w).querySelector(".sel-n")!.textContent).toBe("2 selected");
+		expect(col(w, "shipping").querySelector('.card[data-bundle="bundle-3"]')!.closest(".sel-wrap")!.classList.contains("ticked")).toBe(true);
+		expect(bulk(w, "cancel")!.textContent).toBe("Cancel 2");
+		await check(w, plan.id); await check(w, d1.id); await check(w, "bundle-4");
+		// a Planning ticket, a Done ticket and two bundles: Cancel 4 (the live ticket plus the bundles' tickets) and Clear 1
+		expect(bar(w).querySelector(".sel-n")!.textContent).toBe("5 selected");
+		expect(bulk(w, "cancel")!.textContent).toBe("Cancel 4");
+		expect(bulk(w, "clear")!.textContent).toBe("Clear 1");
+		bulk(w, "cancel")!.click(); await tick();
+		expect(bulk(w, "cancel")!.textContent).toBe("Click again to cancel 4 (closes the PR of bundle-3; cancels bundle-4)");
+		expect(calls(w, "cancelRuns")).toEqual([]);
+		bulk(w, "cancel")!.click(); await new Promise((res) => setTimeout(res, 150));
+		expect(calls(w, "cancelRuns")).toHaveLength(1);
+		expect((calls(w, "cancelRuns")[0]!.args[0] as string[]).sort()).toEqual([m1.id, m2.id, m3.id, plan.id].sort());
+		// the acted-on items left the selection; the Done ticket stays for Clear 1
+		expect([...(w.eval("__t.ui.sel") as Set<string>)]).toEqual([d1.id]);
+		expect(bulk(w, "cancel")).toBeNull();
+		expect(bulk(w, "clear")!.textContent).toBe("Clear 1");
+		// the bundles left Shipping; with Show closed the cancelled tickets are in Done, selectable
+		expect(col(w, "shipping").querySelector(".bundle-card")).toBeNull();
+		w.document.getElementById("f-closed")!.click(); await tick();
+		for (const r of [m1, m2, m3]) expect(col(w, "done").querySelector(`input[data-sel="${r.id}"]`), r.id).not.toBeNull();
+	});
+
+	test("one bundle with a PR: 'closes the PR of bundle-N'; several: listed comma-separated", async () => {
+		const a = run("READY", { bundle: "bundle-5" }), b = run("READY", { bundle: "bundle-6" });
+		const w = await load([a, b], [bundle("bundle-5", [{ run: a.id, title: "a" }], pr(5)), bundle("bundle-6", [{ run: b.id, title: "b" }], pr(6))]);
+		await selecting(w);
+		await check(w, "bundle-5");
+		bulk(w, "cancel")!.click(); await tick();
+		expect(bulk(w, "cancel")!.textContent).toBe("Click again to cancel 1 (closes the PR of bundle-5)");
+		w.document.body.click(); await tick();
+		await check(w, "bundle-6");
+		bulk(w, "cancel")!.click(); await tick();
+		expect(bulk(w, "cancel")!.textContent).toBe("Click again to cancel 2 (closes the PRs of bundle-5, bundle-6)");
+	});
+
+	test("the Shipping column's select all covers the bundle cards it shows (filters apply); a refusal changes nothing", async () => {
+		const m1 = run("READY", { bundle: "bundle-7" }), m2 = run("READY", { bundle: "bundle-7" }), legacy = run("AWAITING_CI");
+		const m3 = run("READY", { bundle: "bundle-8", project: "other", repo: "o/other" });
+		const w = await load([m1, m2, legacy, m3], [
+			bundle("bundle-7", [{ run: m1.id, title: "m1" }, { run: m2.id, title: "m2" }], pr(7)),
+			bundle("bundle-8", [{ run: m3.id, title: "m3" }], { project: "other" }),
+		], { cancelRuns: () => { throw { code: "conflict", message: "bundle-7 is missing a member" }; } });
+		await selecting(w);
+		selCol(w, "shipping")!.click(); await tick();
+		expect([...(w.eval("__t.ui.sel") as Set<string>)].sort()).toEqual(["bundle-7", "bundle-8", legacy.id].sort());
+		expect(bar(w).querySelector(".sel-n")!.textContent).toBe("4 selected");
+		expect(selCol(w, "shipping")!.checked).toBe(true);
+		selCol(w, "shipping")!.click(); await tick();
+		expect((w.eval("__t.ui.sel") as Set<string>).size).toBe(0);
+		// the project filter hides bundle-8: select all leaves it out
+		const proj = w.document.getElementById("proj-filter") as HTMLSelectElement;
+		w.eval(`__t.ui.projects = [{ name: "todo", repo: "o/todo" }, { name: "other", repo: "o/other" }]; __t.renderProjectFilter();`);
+		proj.value = "todo"; proj.dispatchEvent(new w.Event("change")); await tick();
+		selCol(w, "shipping")!.click(); await tick();
+		expect([...(w.eval("__t.ui.sel") as Set<string>)].sort()).toEqual(["bundle-7", legacy.id].sort());
+		// a refused call: the error toast, the selection unchanged
+		bulk(w, "cancel")!.click(); await tick();
+		bulk(w, "cancel")!.click(); await new Promise((res) => setTimeout(res, 50));
+		expect(calls(w, "cancelRuns")).toHaveLength(1);
+		expect((calls(w, "cancelRuns")[0]!.args[0] as string[]).sort()).toEqual([m1.id, m2.id, legacy.id].sort());
+		expect(w.document.querySelector(".toast.error")!.textContent).toContain("bundle-7");
+		expect([...(w.eval("__t.ui.sel") as Set<string>)].sort()).toEqual(["bundle-7", legacy.id].sort());
+		expect(bulk(w, "cancel")!.textContent).toBe("Cancel 3");
+		// leaving select mode clears the selection and drops the bundle checkboxes
+		await selecting(w);
+		expect((w.eval("__t.ui.sel") as Set<string>).size).toBe(0);
+		expect(col(w, "shipping").querySelector(".sel-wrap")).toBeNull();
 	});
 
 	test("Ready: in select mode no Ship N tickets and no ship ticks; leaving select mode restores shipping", async () => {
