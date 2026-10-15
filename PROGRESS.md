@@ -301,3 +301,22 @@ Round 2 (review findings):
 - F3 (not fixed): a stopped subagent's helper spend never reaches the builder's tools bucket (pre-existing accounting
   gap: no cost record has it either), so the live total drops back by it. Fixing it means counting helper
   Conversations in cost records directly — a change to cost records the spec keeps as they are.
+
+## PRs merged/closed outside the factory + bulk cancel of whole bundles (run run-mv99uglw-4rys)
+
+- [x] Core: `externalEnd` marker on BundleDoc; PR watcher (`watchPrs`, `actOnPr`; `prWatchMs`, default ciPollMs else
+      60 s; startup check after `finishIntents`); `checkBundlePr` (+CORE_OPS); `endFailedBundle` shared by cancelBundle
+      (FAILED) and the watcher; `cancelRuns` takes whole bundles (`cancelMarkedBundles`, then runs).
+- [x] Bundle task: phase wrapper ends by the marker; abort path ends by the marker without closing the PR.
+- [x] UI (helper): bundle checkboxes in select mode, counts, confirm text; Check PR now in the bundle view.
+- [x] Tests: test/bundle-pr-watch.test.ts, test/cancel-runs.test.ts, test/web.test.ts (409), jsdom web-board + web-bundle-pr.
+- [x] Docs: spec.md, README, architecture.md, AGENTS.md. Dry run 119/119.
+
+Decisions:
+- The watcher skips AWAITING_CI/AWAITING_MERGE (they poll in-task); checkBundlePr acts in every state (marker + abort).
+- Startup also aborts a live bundle whose marker is committed (the resumed phase would end it the same way anyway).
+- A bundle whose cancelReason is set but which failed before the abort landed is cancelled as a FAILED bundle.
+- releaseMembers no longer adds "back in Ready" to a run that is already terminal.
+- Existing tests asserting that cancelRuns refuses any bundle member were changed to partial bundles (the spec changed
+  that behaviour); whole-bundle cases added.
+- Full suite: only the 8 known bubblewrap sandbox tests fail (host limitation, as on the base).
