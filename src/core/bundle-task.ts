@@ -54,6 +54,7 @@ export function createBundleTask(svc: CoreServices) {
 				d.state = next;
 			}
 			delete d.driving;
+			delete d.interrupted;
 			d.updatedAt = svc.now();
 			return { status: "running", checkpoint: { phase: next, n: current.state.checkpoint.n + 1 } };
 		}, c);
@@ -795,6 +796,7 @@ export function createBundleTask(svc: CoreServices) {
 					const doc = await docIn(tx, id);
 					await toFinal(tx, doc, "CANCELLED", doc.cancelReason ?? "cancelled");
 					delete doc.driving;
+					delete doc.interrupted;
 					doc.updatedAt = svc.now();
 					return undefined;
 				}, c);

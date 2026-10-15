@@ -265,6 +265,12 @@ export function createDiscussionTask(svc: DiscussionServices) {
 		const usageOf = async () => sumUsage((await rt.snapshot(UsageDoc, conversationId as never, c)) as any);
 		const before = await rt.memo(`${turn.key}:usage0`, await usageOf(), c);
 		const startedAt = await rt.memo(`${turn.key}:t0`, svc.now(), c);
+		if (!d.turn?.usage0)
+			await rt.commit(async (tx) => {
+				const doc = (await tx.doc(DiscussionDoc, d.id, null as never)) as unknown as DiscussionDocState;
+				if (doc.turn?.key === turn.key && !doc.turn.usage0) doc.turn.usage0 = { usd: before.usd, totalTokens: before.totalTokens };
+				return undefined;
+			}, c);
 		const outcome = turn.kind === "draft" ? await draftTurn(rt, c, d, handle) : await sayTurn(rt, c, d, handle);
 		const after = await usageOf();
 		await rt.commit(async (tx) => {

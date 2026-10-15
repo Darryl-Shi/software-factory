@@ -6,6 +6,8 @@ import { validateQa, validateResponses, validateReview, validateTickets } from "
 import type { Role } from "./types.ts";
 
 export type BridgeTool = "ask_human" | "submit_spec" | "report_done" | "submit_review" | "submit_qa" | "submit_tickets";
+/** Every bridge tool: a call to one can't be stopped (the core waits for it). */
+export const BRIDGE_TOOLS: readonly BridgeTool[] = ["ask_human", "submit_spec", "report_done", "submit_review", "submit_qa", "submit_tickets"];
 
 export type BridgeState = {
 	runId?: string;

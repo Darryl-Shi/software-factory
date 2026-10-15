@@ -13,6 +13,7 @@ import {
 	createRegistry,
 	defineExtension,
 	Harness,
+	LiveDoc,
 	MemoryStorage,
 	type Registry,
 	type Submission,
@@ -26,7 +27,7 @@ import { type Sandbox, sandboxProblems } from "../sandbox/sandbox.ts";
 import { bundleOwner, type CleanedUp, Cleaner, discussionOwner, type Item, type Owner, runOwner, type SweepSource, workdirOf } from "./cleanup.ts";
 import { type CapturedOwner, maxIndexSeq, nextIndexId, type ProjectDeletion, ProjectDeletions } from "./project-deletion.ts";
 import { clonePath } from "../github/github.ts";
-import { Bridge, BridgeDoc, bridgeToolsNotFor, EnvDoc } from "./bridge.ts";
+import { Bridge, BRIDGE_TOOLS, BridgeDoc, bridgeToolsNotFor, EnvDoc } from "./bridge.ts";
 import { DiscussionDoc, type DiscussionDocState, DiscussionIndex, deriveTitle, toDiscussionView } from "./discussion-doc.ts";
 import { createDiscussionTask, draftInstructions, takeCheckoutNote } from "./discussion-task.ts";
 import { humanFindings } from "./findings.ts";
@@ -37,7 +38,7 @@ import { isLegacyDelivery, RunDoc, type RunDocState, RunIndex, specPathOf, toVie
 import { RunConfigDoc } from "./run-config.ts";
 import { createRunTask } from "./run-task.ts";
 import { assertNoLegacySections, ConfigStore, coreSchema, expandHome, hashConfig, isObj, type Obj, parseDuration, THINKING_LEVELS } from "./settings.ts";
-import { addCost, sumUsage, type UsageSum } from "./usage.ts";
+import { addCost, NO_LIVE_COST, sumUsage, unrecorded, type UsageSum } from "./usage.ts";
 import {
 	type AskId,
 	type AskResponse,
@@ -63,6 +64,8 @@ import {
 	type Gate,
 	type HumanFinding,
 	type HumanMessage,
+	type Interrupted,
+	type LiveCost,
 	type LiveItem,
 	type ModelInfo,
 	type Project,
@@ -134,6 +137,11 @@ export class Factory implements FactoryCore {
 	/** The discussant Conversation of each discussion (keys are String(conversationId)). */
 	private discussionConvs = new Map<string, DiscussionId>();
 	private convThrottle = new Map<string, NodeJS.Timeout>();
+	/** `cost.updated`: per owner id, the 2 s throttle (and whether another change came during it) and the last total sent. */
+	private costThrottle = new Map<string, { timer?: NodeJS.Timeout; dirty: boolean }>();
+	private lastCost = new Map<string, string>();
+	/** Stops of tool calls that were pending without a task yet (per Conversation id): aborted once their task exists. */
+	private pendingStops = new Map<string, Set<string>>();
 	private ctx: Context = BACKGROUND_CONTEXT;
 	private now: () => number;
 	private log: (msg: string) => void;
@@ -268,6 +276,11 @@ export class Factory implements FactoryCore {
 				} else if (ch.type === "entry") {
 					this.touchConversation(ch.value.conversationId as unknown as string);
 				} else if (ch.type === "document" && ch.record.kind === "pi.live" && ch.conversationId) {
+					if (this.pendingStops.has(String(ch.conversationId))) {
+						const cid = String(ch.conversationId);
+						const v = ch.value as { tools?: { callId: string; taskId?: unknown; status: string }[] } | undefined;
+						setImmediate(() => this.applyPendingStops(cid, v));
+					}
 					this.touchConversation(ch.conversationId as unknown as string);
 				}
 			}
@@ -419,6 +432,8 @@ export class Factory implements FactoryCore {
 
 	async close(): Promise<void> {
 		for (const t of this.convThrottle.values()) clearTimeout(t);
+		for (const t of this.costThrottle.values()) if (t.timer) clearTimeout(t.timer);
+		this.costThrottle.clear();
 		await this.harness.close(this.ctx);
 	}
 
@@ -551,19 +566,128 @@ export class Factory implements FactoryCore {
 				const disc = this.discussions.get(this.discussionConvs.get(String(id)) ?? "");
 				if (disc) {
 					this.emit({ type: "discussion.conversation.updated", discussion: disc.id, conversationId: id }, { project: disc.project, discussion: disc.id });
+					this.costTick("discussion", disc.id);
 					return;
 				}
-				const m = this.convIndex.get(id);
+				const m = this.convIndex.get(id) ?? this.convIndex.get(String(id));
 				if (!m) return;
 				const bundle = this.bundles.get(m.run);
 				if (bundle) {
 					this.emit({ type: "bundle.conversation.updated", bundle: bundle.id, conversationId: id, role: m.role }, { project: bundle.project, bundle: bundle.id });
+					this.costTick("bundle", bundle.id);
 					return;
 				}
 				const run = this.cache.get(m.run);
-				if (run) this.emit({ type: "conversation.updated", run: m.run, conversationId: id, role: m.role }, { project: run.project, run: run.id });
+				if (run) {
+					this.emit({ type: "conversation.updated", run: m.run, conversationId: id, role: m.role }, { project: run.project, run: run.id });
+					this.costTick("run", run.id);
+				}
 			}, 150),
 		);
+	}
+
+	// ------------------------------------------------------------------ live cost (docs/specs/run-mv8t6vsz-pmy8.md §4)
+	private conversationId(x: string | number): string {
+		return (/^\d+$/.test(String(x)) ? Number(x) : x) as unknown as string;
+	}
+
+	private async usageNow(conversationId: string): Promise<UsageSum> {
+		return sumUsage((await this.harness.snapshot(UsageDoc, this.conversationId(conversationId) as never, this.ctx)) as any);
+	}
+
+	private async liveState(conversationId: string): Promise<{ run?: unknown; generation?: unknown; tools?: { callId: string; name: string; taskId?: unknown; status: string; details?: any }[] } | undefined> {
+		return (await this.harness.snapshot(LiveDoc, this.conversationId(conversationId) as never, this.ctx)) as any;
+	}
+
+	/**
+	 * The usage of a run's or bundle's Conversations that no cost record contains yet: per Conversation, its usage now
+	 * minus the larger of what the Document recorded and what the current turn started from; a builder's running
+	 * helpers count in full (their spend reaches the builder's own usage only when their subagent call returns).
+	 * Conversations the core never accounted (none recorded, no turn started since this existed) are left out.
+	 */
+	private async liveCostOf(d: RunDocState | BundleDocState): Promise<LiveCost> {
+		const terminal = d.id.startsWith("bundle-") ? BUNDLE_TERMINAL_STATES.includes(d.state as BundleState) : TERMINAL_STATES.includes(d.state as RunState);
+		if (terminal) return NO_LIVE_COST;
+		const c = d.conversations as { architect?: string; builder?: string; integrator?: string; reviewers: { id: string }[]; qa?: { id: string }[] };
+		const convs: [Role, string][] = [
+			...(c.architect !== undefined ? [["architect", c.architect] as [Role, string]] : []),
+			...(c.builder !== undefined ? [["builder", c.builder] as [Role, string]] : []),
+			...(c.integrator !== undefined ? [["integrator", c.integrator] as [Role, string]] : []),
+			...c.reviewers.map((r) => ["reviewer", r.id] as [Role, string]),
+			...(c.qa ?? []).map((r) => ["qa", r.id] as [Role, string]),
+		];
+		const byRole: LiveCost["byRole"] = [];
+		for (const [role, cid] of convs) {
+			const key = String(cid);
+			const recorded = d.usage?.[key];
+			const base = d.usageBase?.[key];
+			if (!recorded && !base) continue;
+			const part = unrecorded(await this.usageNow(cid), recorded, base);
+			if (role === "builder") {
+				const live = await this.liveState(cid);
+				for (const slot of live?.tools ?? []) {
+					const child = slot.details?.conversationId;
+					if (slot.status === "done" || (typeof child !== "string" && typeof child !== "number")) continue;
+					const u = await this.usageNow(child as string);
+					part.usd += u.usd;
+					part.totalTokens += u.totalTokens;
+				}
+			}
+			if (part.usd > 0 || part.totalTokens > 0) byRole.push({ role, conversationId: key, usd: part.usd, totalTokens: part.totalTokens });
+		}
+		return { usd: byRole.reduce((s, x) => s + x.usd, 0), totalTokens: byRole.reduce((s, x) => s + x.totalTokens, 0), byRole };
+	}
+
+	/** A discussion's recorded cost (turns that ended) and its running turn's unrecorded usage. */
+	private async discussionCost(d: DiscussionDocState): Promise<{ cost: { usd: number; totalTokens: number }; live: { usd: number; totalTokens: number } }> {
+		if (d.conversationId === undefined) return { cost: { usd: 0, totalTokens: 0 }, live: { usd: 0, totalTokens: 0 } };
+		const now = await this.usageNow(d.conversationId);
+		const live = d.turn?.usage0 ? unrecorded(now, undefined, d.turn.usage0) : { usd: 0, totalTokens: 0 };
+		return { cost: { usd: Math.max(0, now.usd - live.usd), totalTokens: Math.max(0, now.totalTokens - live.totalTokens) }, live };
+	}
+
+	/** An owner's total (recorded plus live), as `cost.updated` carries it. */
+	private async ownerTotal(kind: "run" | "bundle" | "discussion", id: string): Promise<{ project: string; usd: number; totalTokens: number } | undefined> {
+		if (kind === "discussion") {
+			const d = this.discussions.get(id);
+			if (!d) return undefined;
+			const { cost, live } = await this.discussionCost(d);
+			return { project: d.project, usd: cost.usd + live.usd, totalTokens: cost.totalTokens + live.totalTokens };
+		}
+		const d = kind === "run" ? this.cache.get(id) : this.bundles.get(id);
+		if (!d) return undefined;
+		const live = await this.liveCostOf(d);
+		return { project: d.project, usd: d.cost.reduce((s, x) => s + (x.usd ?? 0), 0) + live.usd, totalTokens: d.cost.reduce((s, x) => s + (x.totalTokens ?? 0), 0) + live.totalTokens };
+	}
+
+	/** An owner's Conversation changed: send `cost.updated` if its total changed (at most once per 2 s per owner). */
+	private costTick(kind: "run" | "bundle" | "discussion", id: string) {
+		const held = this.costThrottle.get(id);
+		if (held) {
+			held.dirty = true;
+			return;
+		}
+		const slot: { timer?: NodeJS.Timeout; dirty: boolean } = { dirty: false };
+		this.costThrottle.set(id, slot);
+		void this.ownerTotal(kind, id)
+			.then((t) => {
+				if (!t || this.purged.has(id)) return;
+				const sig = `${t.usd.toFixed(9)}|${t.totalTokens}`;
+				if (this.lastCost.get(id) === sig) return;
+				const first = !this.lastCost.has(id);
+				this.lastCost.set(id, sig);
+				// the first look at an owner after a start only learns its total, unless it is working now
+				if (first && t.usd === 0 && t.totalTokens === 0) return;
+				this.emit({ type: "cost.updated", project: t.project, [kind]: id, usd: t.usd, totalTokens: t.totalTokens } as FactoryEvent, { project: t.project, [kind]: id });
+			})
+			.catch((e) => this.log(`cost update for ${id}: ${e instanceof Error ? e.message : e}`))
+			.finally(() => {
+				if (this.costThrottle.get(id) !== slot) return;
+				slot.timer = setTimeout(() => {
+					this.costThrottle.delete(id);
+					if (slot.dirty) this.costTick(kind, id);
+				}, 2000);
+			});
 	}
 
 	/** `scope`: whose event it is. A `run`, `discussion` or `bundle` filter only matches events of that one. */
@@ -1013,7 +1137,8 @@ export class Factory implements FactoryCore {
 	}
 
 	async getRun(run: RunId): Promise<RunView> {
-		return toView(await this.doc(run));
+		const d = await this.doc(run);
+		return toView(d, await this.liveCostOf(d));
 	}
 
 	/** Internal document (tests, diagnostics). */
@@ -1031,12 +1156,18 @@ export class Factory implements FactoryCore {
 			if (filter?.project && d.project !== filter.project) continue;
 			if (filter?.states && !filter.states.includes(d.state)) continue;
 			if (d.cleared && !filter?.includeCleared) continue;
-			out.push(toView(d));
+			out.push(toView(d, await this.liveCostOf(d)));
 		}
 		return out;
 	}
 
 	async getConversation(run: RunId, conversationIdIn: string | number): Promise<TranscriptView> {
+		const conversationId = await this.runConversation(run, conversationIdIn);
+		return this.transcript(conversationId, this.convIndex.get(conversationId)?.role);
+	}
+
+	/** A Conversation of the run (its roles, QA agents and the builder's helpers), as the harness's id; else `not_found`. */
+	private async runConversation(run: RunId, conversationIdIn: string | number): Promise<string> {
 		const d = await this.doc(run);
 		// Ids may come back as strings in the JSON from the web UI; the harness's ids are numeric.
 		const conversationId = (/^\d+$/.test(String(conversationIdIn)) ? Number(conversationIdIn) : conversationIdIn) as unknown as string;
@@ -1048,7 +1179,7 @@ export class Factory implements FactoryCore {
 			const env = await this.harness.snapshot(EnvDoc, conversationId as never, this.ctx);
 			if (env?.runId !== run) throw new FactoryError("not_found", `conversation ${conversationId} does not belong to run ${run}`);
 		}
-		return this.transcript(conversationId, this.convIndex.get(conversationId)?.role);
+		return conversationId;
 	}
 
 	/** A Conversation's transcript as interfaces show it: factory input, human messages, replies, tool calls and results. */
@@ -1065,6 +1196,8 @@ export class Factory implements FactoryCore {
 			cursor = (page as any).next ?? (page as any).cursor;
 			if (!(page as any).hasMore && !(page as any).next) break;
 		} while (cursor && entries.length < 5000);
+		/** When the response that made each call ended (for results without their own duration: a stopped call). */
+		const calledAt = new Map<string, number>();
 		for (const e of entries) {
 			const m = e.model?.[0] as any;
 			if (!m) continue;
@@ -1077,6 +1210,7 @@ export class Factory implements FactoryCore {
 				);
 			}
 			else if (m.role === "assistant") {
+				for (const p of m.content) if (p.type === "toolCall" && typeof m.timestamp === "number") calledAt.set(p.id, m.timestamp);
 				items.push({
 					entryId: e.id,
 					kind: e.kind,
@@ -1087,11 +1221,20 @@ export class Factory implements FactoryCore {
 			} else if (m.role === "toolResult") {
 				const child = (m.details as any)?.conversationId;
 				if (typeof child === "string" || typeof child === "number") helpers.add(child as unknown as string);
+				const t0 = calledAt.get(m.toolCallId);
+				const durationMs = typeof m.durationMs === "number" ? m.durationMs : t0 !== undefined && typeof m.timestamp === "number" ? Math.max(0, m.timestamp - t0) : undefined;
 				items.push({
 					entryId: e.id,
 					kind: e.kind,
 					role: "tool",
-					toolResult: { callId: m.toolCallId, name: m.toolName, isError: m.isError, text: m.content.map((p: any) => p.text ?? "").join(""), ...(m.details ? { details: m.details } : {}) },
+					toolResult: {
+						callId: m.toolCallId,
+						name: m.toolName,
+						isError: m.isError,
+						text: m.content.map((p: any) => p.text ?? "").join(""),
+						...(m.details ? { details: m.details } : {}),
+						...(durationMs !== undefined ? { durationMs } : {}),
+					},
 				});
 			}
 		}
@@ -1109,7 +1252,14 @@ export class Factory implements FactoryCore {
 			if (typeof child === "string" || typeof child === "number") helpers.add(child as unknown as string);
 		}
 		const busy = !!live && (live.generation !== undefined || Object.keys(live.tools ?? {}).length > 0);
-		return { conversationId, ...(role ? { role } : {}), items, helpers: [...helpers], busy, queued };
+		const running: TranscriptView["running"] = [];
+		for (const slot of (live?.tools ?? []) as { callId: string; name: string; taskId?: unknown; status: string }[]) {
+			if (slot.status !== "running" && slot.status !== "pending") continue;
+			const task = slot.taskId !== undefined ? await this.harness.getTask(slot.taskId as never, this.ctx).catch(() => undefined) : undefined;
+			const startedAt = (task as { startedAt?: number } | undefined)?.startedAt;
+			running.push({ callId: slot.callId, name: slot.name, status: slot.status, ...(startedAt !== undefined ? { startedAt } : {}) });
+		}
+		return { conversationId, ...(role ? { role } : {}), items, helpers: [...helpers], busy, queued, running, now: Date.now() };
 	}
 
 	async cancelRun(run: RunId, reason?: string): Promise<void> {
@@ -1188,6 +1338,7 @@ export class Factory implements FactoryCore {
 			delete doc.failure;
 			delete doc.cancelReason;
 			delete doc.driving;
+			delete doc.interrupted;
 			doc.counters.attempt = (doc.counters.attempt ?? 0) + 1;
 			doc.notices.push({ at: this.now(), level: "info", text: `Retried by ${by}; resuming at ${to}` });
 			const taskId = await tx.createTask(this.runTask, { runId: run, start: to }, { ownership: { kind: "conversation" }, background: true });
@@ -1308,11 +1459,14 @@ export class Factory implements FactoryCore {
 			if (!allowed.includes(target.role)) throw new FactoryError("conflict", `messages to the ${target.role} are turned off for this run (policy.messages)`);
 			d.counters.msgSeq = (d.counters.msgSeq ?? 0) + 1;
 			msg = { id: `${d.id}-msg${d.counters.msgSeq}`, text: text.trim(), by, to: target.role, at: this.now() };
+			this.resumeWith(d, msg, target.conversationId);
 			// (assign, then push through the document: a push onto the assigned array itself would not be recorded)
 			if (!d.messages) d.messages = [];
 			d.messages.push(msg);
 			d.updatedAt = this.now();
 		}, this.ctx);
+		// A message to a paused agent resumes its turn: the run Task submits it (as `msg.resume`) as the turn's next input.
+		if (msg.resume) return { message: msg.id, to: msg.to, conversationId: msg.conversationId! };
 		// Re-read after the commit: if the core started the role's turn meanwhile, deliver now (request ids make a
 		// second delivery by the run task a no-op).
 		const d = await this.doc(run);
@@ -1350,6 +1504,138 @@ export class Factory implements FactoryCore {
 			const doc = (await tx.doc(Doc as typeof RunDoc, run, null as never)) as unknown as RunDocState;
 			if (doc?.id) addCost(doc, role, conversationId, before, after, this.now() - started, { trigger: "message" });
 		}, this.ctx);
+	}
+
+	/**
+	 * Inside a message's commit: when the message goes to the agent the human paused, it becomes the paused turn's next
+	 * input (request id `<key>:resume<n>`, which the Task submits) and the pause ends.
+	 */
+	private resumeWith(d: { interrupted?: Interrupted; messages?: HumanMessage[] }, msg: HumanMessage, conversationId: string | undefined) {
+		const p = d.interrupted;
+		if (!p || conversationId === undefined || String(p.conversationId) !== String(conversationId)) return;
+		const n = (d.messages ?? []).filter((m) => m.resume?.startsWith(`${p.key}:resume`)).length + 1;
+		msg.resume = `${p.key}:resume${n}`;
+		msg.conversationId = String(conversationId);
+		delete d.interrupted;
+	}
+
+	// ------------------------------------------------------------------ interrupts and stopping tool calls (§3, §2)
+	async interruptAgent(run: RunId): Promise<void> {
+		const by = this.by;
+		const d = await this.doc(run);
+		if (TERMINAL_STATES.includes(d.state)) throw new FactoryError("conflict", `run ${run} is ${d.state}`);
+		const held = this.activeBundleOf(d);
+		if (held) throw new FactoryError("conflict", `run ${run} is in ${held}; interrupt the bundle's agent instead`);
+		const target = messageTarget(d);
+		const allowed = (d.pinned.config.policy?.messages ?? DEFAULT_MESSAGE_ROLES) as Role[];
+		if (!allowed.includes(target.role))
+			throw new FactoryError("conflict", `the ${target.role} can't be interrupted: messages to it are turned off for this run (policy.messages), and only a message continues it`);
+		await this.interrupt("run", RunDoc, d, target, ["DISCUSSING", "BUILDING", "REVIEWING"], by, (x) => messageTarget(x as RunDocState));
+	}
+
+	async interruptBundleAgent(id: BundleId): Promise<void> {
+		const by = this.by;
+		const d = await this.bundleDoc(id);
+		if (BUNDLE_TERMINAL_STATES.includes(d.state)) throw new FactoryError("conflict", `bundle ${id} is ${d.state}`);
+		const target = bundleMessageTarget(d);
+		// As messageBundle: the integrator always takes messages; the reviewer only when policy.messages lists it.
+		const allowed = (d.pinned.config.policy?.messages ?? DEFAULT_MESSAGE_ROLES) as Role[];
+		if (target.role === "reviewer" && !allowed.includes("reviewer"))
+			throw new FactoryError("conflict", `the reviewer can't be interrupted: messages to it are turned off for this project (policy.messages), and only a message continues it`);
+		await this.interrupt("bundle", BundleDoc, d, target, ["INTEGRATING", "FIXING", "REVIEWING"], by, (x) => bundleMessageTarget(x as BundleDocState));
+	}
+
+	/**
+	 * Interrupt the agent `target`: when the core drives it, one commit records the pause (`interrupted`) and the notice,
+	 * then its Conversation is aborted (the Task waits for the next message instead of failing); otherwise only the reply
+	 * in progress is aborted.
+	 */
+	private async interrupt(
+		noun: "run" | "bundle",
+		Doc: unknown,
+		d: RunDocState | BundleDocState,
+		target: { role: Role; conversationId?: string },
+		driven: string[],
+		by: string,
+		targetOf: (d: RunDocState | BundleDocState) => { role: Role; conversationId?: string },
+	): Promise<void> {
+		const Role = target.role.charAt(0).toUpperCase() + target.role.slice(1);
+		if (d.interrupted) throw new FactoryError("conflict", `${Role} is paused already; send a message to continue`);
+		if (target.conversationId === undefined) throw new FactoryError("conflict", `${target.role} is not working`);
+		const cid = target.conversationId;
+		const live = await this.liveState(cid);
+		const busy = !!live && (live.generation !== undefined || (live.tools?.length ?? 0) > 0 || live.run !== undefined);
+		if (!busy) throw new FactoryError("conflict", `${target.role} is not working`);
+		const terminal = noun === "run" ? (s: string) => TERMINAL_STATES.includes(s as RunState) : (s: string) => BUNDLE_TERMINAL_STATES.includes(s as BundleState);
+		let paused = false;
+		await this.root.commit(async (tx) => {
+			const doc = (await tx.doc(Doc as typeof RunDoc, d.id, null as never)) as unknown as RunDocState | BundleDocState;
+			if (terminal(doc.state)) throw new FactoryError("conflict", `${noun} ${d.id} is ${doc.state}`);
+			const now = targetOf(doc);
+			if (String(now.conversationId) !== String(cid)) throw new FactoryError("conflict", `${noun} ${d.id} moved on; ${target.role} is not working`);
+			if (doc.interrupted) throw new FactoryError("conflict", `${Role} is paused already; send a message to continue`);
+			// Core-driven: the Task is waiting for this agent's bridge tool in this state.
+			paused = driven.includes(doc.state) && doc.driving !== undefined && String(doc.driving.conversationId) === String(cid);
+			if (paused) doc.interrupted = { role: target.role, conversationId: String(cid), key: doc.driving!.key, at: this.now(), by };
+			doc.notices.push({ at: this.now(), level: "info", text: `${Role} interrupted by you; send a message to continue` });
+			doc.updatedAt = this.now();
+		}, this.ctx);
+		this.log(`${noun} ${d.id}: ${by} interrupted the ${target.role} (conversation ${cid})${paused ? "; paused until the next message" : ""}`);
+		const conv = await this.harness.conversation(this.conversationId(cid) as never, this.ctx);
+		// The abort resolves once the Conversation is idle; the call does not wait longer than 10 s for it.
+		const aborting = conv?.abort(this.ctx).catch((e) => this.log(`${noun} ${d.id}: interrupting the ${target.role} failed: ${e instanceof Error ? e.message : e}`));
+		let timer: NodeJS.Timeout | undefined;
+		await Promise.race([aborting, new Promise((r) => (timer = setTimeout(r, 10_000)))]);
+		clearTimeout(timer);
+	}
+
+	async stopToolCall(target: { run?: RunId; bundle?: BundleId; discussion?: DiscussionId; conversationId: string; callId: string }): Promise<void> {
+		const by = this.by;
+		if (!target || typeof target !== "object") throw new FactoryError("invalid", "stopToolCall needs { run | bundle | discussion, conversationId, callId }");
+		const owners = (["run", "bundle", "discussion"] as const).filter((k) => target[k] !== undefined && target[k] !== null);
+		if (owners.length !== 1) throw new FactoryError("invalid", "give exactly one of run, bundle or discussion");
+		const kind = owners[0]!;
+		const ownerId = target[kind]!;
+		if (typeof ownerId !== "string" || !ownerId) throw new FactoryError("invalid", `${kind} must be an id`);
+		if ((typeof target.conversationId !== "string" && typeof target.conversationId !== "number") || String(target.conversationId) === "")
+			throw new FactoryError("invalid", "conversationId is required");
+		if (typeof target.callId !== "string" || !target.callId) throw new FactoryError("invalid", "callId is required");
+		let cid: string;
+		if (kind === "run") cid = await this.runConversation(ownerId, target.conversationId);
+		else if (kind === "bundle") cid = await this.bundleConversation(ownerId, target.conversationId);
+		else {
+			const d = await this.discussionDoc(ownerId);
+			if (d.conversationId === undefined || String(d.conversationId) !== String(target.conversationId))
+				throw new FactoryError("not_found", `conversation ${target.conversationId} does not belong to discussion ${ownerId}`);
+			cid = d.conversationId;
+		}
+		const live = await this.liveState(cid);
+		const slot = (live?.tools ?? []).find((s) => s.callId === target.callId);
+		if (!slot || (slot.status !== "running" && slot.status !== "pending")) throw new FactoryError("conflict", `tool call ${target.callId} is not running`);
+		if ((BRIDGE_TOOLS as readonly string[]).includes(slot.name)) throw new FactoryError("conflict", `${slot.name} can't be stopped: the factory is waiting for it`);
+		if (slot.taskId !== undefined) await this.harness.abortTask(slot.taskId as never, this.ctx);
+		else {
+			// Not started yet (a sequential round): aborted as soon as its task exists.
+			const set = this.pendingStops.get(String(cid)) ?? new Set<string>();
+			set.add(slot.callId);
+			this.pendingStops.set(String(cid), set);
+		}
+		this.log(`${kind} ${ownerId}: ${by} stopped ${slot.name} (${slot.callId}) in conversation ${cid}`);
+	}
+
+	/** Abort the pending stopped calls of a Conversation whose task now exists; forget those done or gone. */
+	private applyPendingStops(cid: string, live: { tools?: { callId: string; taskId?: unknown; status: string }[] } | undefined) {
+		const set = this.pendingStops.get(cid);
+		if (!set) return;
+		for (const callId of [...set]) {
+			const slot = live?.tools?.find((s) => s.callId === callId);
+			if (!slot || slot.status === "done") set.delete(callId);
+			else if (slot.taskId !== undefined) {
+				set.delete(callId);
+				void this.harness.abortTask(slot.taskId as never, this.ctx).catch((e) => this.log(`stopping ${callId}: ${e instanceof Error ? e.message : e}`));
+			}
+		}
+		if (!set.size) this.pendingStops.delete(cid);
 	}
 
 	async getScreenshot(run: RunId, id: string): Promise<{ mime: string; bytes: Uint8Array }> {
@@ -1451,7 +1737,8 @@ export class Factory implements FactoryCore {
 	}
 
 	async getBundle(id: BundleId): Promise<BundleView> {
-		return toBundleView(await this.bundleDoc(id));
+		const d = await this.bundleDoc(id);
+		return toBundleView(d, await this.liveCostOf(d));
 	}
 
 	/** Internal document (tests, diagnostics). */
@@ -1467,12 +1754,18 @@ export class Factory implements FactoryCore {
 			const d = await this.bundleDoc(id);
 			if (filter?.project && d.project !== filter.project) continue;
 			if (filter?.states && !filter.states.includes(d.state)) continue;
-			out.push(toBundleView(d));
+			out.push(toBundleView(d, await this.liveCostOf(d)));
 		}
 		return out;
 	}
 
 	async getBundleConversation(id: BundleId, conversationIdIn: string | number): Promise<TranscriptView> {
+		const conversationId = await this.bundleConversation(id, conversationIdIn);
+		return this.transcript(conversationId, this.convIndex.get(conversationId)?.role);
+	}
+
+	/** A Conversation of the bundle (integrator, reviewers, QA agents), as the harness's id; else `not_found`. */
+	private async bundleConversation(id: BundleId, conversationIdIn: string | number): Promise<string> {
 		const d = await this.bundleDoc(id);
 		const conversationId = (/^\d+$/.test(String(conversationIdIn)) ? Number(conversationIdIn) : conversationIdIn) as unknown as string;
 		const known = new Set([d.conversations.integrator, ...d.conversations.reviewers.map((r) => r.id), ...(d.conversations.qa ?? []).map((r) => r.id)].filter((x) => x !== undefined).map(String));
@@ -1480,7 +1773,7 @@ export class Factory implements FactoryCore {
 			const env = await this.harness.snapshot(EnvDoc, conversationId as never, this.ctx);
 			if (env?.runId !== id) throw new FactoryError("not_found", `conversation ${conversationId} does not belong to bundle ${id}`);
 		}
-		return this.transcript(conversationId, this.convIndex.get(conversationId)?.role);
+		return conversationId;
 	}
 
 	/** Answer a bundle's pending ask (one commit; `check` refuses with a reason). */
@@ -1594,6 +1887,7 @@ export class Factory implements FactoryCore {
 			if (f.pendingAsk) doc.pendingAsk = f.pendingAsk;
 			delete doc.failure;
 			delete doc.driving;
+			delete doc.interrupted;
 			doc.counters.attempt = (doc.counters.attempt ?? 0) + 1;
 			doc.notices.push({ at: this.now(), level: "info", text: `Retried by ${by}; resuming at ${to}` });
 			doc.taskId = (await tx.createTask(this.bundleTask, { bundleId: id, start: to }, { ownership: { kind: "conversation" }, background: true })) as unknown as string;
@@ -1614,10 +1908,12 @@ export class Factory implements FactoryCore {
 			if (target.role === "reviewer" && !allowed.includes("reviewer")) throw new FactoryError("conflict", `messages to the reviewer are turned off for this project (policy.messages); ${id} is being reviewed`);
 			d.counters.msgSeq = (d.counters.msgSeq ?? 0) + 1;
 			msg = { id: `${id}-msg${d.counters.msgSeq}`, text: text.trim(), by, to: target.role, at: this.now() };
+			this.resumeWith(d, msg, target.conversationId);
 			if (!d.messages) d.messages = [];
 			d.messages.push(msg);
 			d.updatedAt = this.now();
 		}, this.ctx);
+		if (msg.resume) return { message: msg.id, to: msg.to, conversationId: msg.conversationId! };
 		const d = await this.bundleDoc(id);
 		const target = bundleMessageTarget(d);
 		if (target.role === msg.to && target.conversationId !== undefined && !bundleHoldMessage(d, target))
@@ -1755,13 +2051,13 @@ export class Factory implements FactoryCore {
 	}
 
 	private async discussionView(d: DiscussionDocState): Promise<DiscussionView> {
-		const usage = d.conversationId !== undefined ? sumUsage((await this.harness.snapshot(UsageDoc, d.conversationId as never, this.ctx)) as any) : undefined;
+		const { cost, live } = await this.discussionCost(d);
 		// The run cache, or the document for a run the watch has not delivered yet (just created by createTicket).
 		const uncached = new Map<RunId, RunState | undefined>();
 		for (const x of d.drafts)
 			if (x.runId !== undefined && !this.cache.has(x.runId))
 				uncached.set(x.runId, ((await this.harness.snapshot(RunDoc, x.runId, this.ctx)) as RunDocState | undefined)?.state);
-		return toDiscussionView(d, { usd: usage?.usd ?? 0, totalTokens: usage?.totalTokens ?? 0 }, (run) => this.cache.get(run)?.state ?? uncached.get(run));
+		return toDiscussionView(d, cost, live, (run) => this.cache.get(run)?.state ?? uncached.get(run));
 	}
 
 	async getDiscussion(id: DiscussionId): Promise<DiscussionView> {

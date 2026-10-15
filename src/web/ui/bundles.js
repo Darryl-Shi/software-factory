@@ -16,7 +16,7 @@ function bundleChatTarget(b) {
 }
 // The run view's transcript renderer takes a run; a bundle has the parts it reads.
 const bundleAsRun = (b) => ({
-  id: b.id, state: b.state, cost: b.cost ?? [], messages: b.messages ?? [],
+  id: b.id, state: b.state, cost: b.cost ?? [], messages: b.messages ?? [], interrupted: b.interrupted,
   conversations: { reviewers: b.conversations.reviewers ?? [], qa: b.conversations.qa ?? [], active: b.conversations.active },
   chatTarget: bundleChatTarget(b),
 });
@@ -98,7 +98,7 @@ function renderBundleView() {
   $("#rv-key").textContent = b.id;
   $("#rv-title").textContent = bundleTitle(b); $("#rv-title").title = bundleTitle(b);
   $("#rv-state").innerHTML = bundleStateLabel(b);
-  $("#rv-cost").textContent = money(totalUsd(b));
+  $("#rv-cost").textContent = money(ownerUsd(b));
   const { idx, name, cls } = bundleStage(b), merged = b.state === "MERGED";
   const label = merged ? "Merged" : b.state === "FAILED" ? `Failed in ${name}` : b.state === "CANCELLED" ? "Cancelled" : `${name}${b.round > 1 ? ` · round ${b.round}` : ""}`;
   $("#rv-progress").innerHTML = `<div class="rv-track">${BUNDLE_PIPELINE.map(([, n], i) => `<span class="rv-seg${merged || i < idx ? " done" : i === idx && b.state !== "CANCELLED" ? ` now ${cls}` : ""}" title="${n}"></span>`).join("")}</div><span class="rv-stage">${esc(label)}</span>`;
@@ -217,16 +217,22 @@ function refreshBundleConv(id, cid) {
 function updateBundleComposerLive(b) {
   const line = $("#bc-live"); if (!line || !b) return;
   const cid = b.conversations.active, role = bundleRoleOf(b, cid), busy = role && convLive(cid);
-  line.innerHTML = busy ? `<span class="shimmer">${roleName(role)} is working</span>`
+  const running = busy ? runningToolHtml(role, cid != null ? ui.tx.get(String(cid)) : null) : null;
+  line.innerHTML = b.interrupted ? `<span style="color:var(--turn)">${esc(roleName(b.interrupted.role))} is paused</span>`
+    : running ? running
+    : busy ? `<span class="shimmer">${roleName(role)} is working</span>`
     : BUNDLE_LIVE[b.state] ? `<span class="shimmer">${BUNDLE_LIVE[b.state]}</span>`
     : pending(b) ? `<span style="color:var(--turn)">Waiting for your decision on the card above</span>`
     : b.mergeRequested ? "Merging by itself when the update is clean and green" : `${roleName(role ?? "integrator")} is between steps`;
   const tg = bundleChatTarget(b), hint = $("#bc-hint");
-  if (hint) hint.textContent = tg.cid == null ? `Delivered when the ${tg.role} starts` : convLive(tg.cid) ? `Delivered when the ${tg.role} finishes its current step` : `The ${tg.role} replies right away`;
+  if (hint) hint.textContent = b.interrupted ? `Your message resumes the ${b.interrupted.role} right away` : tg.cid == null ? `Delivered when the ${tg.role} starts` : convLive(tg.cid) ? `Delivered when the ${tg.role} finishes its current step` : `The ${tg.role} replies right away`;
+  const int = $("#bc-int");
+  if (int) int.hidden = !canInterrupt(b, tg, BUNDLE_TERMINAL.includes(b.state));
+  ensureClocks();
 }
 function renderBundleComposer(b) {
   const tg = bundleChatTarget(b);
-  const key = BUNDLE_TERMINAL.includes(b.state) ? `end:${b.state}` : `chat:${tg.role}`;
+  const key = BUNDLE_TERMINAL.includes(b.state) ? `end:${b.state}` : `chat:${tg.role}:${b.interrupted ? `paused:${b.interrupted.role}` : ""}`;
   if (key === ui.bComposerKey) return updateBundleComposerLive(b);
   const draft = $("#bc-chat")?.value ?? "";
   ui.bComposerKey = key;
@@ -244,29 +250,38 @@ function renderBundleComposer(b) {
     $("#bc-retry").addEventListener("click", (e) => retryBundleFlow(b.id, e.currentTarget));
     return;
   }
-  el.innerHTML = `<div class="cbox">
+  el.innerHTML = `<div class="cbox${b.interrupted ? " paused" : ""}">
     <div class="c-top"><span class="to-chip">To ${avatar(tg.role, false)}<b>${esc(roleName(tg.role))}</b></span><span class="c-live-line" id="bc-live"></span></div>
-    <form class="c-input" id="bc-form"><textarea id="bc-chat" rows="1" placeholder="Message the ${tg.role}…" aria-label="Message the ${tg.role}"></textarea><button type="submit" class="send" id="bc-send" disabled aria-label="Send message">${ICON.send}</button></form>
+    ${b.interrupted ? pausedHtml(b.interrupted.role, "bc-continue") : ""}
+    <form class="c-input" id="bc-form"><textarea id="bc-chat" rows="1" placeholder="Message the ${tg.role}…" aria-label="Message the ${tg.role}"></textarea>${interruptBtnHtml("bc-int", tg.role)}<button type="submit" class="send" id="bc-send" disabled aria-label="Send message">${ICON.send}</button></form>
     <div class="c-foot"><span id="bc-hint"></span><span><kbd>Enter</kbd> to send · <kbd>Shift</kbd> + <kbd>Enter</kbd> for a new line</span></div></div>`;
   const ta = $("#bc-chat"), send = $("#bc-send");
   ta.value = draft; autosize(ta, send);
   ta.addEventListener("input", () => autosize(ta, send));
   ta.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); $("#bc-form").requestSubmit(); } });
-  $("#bc-form").addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const text = ta.value.trim(); if (!text || send.dataset.busy) return;
-    send.dataset.busy = "1"; send.disabled = true;
+  $("#bc-int").addEventListener("click", async (e) => {
+    const btn = e.currentTarget; btn.disabled = true;
+    if (await act(() => core.interruptBundleAgent(b.id), `Interrupting the ${tg.role}`)) refreshBundle(b.id);
+    btn.disabled = false;
+  });
+  $("#bc-continue")?.addEventListener("click", (e) => sendBundleChat("Continue.", e.currentTarget));
+  $("#bc-form").addEventListener("submit", (e) => { e.preventDefault(); sendBundleChat(ta.value.trim()); });
+  // Your text (or Continue's "Continue.") through the ordinary messageBundle op; a refused one stays in the box.
+  async function sendBundleChat(text, btn) {
+    if (!text || send.dataset.busy) return;
+    send.dataset.busy = "1"; send.disabled = true; if (btn) btn.disabled = true;
     let out;
     const ok = await act(async () => { out = await core.messageBundle(b.id, text); });
-    delete send.dataset.busy;
+    delete send.dataset.busy; if (btn) btn.disabled = false;
     if (!ok) { autosize(ta, send); return; }
-    ta.value = ""; autosize(ta, send);
+    if (!btn) ta.value = "";
+    autosize(ta, send);
     ui.stick = true;
     if (out?.conversationId == null) toast(`Queued for the ${out?.to ?? tg.role}. It's delivered when the ${out?.to ?? tg.role} starts.`);
     else if (String(ui.thread) !== String(out.conversationId)) { ui.thread = out.conversationId; renderBundleThreads(openBundleData()); loadBundleThread(true); }
     refreshBundle(b.id);
     if (out?.conversationId != null) refreshBundleConv(b.id, out.conversationId);
-  });
+  }
   updateBundleComposerLive(b);
 }
 async function retryBundleFlow(id, btn) {
@@ -443,10 +458,11 @@ function renderBundleDetails(b) {
       ${resp ? `<div class="f-resp">${resp.status === "fixed" ? "✓ Fixed by the integrator" : `Won't fix · ${esc(resp.reason ?? "")}`}</div>` : ""}</div>`; }).join("")}`).join("");
   const byRole = {};
   (b.cost ?? []).forEach((c) => { const k = `${c.role}:${c.round}`; byRole[k] ??= { role: c.role, round: c.round, usd: 0 }; byRole[k].usd += c.usd || 0; });
-  const costRows = Object.values(byRole).map((c) => `<tr><td>${roleName(c.role)}</td><td class="n">${c.round}</td><td class="n">${money(c.usd)}</td></tr>`).join("");
+  const costRows = Object.values(byRole).map((c) => `<tr><td>${roleName(c.role)}</td><td class="n">${c.round}</td><td class="n">${money(c.usd)}</td></tr>`).join("")
+    + liveCostRows(b).map((c) => `<tr class="live-cost"><td>${roleName(c.role)} <span class="meta" title="The turn in progress: not recorded yet">· in progress</span></td><td class="n">${b.round ?? ""}</td><td class="n">${money(c.usd || 0)}</td></tr>`).join("");
   const cancellable = !BUNDLE_RELEASED.includes(b.state);
   $("#rv-details-inner").innerHTML = `
-    <div class="kpis"><div class="kpi"><span class="k">Stage</span><span class="v">${merged ? "Merged" : esc(name)}</span></div><div class="kpi"><span class="k">Review</span><span class="v">${b.reviews?.length ? `${b.reviewRound}/${b.caps.review}` : "—"}</span></div><div class="kpi"><span class="k">CI fixes</span><span class="v">${b.ciFixes}/${b.caps.ciFix}</span></div><div class="kpi"><span class="k">Cost</span><span class="v">${money(totalUsd(b))}</span></div></div>
+    <div class="kpis"><div class="kpi"><span class="k">Stage</span><span class="v">${merged ? "Merged" : esc(name)}</span></div><div class="kpi"><span class="k">Review</span><span class="v">${b.reviews?.length ? `${b.reviewRound}/${b.caps.review}` : "—"}</span></div><div class="kpi"><span class="k">CI fixes</span><span class="v">${b.ciFixes}/${b.caps.ciFix}</span></div><div class="kpi"><span class="k">Cost</span><span class="v kpi-cost">${money(ownerUsd(b))}</span></div></div>
     <section class="d-sec"><h4>Tickets <span>${b.members.length}</span></h4><div class="b-members">${memberRows}</div>
       ${b.dropped?.length ? `<div class="meta" style="margin-top:6px">Dropped: ${b.dropped.map((id) => esc(keyOf(id))).join(", ")}</div>` : ""}</section>
     <section class="d-sec"><h4>Delivery</h4><div style="display:grid;gap:6px;font-size:13px">
@@ -458,7 +474,7 @@ function renderBundleDetails(b) {
       ${integ.conflict ? `<div class="notice warn">${b.state === "INTEGRATING" ? "Resolving a conflict with" : "Unresolved conflict with"} ${esc(keyOf(integ.conflict.run))}: <span class="mono">${esc(integ.conflict.files.join(", "))}</span></div>` : ""}
       ${resolved ? `<div class="meta">Conflicts resolved:</div>${resolved}` : ""}</div></section>` : ""}
     ${findings ? `<section class="d-sec"><h4>Findings <span>${b.findingsLog.reduce((a, e) => a + e.findings.length, 0)}</span></h4>${findings}</section>` : ""}
-    ${costRows ? `<section class="d-sec"><h4>Cost by role</h4><div class="scroll-x"><table class="cost"><thead><tr><th>Role</th><th class="n">Round</th><th class="n">USD</th></tr></thead><tbody>${costRows}<tr class="total"><td>Total</td><td></td><td class="n">${money(totalUsd(b))}</td></tr></tbody></table></div></section>` : ""}
+    ${costRows ? `<section class="d-sec"><h4>Cost by role</h4><div class="scroll-x"><table class="cost"><thead><tr><th>Role</th><th class="n">Round</th><th class="n">USD</th></tr></thead><tbody>${costRows}<tr class="total"><td>Total</td><td></td><td class="n">${money(ownerUsd(b))}</td></tr></tbody></table></div></section>` : ""}
     <section class="d-sec"><h4>Activity</h4><div style="display:grid;gap:6px">${b.notices.slice(-5).reverse().map((n) => `<div class="notice ${esc(n.level)}">${linkify(esc(n.text))}<span class="meta">${stamp(n.at)}</span></div>`).join("") || `<span class="meta">Nothing yet</span>`}</div></section>
     <section class="d-sec"><h4>Bundle</h4><dl class="dl">
       <dt>Project</dt><dd>${esc(b.project)}</dd><dt>Repo</dt><dd>${esc(b.repo)}</dd><dt>Bundle id</dt><dd class="mono">${esc(b.id)}</dd>

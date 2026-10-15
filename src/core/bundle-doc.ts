@@ -2,6 +2,7 @@
 // CI, pending ask, findings, cost and pinned settings. The fields it shares with the run Document have the same names,
 // so the run and bundle Tasks share their review, agent and CI code (task-kit.ts).
 import type { CleanedUp } from "./cleanup.ts";
+import { NO_LIVE_COST, type UsageSum } from "./usage.ts";
 import { defineDoc, defineDocFamily } from "@earendil-works/pi-durable";
 import { lastQaStatus, type ReviewRoundState } from "./run-doc.ts";
 import type {
@@ -16,6 +17,8 @@ import type {
 	Finding,
 	FindingsLogEntry,
 	HumanMessage,
+	Interrupted,
+	LiveCost,
 	MergeMethod,
 	Notice,
 	ReviewResult,
@@ -57,6 +60,9 @@ export type BundleDocState = {
 	conversations: { integrator?: string; reviewers: { id: string; seq: number }[]; qa?: { id: string; seq: number }[]; active?: string };
 	reviews?: Record<string, ReviewRoundState>;
 	driving?: { conversationId: string; key: string };
+	/** The agent paused by `interruptBundleAgent` while the bundle Task drives it (see RunDocState.interrupted). */
+	interrupted?: Interrupted;
+	usageBase?: Record<string, UsageSum>;
 	/** The integration in progress or done: merging members in order onto `base`. */
 	integration?: {
 		n: number;
@@ -120,7 +126,7 @@ export const BundleIndex = defineDoc<{ ids: string[]; seq?: number }>({
 
 export const mergeMethodOf = (d: Pick<BundleDocState, "pinned">): MergeMethod => (d.pinned.config.bundle?.mergeMethod ?? "squash") as MergeMethod;
 
-export function toBundleView(d: BundleDocState): BundleView {
+export function toBundleView(d: BundleDocState, liveCost: LiveCost = NO_LIVE_COST): BundleView {
 	const qaStatus = lastQaStatus(d as any);
 	return {
 		id: d.id,
@@ -179,6 +185,8 @@ export function toBundleView(d: BundleDocState): BundleView {
 		messages: d.messages ?? [],
 		history: d.history,
 		cost: d.cost,
+		liveCost,
+		...(d.interrupted ? { interrupted: { ...d.interrupted, conversationId: String(d.interrupted.conversationId) } } : {}),
 		...(d.failure ? { failure: { state: d.failure.state, reason: d.failure.reason } } : {}),
 		...(d.workspace ? { workspace: d.workspace } : {}),
 		createdAt: d.createdAt,

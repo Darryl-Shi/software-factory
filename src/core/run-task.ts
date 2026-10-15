@@ -65,6 +65,7 @@ export function createRunTask(svc: CoreServices) {
 			}
 			if (next !== "AWAITING_APPROVAL") delete d.gate;
 			delete d.driving;
+			delete d.interrupted;
 			d.updatedAt = svc.now();
 			return { status: "running", checkpoint: { phase: next, n } };
 		}, c);
@@ -706,6 +707,7 @@ export function createRunTask(svc: CoreServices) {
 					const doc = (await tx.doc(RunDoc, runId, null as never)) as unknown as RunDocState;
 					toFinal(doc, "CANCELLED", doc.cancelReason ?? "cancelled");
 					delete doc.driving;
+					delete doc.interrupted;
 					doc.updatedAt = svc.now();
 					return undefined;
 				}, c);

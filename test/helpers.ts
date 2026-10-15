@@ -86,6 +86,12 @@ export interface Control {
 	builderCommits?: boolean;
 	/** With builderCommits: the bash outputs of the builder's commit commands. */
 	builderCommitOutputs?: string[];
+	/**
+	 * A slow tool (stop / interrupt tests): on its first input the builder first runs this bash command (e.g.
+	 * `sleep 30; echo SLOW-DONE`), then writes its file and reports. The slow call's result text lands in `slowResults`.
+	 */
+	builderSlow?: string;
+	slowResults?: string[];
 }
 
 export function newControl(): Control {
@@ -185,6 +191,14 @@ export function scripts(control: Control): Record<string, Script> {
 			if (control.builderSubagent && ctx.inputs.length === 1) return call("subagent", { task: "count the files" });
 		}
 		if (control.builderSubagent && ctx.turn === 1 && ctx.inputs.length === 1) return call("write", { path: "round-1.txt", content: "round 1\n" });
+		if (control.builderSlow && ctx.inputs.length === 1) {
+			const slow = ctx.results.find((r) => r.name === "bash");
+			if (!slow) return call("bash", { command: control.builderSlow });
+			if (!ctx.results.some((r) => r.name === "write")) {
+				(control.slowResults ??= []).push(slow.text);
+				return call("write", { path: "round-1.txt", content: "round 1\n" });
+			}
+		}
 		if (ctx.turn === 0) {
 			const noProgress = control.builderNoProgress || (control.noProgressFromInput !== undefined && ctx.inputs.length >= control.noProgressFromInput);
 			if (!noProgress && control.runScript && ctx.inputs.length === 1)

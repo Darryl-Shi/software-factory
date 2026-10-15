@@ -14,7 +14,7 @@ import { RunConfigDoc } from "./run-config.ts";
 import type { ReviewRoundState } from "./run-doc.ts";
 import type { CoreServices } from "./run-task.ts";
 import { parseDuration } from "./settings.ts";
-import type { CiStatus, CostRecord, Delivery, Finding, FindingsLogEntry, HumanMessage, Notice, QaStatus, ReviewResult, Role, RunCtx, Workspace } from "./types.ts";
+import type { CiStatus, CostRecord, Delivery, Finding, FindingsLogEntry, HumanMessage, Interrupted, Notice, QaStatus, ReviewResult, Role, RunCtx, Workspace } from "./types.ts";
 import { addCost, sumUsage, type UsageSum } from "./usage.ts";
 import { createEditTool, createWriteTool } from "@earendil-works/pi-durable/tools";
 import type { ToolRegistration } from "@earendil-works/pi-durable";
@@ -41,6 +41,8 @@ export type KitDoc = {
 	conversations: { reviewers: { id: string; seq: number }[]; qa?: { id: string; seq: number }[]; active?: string };
 	reviews?: Record<string, ReviewRoundState>;
 	driving?: { conversationId: string; key: string };
+	interrupted?: Interrupted;
+	usageBase?: Record<string, UsageSum>;
 	pendingAsk?: { id: string; question: any; createdAt: number; response?: any };
 	messages?: HumanMessage[];
 	findingsLog: FindingsLogEntry[];
@@ -175,39 +177,78 @@ export function createTaskKit<D extends KitDoc>(svc: CoreServices, Doc: unknown,
 		opts: { drive?: boolean } = {},
 	): Promise<AgentResult> {
 		if (d.counters.attempt) key = `${key}:retry${d.counters.attempt}`;
+		const usageOf = async () => sumUsage((await rt.snapshot(UsageDoc, conversationId as never, c)) as any);
+		const before = await rt.memo(`${key}:usage0`, await usageOf(), c);
+		const startedAt = await rt.memo(`${key}:t0`, svc.now(), c);
 		await rt.commit(async (tx) => {
 			const b = await tx.doc(BridgeDoc, conversationId as never);
 			if (b.expect?.key !== key) b.expect = { key, tools, ...(findingIds ? { findingIds } : {}) };
+			const r = await docIn(tx, d.id);
+			// The live cost's baseline: what this turn started from (addCost records from the same point).
+			r.usageBase = { ...(r.usageBase ?? {}), [String(conversationId)]: before };
 			// The QA agent runs beside the reviewer and takes no messages: it never becomes the active agent.
 			if (opts.drive !== false) {
-				const r = await docIn(tx, d.id);
 				r.conversations.active = conversationId;
 				r.driving = { conversationId, key };
 			}
 			return undefined;
 		}, c);
-		const usageOf = async () => sumUsage((await rt.snapshot(UsageDoc, conversationId as never, c)) as any);
-		const before = await rt.memo(`${key}:usage0`, await usageOf(), c);
-		const startedAt = await rt.memo(`${key}:t0`, svc.now(), c);
 		const handle = await rt.conversation(conversationId as never, c);
 		if (!handle) throw new Error(`conversation ${conversationId} is missing`);
+		const pausedHere = (doc: D) => !!doc.interrupted && String(doc.interrupted.conversationId) === String(conversationId) && doc.interrupted.key === key;
+		/**
+		 * After an aborted input: while the human has this agent paused (`interruptAgent`), wait durably for the message that
+		 * resumes it (the `n`-th resume of this turn). Undefined when the agent is not paused (the abort was not an interrupt).
+		 */
+		const awaitResume = async (n: number): Promise<HumanMessage | undefined> => {
+			for (;;) {
+				const doc = await read(rt, d.id, c);
+				const resume = (doc.messages ?? []).filter((m) => m.resume?.startsWith(`${key}:resume`))[n];
+				if (resume) return resume;
+				if (!pausedHere(doc)) return undefined;
+				if (rt.signal.aborted) throw new Cancelled();
+				await Promise.race([svc.changed(d.id, 1000), rt.sleep(svc.now() + 1000, c).catch(() => undefined)]);
+				if (rt.signal.aborted) throw new Cancelled();
+			}
+		};
 		let result: { tool: BridgeTool; payload: any } | undefined;
 		let lastStatus = "";
-		for (let attempt = 0; attempt <= MAX_NUDGES && result === undefined; attempt++) {
-			const requestId = attempt === 0 ? key : `${key}:nudge${attempt}`;
-			const text =
-				attempt === 0
-					? content
-					: `You stopped without calling ${tools.join(" or ")}. The factory only continues when you call ${tools.join(" or ")}. Continue your work if needed, then call it.`;
+		let requestId = key;
+		let text: AgentContent = content;
+		let nudges = 0;
+		let resumes = 0;
+		for (;;) {
 			const sub = await handle.submit({ type: "input", content: text as any, requestId }, c);
 			if (opts.drive !== false) await deliverHeld(rt, c, d.id, role, conversationId, handle);
 			const settled = await sub.wait(c);
 			result = (await rt.snapshot(BridgeDoc, conversationId as never, c))?.results[key];
-			if (result === undefined && settled.status === "unanswered") {
+			if (result !== undefined) break;
+			if (settled.status === "unanswered" && (settled as any).reason === "aborted") {
+				// Interrupted by the human: the turn neither fails nor uses a nudge; the next message continues it.
+				const resume = await awaitResume(resumes);
+				if (resume) {
+					resumes += 1;
+					requestId = resume.resume!;
+					text = hooks.messageContent(await read(rt, d.id, c), resume);
+					continue;
+				}
+			}
+			if (settled.status === "unanswered") {
 				lastStatus = `unanswered (${(settled as any).reason ?? "unknown"}${(settled as any).error ? `: ${JSON.stringify((settled as any).error)}` : ""})`;
 				if ((settled as any).reason !== "stale") break;
 			}
+			if (nudges >= MAX_NUDGES) break;
+			nudges += 1;
+			requestId = `${key}:nudge${nudges}`;
+			text = `You stopped without calling ${tools.join(" or ")}. The factory only continues when you call ${tools.join(" or ")}. Continue your work if needed, then call it.`;
 		}
+		// The bridge tool won the race with an interrupt: the result is taken as usual and the pause is dropped.
+		if (result !== undefined && pausedHere(await read(rt, d.id, c)))
+			await rt.commit(async (tx) => {
+				const r = await docIn(tx, d.id);
+				if (pausedHere(r)) delete r.interrupted;
+				return undefined;
+			}, c);
 		if (result === undefined) throw new Error(`${role} conversation finished without calling ${tools.join("/")}${lastStatus ? `; last input ${lastStatus}` : ""}`);
 		return { ...result, usage: { before, after: await usageOf(), durationMs: svc.now() - startedAt } };
 	}
