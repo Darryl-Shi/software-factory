@@ -401,6 +401,27 @@ const writes = (fs: Record<string, string>) => calls(...Object.entries(fs).map((
 const commit = (msg: string, progress?: string) =>
 	call("bash", { command: `${progress === undefined ? "" : `printf '%s\\n' ${JSON.stringify(progress)} >> PROGRESS.md && `}chmod +x scripts/setup.sh bin/todo.js 2>/dev/null; git add -A && git commit -qm ${JSON.stringify(msg)} && git log --oneline -1` });
 
+// A ticket whose title carries SLOW_MARK: before its normal work the builder runs two slow `bash` commands, one after
+// the other, so that the dry run can stop the first one (stopToolCall) and interrupt the builder while the second one
+// runs (interruptAgent, then a message resumes it). Tickets without the marker are unaffected.
+export const SLOW_MARK = "[slow-tool]";
+export const SLOW_COMMAND = (n: number) => `echo SLOW-START-${n}; sleep 60; echo SLOW-DONE-${n}`;
+const isSlowCall = (p: any) => p?.type === "toolCall" && p.name === "bash" && /SLOW-START-\d/.test(String(p.arguments?.command ?? ""));
+/** The slow calls made so far, and the builder's (non-empty, not aborted) responses after the last of them. */
+function slowSteps(messages: any[]): { n: number; after: number } {
+	let n = 0;
+	let after = 0;
+	for (const m of messages) {
+		if (m.role !== "assistant") continue;
+		const parts = Array.isArray(m.content) ? m.content : [];
+		if (parts.some(isSlowCall)) {
+			n += 1;
+			after = 0;
+		} else if (parts.length > 0 && m.stopReason !== "aborted" && m.stopReason !== "error") after += 1;
+	}
+	return { n, after };
+}
+
 const PUSH_ATTEMPT = 'git remote -v; out=$(git push origin HEAD:refs/heads/agent-push 2>&1); echo PUSH-EXIT=$?; echo "$out" | tail -2; out=$(curl -sS -m 10 https://api.github.com/ -o /dev/null 2>&1); echo GITHUB-API-EXIT=$?; echo "$out" | tail -1';
 
 export const builder: Script = async (ctx) => {
@@ -417,7 +438,13 @@ export const builder: Script = async (ctx) => {
 				responses: ids.map((findingId) => ({ findingId, status: "fixed" })),
 			}),
 		);
-	const t = ctx.turn;
+	let t = ctx.turn;
+
+	if (!findings && spec.includes(SLOW_MARK)) {
+		const s = slowSteps(ctx.messages as any[]);
+		if (s.n < 2) return slow(call("bash", { command: SLOW_COMMAND(s.n + 1) }));
+		t = s.after; // then the normal work, counted from the last slow call
+	}
 
 	if (!findings) {
 		// initial build of this run

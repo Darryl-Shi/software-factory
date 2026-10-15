@@ -92,6 +92,17 @@ export interface Control {
 	 */
 	builderSlow?: string;
 	slowResults?: string[];
+	/**
+	 * With builderSlow: the builder's first step is one round of write + the slow bash + report_done (report_done waits,
+	 * pending, behind the slow call: stopToolCall refuses bridge tools).
+	 */
+	builderSlowBatch?: boolean;
+	/** With builderSlow: how many times the builder runs the slow command (one after the other) before it writes (default 1). */
+	builderSlowTimes?: number;
+	/** The reviewer's next first step runs this bash command instead of its usual check (consumed once; interrupt tests). */
+	reviewerSlow?: string;
+	/** Hang the discussant's reply to a human message after its first step (a model response landed: live cost tests). */
+	discussantHangLater?: boolean;
 }
 
 export function newControl(): Control {
@@ -131,6 +142,11 @@ export function scripts(control: Control): Record<string, Script> {
 		if (ctx.turn === 0) {
 			control.reviewerInputs.push(ctx.input);
 			control.reviewerModels.push(model);
+			if (control.reviewerSlow) {
+				const command = control.reviewerSlow;
+				delete control.reviewerSlow;
+				return call("bash", { command });
+			}
 			return call("bash", { command: "ls -1 && echo TESTS-OK" });
 		}
 		if (control.reviewerHang) {
@@ -191,11 +207,13 @@ export function scripts(control: Control): Record<string, Script> {
 			if (control.builderSubagent && ctx.inputs.length === 1) return call("subagent", { task: "count the files" });
 		}
 		if (control.builderSubagent && ctx.turn === 1 && ctx.inputs.length === 1) return call("write", { path: "round-1.txt", content: "round 1\n" });
+		if (control.builderSlow && control.builderSlowBatch && ctx.inputs.length === 1 && ctx.turn === 0)
+			return calls(["write", { path: "round-1.txt", content: "round 1\n" }], ["bash", { command: control.builderSlow }], ["report_done", { summary: "round 1", responses: [] }]);
 		if (control.builderSlow && ctx.inputs.length === 1) {
-			const slow = ctx.results.find((r) => r.name === "bash");
-			if (!slow) return call("bash", { command: control.builderSlow });
+			const slows = ctx.results.filter((r) => r.name === "bash");
+			if (slows.length < (control.builderSlowTimes ?? 1)) return call("bash", { command: control.builderSlow });
 			if (!ctx.results.some((r) => r.name === "write")) {
-				(control.slowResults ??= []).push(slow.text);
+				(control.slowResults ??= []).push(...slows.map((r) => r.text));
 				return call("write", { path: "round-1.txt", content: "round 1\n" });
 			}
 		}
@@ -281,6 +299,7 @@ export function scripts(control: Control): Record<string, Script> {
 			control.discussantModels.push(ctx.model);
 		}
 		while (control.discussantHang) await new Promise((r) => setTimeout(r, 50));
+		if (ctx.side!.turn > 0) while (control.discussantHangLater) await new Promise((r) => setTimeout(r, 50));
 		if (control.discussantFail) return fail(control.discussantFail);
 		if (ctx.side!.turn === 0 && text.startsWith("WRITE:")) return call("write", { path: "x.txt", content: "x" });
 		// "READ: path" reads a file of the checkout and replies with what it got
