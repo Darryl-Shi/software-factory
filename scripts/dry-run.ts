@@ -21,7 +21,7 @@ import YAML from "yaml";
 import { fieldAt } from "../src/core/settings.ts";
 import { daemonFiles, livePid } from "../src/daemon.ts";
 import { LocalGitHubHost } from "../src/github/host.ts";
-import { TODO_REQUEST } from "../src/testing/dry-run-agents.ts";
+import { SLOW_COMMAND, SLOW_MARK, TODO_REQUEST } from "../src/testing/dry-run-agents.ts";
 import type { BundleView, DiscussionLink, DiscussionView, FactoryEvent, RunView, Scope, SettingField, TranscriptView } from "../src/core/types.ts";
 
 const pexec = promisify(execFile);
@@ -166,6 +166,12 @@ async function api<T = any>(op: string, ...args: unknown[]): Promise<T> {
 	if (!body.ok) throw new Error(body.error);
 	return body.result;
 }
+/** Calls an operation that should fail: its HTTP status, error code and message (undefined if it succeeded). */
+async function apiError(op: string, ...args: unknown[]): Promise<{ status: number; code?: string; error: string } | undefined> {
+	const res = await fetch(new URL(`/api/op/${op}`, link), { method: "POST", headers: { "content-type": "application/json", ...auth() }, body: JSON.stringify({ args }) });
+	const body = (await res.json()) as { ok: true } | { ok: false; error: string; code?: string };
+	return body.ok ? undefined : { status: res.status, ...(body.code ? { code: body.code } : {}), error: body.error };
+}
 async function apiFails(op: string, ...args: unknown[]): Promise<string | undefined> {
 	try {
 		await api(op, ...args);
@@ -289,6 +295,32 @@ async function cloneMain(repo: string): Promise<string> {
 }
 const ranTestsGreen = (tr: TranscriptView) => tr.items.some((i: any) => i.toolResult?.name === "run_tests" && /\[exit code 0\]/.test(i.toolResult.text));
 const reviewerRanTestsGreen = async (run: string) => ranTestsGreen(await transcript(run, "reviewer"));
+/** Waits until the builder's n-th slow command (SLOW_COMMAND(n)) is running: its callId, its `running` slot and the transcript. */
+async function untilSlowCall(run: string, n: number, ms = 60_000) {
+	const t0 = Date.now();
+	for (;;) {
+		const cid = (await status(run)).conversations.builder;
+		if (cid !== undefined) {
+			const tr = await api<TranscriptView>("getConversation", run, cid);
+			const callId = (tr.items as any[]).flatMap((i) => i.toolCalls ?? []).find((c: any) => c.name === "bash" && String(c.args?.command ?? "").includes(`SLOW-START-${n};`))?.id as string | undefined;
+			const slot = tr.running.find((s) => s.callId === callId);
+			if (callId && slot?.status === "running" && slot.startedAt !== undefined) return { callId, slot, tr };
+		}
+		if (Date.now() - t0 > ms) throw new Error(`timeout waiting for the builder's slow command ${n} to run`);
+		await sleep(100);
+	}
+}
+/** Waits for the result of a tool call in a run's Conversation. */
+async function untilToolResult(run: string, cid: string, callId: string, ms = 30_000): Promise<NonNullable<TranscriptView["items"][number]["toolResult"]>> {
+	const t0 = Date.now();
+	for (;;) {
+		const tr = await api<TranscriptView>("getConversation", run, cid);
+		const r = (tr.items as any[]).find((i) => i.toolResult?.callId === callId)?.toolResult;
+		if (r) return r;
+		if (Date.now() - t0 > ms) throw new Error(`timeout waiting for the result of ${callId}`);
+		await sleep(100);
+	}
+}
 const userInputs = (tr: TranscriptView) => tr.items.filter((i: any) => i.role === "user" && i.text).map((i: any) => String(i.text));
 
 // ------------------------------------------------------------------ bundles: Ship and Merge
@@ -853,6 +885,84 @@ async function main() {
 	const mCD = await merge(idCD);
 	check("Merge: the clean, reviewed bundle MERGED and both runs are DELIVERED", mCD.state === "MERGED" && (await Promise.all([status(runC), status(runD)])).every((x) => x.state === "DELIVERED" && x.bundle === idCD), mCD.state);
 
+	// ---------------------------------------------------------------- stop a running tool call; interrupt the builder
+	section("Stop a running tool call (stopToolCall) and interrupt the builder (interruptAgent; a message resumes it)");
+	const runS = await startRun("todo", `add a --verbose flag ${SLOW_MARK}`, `add a --verbose flag; ${SLOW_MARK}: the builder runs two slow commands first`);
+	say(`  run ${runS}: its builder runs \`${SLOW_COMMAND(1)}\` twice before its normal work`);
+	await drive(runS, [], { until: (v) => v.state === "BUILDING" });
+	const slowRun = await untilSlowCall(runS, 1);
+	const sv1 = await status(runS);
+	const bcid = sv1.conversations.builder!;
+	check(
+		"while the slow bash runs, getConversation's `running` lists it with status running and a startedAt (and `now`)",
+		slowRun.slot.name === "bash" && slowRun.slot.status === "running" && typeof slowRun.slot.startedAt === "number" && typeof slowRun.tr.now === "number" && slowRun.slot.startedAt <= slowRun.tr.now + 1000,
+		JSON.stringify({ running: slowRun.tr.running, now: slowRun.tr.now }),
+	);
+	const archId = sv1.conversations.architect!;
+	const submitCall = ((await api<TranscriptView>("getConversation", runS, archId)).items as any[]).flatMap((i) => i.toolCalls ?? []).find((c: any) => c.name === "submit_spec");
+	const eFinished = await apiError("stopToolCall", { run: runS, conversationId: archId, callId: submitCall?.id ?? "none" });
+	const eUnknown = await apiError("stopToolCall", { run: runS, conversationId: bcid, callId: "call_not_running" });
+	check(
+		"stopToolCall on a finished call (the architect's submit_spec) and on a call that is not running → 409",
+		!!submitCall && eFinished?.status === 409 && eUnknown?.status === 409,
+		JSON.stringify({ submitCall: submitCall?.id, eFinished, eUnknown }),
+	);
+	const otherConv = (await status(run1)).conversations.builder!;
+	const eOther = await apiError("stopToolCall", { run: runS, conversationId: otherConv, callId: slowRun.callId });
+	check("stopToolCall with a Conversation of another run → 404", eOther?.status === 404, JSON.stringify(eOther));
+	say(`  stop ${slowRun.callId} (bash) in the builder's Conversation ${bcid}`);
+	const tStop = Date.now();
+	await api("stopToolCall", { run: runS, conversationId: bcid, callId: slowRun.callId });
+	const stopped = await untilToolResult(runS, bcid, slowRun.callId);
+	const svStopped = await status(runS);
+	check(
+		'the stopped bash ends at once: its result isError, says "was aborted" and carries durationMs',
+		stopped.isError && /was aborted/.test(stopped.text) && typeof stopped.durationMs === "number" && stopped.durationMs < 60_000 && Date.now() - tStop < 30_000,
+		JSON.stringify(stopped),
+	);
+	check("after the stop the run stays BUILDING with the same builder, nothing failed", svStopped.state === "BUILDING" && !svStopped.failure && svStopped.conversations.builder === bcid, `${svStopped.state} ${svStopped.failure?.reason ?? ""}`);
+	const slow2 = await untilSlowCall(runS, 2);
+	check("the builder kept working: it ran its next (slow) command after the stop", slow2.slot.status === "running" && slow2.callId !== slowRun.callId, JSON.stringify(slow2.tr.running));
+	const live = (await status(runS)).liveCost;
+	check("getRun carries liveCost { usd, totalTokens, byRole } while the builder works", !!live && typeof live.usd === "number" && typeof live.totalTokens === "number" && Array.isArray(live.byRole), JSON.stringify(live));
+	say("  interrupt the builder");
+	await api("interruptAgent", runS);
+	const paused = await status(runS);
+	check(
+		'interruptAgent: getRun shows `interrupted` (builder), the run stays BUILDING, a notice says "interrupted", nothing failed',
+		paused.interrupted?.role === "builder" && String(paused.interrupted.conversationId) === String(bcid) && paused.state === "BUILDING" && !paused.failure && paused.notices.some((n) => /interrupted/.test(n.text)),
+		JSON.stringify({ state: paused.state, interrupted: paused.interrupted, notices: paused.notices.slice(-3), failure: paused.failure }),
+	);
+	const aborted2 = await untilToolResult(runS, bcid, slow2.callId);
+	check("the interrupt aborted the running bash (its result isError)", aborted2.isError, JSON.stringify(aborted2));
+	const eAgain = await apiError("interruptAgent", runS);
+	check("interruptAgent again while paused → 409", eAgain?.status === 409, JSON.stringify(eAgain));
+	await sleep(1500);
+	const stillPaused = await status(runS);
+	check("the paused builder waits: still BUILDING and interrupted after a pause", stillPaused.state === "BUILDING" && stillPaused.interrupted?.role === "builder", stillPaused.state);
+	say("  human says: Continue.");
+	const tMsg = Date.now();
+	const sent = await api<{ message: string; to: string; conversationId?: string }>("message", runS, "Continue.");
+	const resumed = await status(runS);
+	check(
+		"a message to the paused builder resumes it: it returns quickly, goes to the same builder Conversation, and `interrupted` clears",
+		sent.to === "builder" && String(sent.conversationId) === String(bcid) && !resumed.interrupted && Date.now() - tMsg < 10_000,
+		JSON.stringify({ sent, interrupted: resumed.interrupted, ms: Date.now() - tMsg }),
+	);
+	const vS = await drive(runS, []);
+	const trS = await api<TranscriptView>("getConversation", runS, bcid);
+	const results = (trS.items as any[]).flatMap((i) => (i.toolResult ? [i.toolResult] : []));
+	check(
+		"the resumed builder called report_done: the run went BUILDING → REVIEWING → READY with the same builder Conversation",
+		vS.state === "READY" && vS.history.some((h) => h.from === "BUILDING" && h.to === "REVIEWING") && vS.conversations.builder === bcid && results.some((r) => r.name === "report_done" && !r.isError) && (trS.items as any[]).some((i) => i.author === "human" && /Continue\./.test(i.text ?? "")),
+		JSON.stringify({ state: vS.state, path: vS.history.map((h) => h.to), failure: vS.failure }),
+	);
+	check(
+		"every finished tool row in the builder's transcript carries durationMs",
+		results.length >= 4 && results.every((r) => typeof r.durationMs === "number" && r.durationMs >= 0) && trS.running.length === 0,
+		JSON.stringify(results.map((r) => [r.name, r.durationMs])),
+	);
+
 	// ---------------------------------------------------------------- the web UI and its API
 	section("Web UI and its API");
 	const urlFile = daemonFiles(CONFIG).url;
@@ -862,7 +972,7 @@ async function main() {
 	const noToken = await fetch(new URL("/api/op/listRuns", link), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ args: [] }) });
 	check("the API refuses requests without the token", noToken.status === 401);
 	const runs = await api<RunView[]>("listRuns");
-	const started = [run1, run2, run3, run4, run5, run6, run7, run8, runA, runB, runC, runD];
+	const started = [run1, run2, run3, run4, run5, run6, run7, run8, runA, runB, runC, runD, runS];
 	check("with the token it lists every run of the trial", runs.map((r) => r.id).sort().join() === [...started].sort().join(), runs.map((r) => r.id).join());
 	const bundles = await api<BundleView[]>("listBundles");
 	const shipped = [ship1.id, ship2.id, ship3.id, ship4.id, ship5.id, ship6.id, ship7.id, ship8.id, idAB, idCD];

@@ -21,6 +21,8 @@ export type DiscussionTurn = {
 	stopRequested?: boolean;
 	/** The interface that asked to stop the turn. */
 	stoppedBy?: string;
+	/** The Conversation's usage when the turn started (the live cost's baseline; set by the Task once it runs the turn). */
+	usage0?: { usd: number; totalTokens: number };
 };
 
 export type DiscussionDocState = {
@@ -76,8 +78,8 @@ export const DiscussionIndex = defineDoc<{ ids: string[]; seq?: number }>({
 	initial: () => ({ ids: [] }),
 });
 
-/** The view interfaces get: `cost` is the Conversation's usage so far; `runState` looks up the state of a run a draft became. */
-export function toDiscussionView(d: DiscussionDocState, cost: { usd: number; totalTokens: number }, runState: (id: RunId) => RunState | undefined): DiscussionView {
+/** The view interfaces get: `cost` is the recorded usage (turns that ended), `liveCost` the running turn's; `runState` looks up the state of a run a draft became. */
+export function toDiscussionView(d: DiscussionDocState, cost: { usd: number; totalTokens: number }, liveCost: { usd: number; totalTokens: number }, runState: (id: RunId) => RunState | undefined): DiscussionView {
 	const runs: { id: RunId; state: RunState }[] = [];
 	for (const x of d.drafts) {
 		const state = x.runId !== undefined ? runState(x.runId) : undefined;
@@ -97,6 +99,7 @@ export function toDiscussionView(d: DiscussionDocState, cost: { usd: number; tot
 		drafts: d.drafts,
 		notices: d.notices,
 		cost,
+		liveCost,
 		turnCosts: d.turnCosts,
 		runs,
 		...(d.workspace ? { workspace: d.workspace } : {}),

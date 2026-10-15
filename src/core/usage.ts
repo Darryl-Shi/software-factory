@@ -2,7 +2,7 @@
 // remembers how much of it is already in a cost record (`usage`), so a turn the core drives and a turn a human message
 // started are each counted once, even when they overlap.
 import type { RunDocState } from "./run-doc.ts";
-import type { CostRecord, Role } from "./types.ts";
+import type { CostRecord, LiveCost, Role } from "./types.ts";
 
 export type UsageSum = { input: number; output: number; cacheRead: number; cacheWrite: number; totalTokens: number; usd: number };
 const KEYS = ["input", "output", "cacheRead", "cacheWrite", "totalTokens", "usd"] as const;
@@ -64,4 +64,15 @@ export function addCost(
 	};
 	d.cost.push(record);
 	return record;
+}
+
+/** No unrecorded usage. */
+export const NO_LIVE_COST: LiveCost = { usd: 0, totalTokens: 0, byRole: [] };
+
+/** What of `now` is not in a cost record yet: `now` minus the larger of the recorded and the turn's starting usage. */
+type Part = Pick<UsageSum, "usd" | "totalTokens">;
+export function unrecorded(now: Part, recorded: Part | undefined, base: Part | undefined): { usd: number; totalTokens: number } {
+	const usd = Math.max(recorded?.usd ?? 0, base?.usd ?? 0);
+	const totalTokens = Math.max(recorded?.totalTokens ?? 0, base?.totalTokens ?? 0);
+	return { usd: Math.max(0, now.usd - usd), totalTokens: Math.max(0, now.totalTokens - totalTokens) };
 }

@@ -281,7 +281,7 @@ function renderDiscussionView() {
   $("#rv-key").textContent = d?.project ?? "";
   $("#rv-title").textContent = d ? d.title : "New chat"; $("#rv-title").title = d ? d.title : "";
   $("#rv-state").innerHTML = "";
-  $("#rv-cost").textContent = d ? money(d.cost.usd) : "";
+  $("#rv-cost").textContent = d ? money(discUsd(d)) : ""; // recorded plus the running turn's (liveCost)
   $("#rv-cost").title = d ? "Cost of this chat" : "";
   if (d) autoPanel(d);
   renderDiscActions(d); renderDiscComposer(d); if (d) renderDrafts(d); renderDiscTranscript(false);
@@ -382,6 +382,14 @@ function renderDiscTranscript(first) {
   const tx = $("#tx"), key = `disc:${d.id}`;
   if (first || ui.txConv !== key) { tx.replaceChildren(); ui.txConv = key; first = true; }
   settleScroll(first, patch(tx, discBlocks(d, t), !first));
+  updateDiscLive(d, t);
+}
+// The live line while a turn runs a tool: "Discussant is running web_search · 0:12"; otherwise the composer's own text.
+function updateDiscLive(d, t) {
+  const line = $("#dc-live"); if (!line) return;
+  const running = d.turn && t?.busy ? runningToolHtml("discussant", t) : null;
+  line.innerHTML = running ?? line.dataset.base ?? "";
+  ensureClocks();
 }
 
 // ---------------------------------------------------------------- composer: say (or start the chat), or Stop while a turn runs
@@ -404,7 +412,7 @@ function renderDiscComposer(d) {
   const open = !d || d.state === "OPEN", busy = !!d?.turn;
   const live = !d ? "New chat" : !open ? `<span class="shimmer">Preparing the workspace</span>` : busy ? `<span class="shimmer">The discussant is ${d.turn.kind === "draft" ? "drafting tickets" : "replying"}</span>` : "Your turn";
   el.innerHTML = `<div class="cbox">
-    <div class="c-top"><span class="to-chip">To ${avatar("discussant", false)}<b>Discussant</b></span><span class="c-live-line">${live}</span></div>
+    <div class="c-top"><span class="to-chip">To ${avatar("discussant", false)}<b>Discussant</b></span><span class="c-live-line" id="dc-live" data-base="${esc(live)}">${live}</span></div>
     <form class="c-input" id="dc-form"><textarea id="dc-input" rows="1" placeholder="${d ? "Message the discussant…" : "What's the problem? Ask anything about the repo…"}" aria-label="Message the discussant"${open ? "" : " disabled"}></textarea><button type="submit" class="send${busy ? " stop" : ""}" id="dc-send" aria-label="${busy ? "Stop the turn" : "Send message"}" title="${busy ? "Stop" : "Send"}"${open ? "" : " disabled"}>${busy ? ICON.stop : ICON.send}</button></form>
     <div class="c-foot"><span>${busy ? "Stop ends the turn; it isn't resumed" : "It reads the repo and can search the web; it can't change anything"}</span><span><kbd>Enter</kbd> to send · <kbd>Shift</kbd> + <kbd>Enter</kbd> for a new line</span></div></div>`;
   const ta = $("#dc-input"), send = $("#dc-send");
@@ -488,7 +496,7 @@ function renderDrafts(d) {
   const pendingN = d.drafts.filter((x) => !x.runId).length;
   const ws = d.workspace, a = ago(d.createdAt);
   $("#rv-details-inner").innerHTML = `
-    <div class="kpis"><div class="kpi"><span class="k">State</span><span class="v">${esc(DISC_STATE[d.state]?.[0] ?? d.state)}</span></div><div class="kpi"><span class="k">Drafts</span><span class="v">${d.drafts.length}</span></div><div class="kpi"><span class="k">Cost</span><span class="v">${money(d.cost.usd)}</span></div></div>
+    <div class="kpis"><div class="kpi"><span class="k">State</span><span class="v">${esc(DISC_STATE[d.state]?.[0] ?? d.state)}</span></div><div class="kpi"><span class="k">Drafts</span><span class="v">${d.drafts.length}</span></div><div class="kpi"><span class="k">Cost</span><span class="v kpi-cost">${money(discUsd(d))}</span></div></div>
     <section class="d-sec"><h4>Draft tickets</h4>${drafting ? `<div class="notice drafting"><span class="spin"></span> Drafting in progress. The drafts can't be edited until the model submits.</div>` : `
       <div class="field"><label for="dd-instr">Instructions <span class="meta">(optional)</span></label><textarea id="dd-instr" data-keep rows="2" placeholder="e.g. Keep the API and the UI in separate tickets"${canDraft ? "" : " disabled"}></textarea></div>
       <div class="dd-go"><button type="button" class="btn primary small" id="dd-draft"${canDraft ? "" : " disabled"}>${pendingN ? "Redraft tickets" : "Draft tickets"}</button><span class="meta">${d.state !== "OPEN" ? "Drafting needs an open discussion." : d.turn ? "Wait for the reply, or stop it." : "The model writes a summary and the tickets."}</span></div>`}

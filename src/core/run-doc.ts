@@ -2,6 +2,8 @@
 // cost per role per round, pinned config hash and Pi version. One session-scoped family member per run.
 import type { CleanedUp } from "./cleanup.ts";
 import { defineDoc, defineDocFamily } from "@earendil-works/pi-durable";
+import { NO_LIVE_COST, type UsageSum } from "./usage.ts";
+import { DEFAULT_MESSAGE_ROLES } from "./messages.ts";
 import type {
 	ArtifactRef,
 	CiStatus,
@@ -12,6 +14,8 @@ import type {
 	FindingsLogEntry,
 	Gate,
 	HumanMessage,
+	Interrupted,
+	LiveCost,
 	Notice,
 	PendingAsk,
 	QaStatus,
@@ -64,6 +68,10 @@ export type RunDocState = {
 	reviews?: Record<string, ReviewRoundState>;
 	/** The Conversation the core is driving right now (set when runAgent submits, cleared by the next transition). */
 	driving?: { conversationId: string; key: string };
+	/** The agent paused by `interruptAgent` while the core drives it (cleared by the resuming message or the turn's end). */
+	interrupted?: Interrupted;
+	/** Per Conversation: its usage when the core's current turn on it started (the live cost's baseline, with `usage`). */
+	usageBase?: Record<string, UsageSum>;
 	pending: { architectInput?: string; builderFindings?: Finding[]; builderNote?: string };
 	pendingAsk?: PendingAsk;
 	artifacts: { spec?: ArtifactRef & { text: string }; delivery?: Delivery };
@@ -137,7 +145,7 @@ export const RunIndex = defineDoc<{ runs: string[] }>({
 	initial: () => ({ runs: [] }),
 });
 
-export function toView(d: RunDocState): RunView {
+export function toView(d: RunDocState, liveCost: LiveCost = NO_LIVE_COST): RunView {
 	return {
 		id: d.id,
 		project: d.project,
@@ -166,6 +174,9 @@ export function toView(d: RunDocState): RunView {
 			})),
 		...(lastQaStatus(d) ? { qaStatus: lastQaStatus(d) } : {}),
 		cost: d.cost,
+		liveCost,
+		messageRoles: [...((d.pinned.config.policy?.messages ?? DEFAULT_MESSAGE_ROLES) as Role[])],
+		...(d.interrupted ? { interrupted: { ...d.interrupted, conversationId: String(d.interrupted.conversationId) } } : {}),
 		configHash: d.pinned.configHash,
 		piVersion: d.pinned.piVersion,
 		...(d.failure ? { failure: { state: d.failure.state, ...(d.failure.gate ? { gate: d.failure.gate } : {}), reason: d.failure.reason } } : {}),

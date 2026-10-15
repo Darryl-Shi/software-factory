@@ -1,4 +1,4 @@
-# Dry run of spec §8 — 2026-10-13T08:14:19.147Z
+# Dry run of spec §8 — 2026-10-15T01:39:52.760Z
 
 Directory: .dryrun (DRYRUN_DIR). Scripted agents (no model credentials), sandbox OFF (DRYRUN_SANDBOX=0), fake GitHub with local CI runner, SQLite storage, a daemonized `factory serve` driven through the web HTTP API (`POST /api/op/<op>`, `GET /api/events`).
 
@@ -6,7 +6,7 @@ Dropped CLI-only checks: none. The terminal attach view check is replaced by the
 
 Bundles: runs stop at Ready after review (branch `factory/<run-id>` pushed, no PR); every step ships its Ready run(s) as a bundle (`createBundle`) and merges it (`mergeBundle`) where the run used to deliver by itself. The PR description and delivery notes are written by the bundle (`## Ticket: <title>` sections and `## Integration`).
 
-**105/105 checks passed.**
+**119/119 checks passed.**
 
 ## §8.1 zero-to-MVP: createProject todo → me/todo, a discussion, then a ticket from its draft (repo does not exist)
 - ✅ discussion reached OPEN and answered both messages (after an ls, then a web search)
@@ -130,6 +130,22 @@ Bundles: runs stop at Ready after review (branch `factory/<run-id>` pushed, no P
 - ✅ a QA agent tested the clean combination in a VM beside the bundle review
 - ✅ the PR's "## Integration" says the merge was clean and the combination was reviewed in 1 review round, with its QA status
 - ✅ Merge: the clean, reviewed bundle MERGED and both runs are DELIVERED
+
+## Stop a running tool call (stopToolCall) and interrupt the builder (interruptAgent; a message resumes it)
+- ✅ while the slow bash runs, getConversation's `running` lists it with status running and a startedAt (and `now`)
+- ✅ stopToolCall on a finished call (the architect's submit_spec) and on a call that is not running → 409
+- ✅ stopToolCall with a Conversation of another run → 404
+- ✅ the stopped bash ends at once: its result isError, says "was aborted" and carries durationMs
+- ✅ after the stop the run stays BUILDING with the same builder, nothing failed
+- ✅ the builder kept working: it ran its next (slow) command after the stop
+- ✅ getRun carries liveCost { usd, totalTokens, byRole } while the builder works
+- ✅ interruptAgent: getRun shows `interrupted` (builder), the run stays BUILDING, a notice says "interrupted", nothing failed
+- ✅ the interrupt aborted the running bash (its result isError)
+- ✅ interruptAgent again while paused → 409
+- ✅ the paused builder waits: still BUILDING and interrupted after a pause
+- ✅ a message to the paused builder resumes it: it returns quickly, goes to the same builder Conversation, and `interrupted` clears
+- ✅ the resumed builder called report_done: the run went BUILDING → REVIEWING → READY with the same builder Conversation
+- ✅ every finished tool row in the builder's transcript carries durationMs
 
 ## Web UI and its API
 - ✅ the link factory serve printed is the one in web-url (mode 0600)

@@ -56,7 +56,75 @@ function stamp(t) {
 }
 const cap1 = (x) => (x ? x[0].toUpperCase() + x.slice(1) : "");
 const money = (n) => `$${n.toFixed(2)}`;
-const totalUsd = (run) => run.cost.reduce((a, c) => a + (c.usd || 0), 0);
+const totalUsd = (run) => (run.cost ?? []).reduce((a, c) => a + (c.usd || 0), 0);
+// Recorded plus live (the turns in progress): what the cards, the headers and the cost tables show.
+const ownerUsd = (x) => totalUsd(x) + (x.liveCost?.usd || 0);
+/**
+ * The cost-by-role table's "in progress" rows: liveCost.byRole with spend. When the cached live total moved ahead of
+ * byRole (a cost.updated before the refetch), the difference goes to the last row so the table's total matches.
+ */
+function liveCostRows(x) {
+  const lc = x.liveCost; if (!lc) return [];
+  const rows = (lc.byRole ?? []).filter((c) => (c.usd || 0) > 0 || (c.totalTokens || 0) > 0).map((c) => ({ ...c }));
+  const gap = (lc.usd || 0) - rows.reduce((a, c) => a + (c.usd || 0), 0), tgap = (lc.totalTokens || 0) - rows.reduce((a, c) => a + (c.totalTokens || 0), 0);
+  if (gap > 1e-9 || tgap > 0) {
+    if (rows.length) { rows.at(-1).usd += Math.max(0, gap); rows.at(-1).totalTokens += Math.max(0, tgap); }
+    else rows.push({ role: x.interrupted?.role ?? "agent", usd: Math.max(0, gap), totalTokens: Math.max(0, tgap) });
+  }
+  return rows;
+}
+
+// ---------------------------------------------------------------- live tool timing (shared by runs, bundles, discussions, helpers)
+// The agent → core tools: never stopped from the UI.
+const BRIDGE_TOOLS = new Set(["ask_human", "submit_spec", "report_done", "submit_review", "submit_qa", "submit_tickets"]);
+const pad2 = (n) => String(n).padStart(2, "0");
+/** A finished call's duration: `850 ms`, `12.4 s`, `3m 05s`, `1h 02m`. */
+function fmtDur(ms) {
+  if (!(ms >= 0)) return "";
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  if (ms < 59950) return `${(ms / 1000).toFixed(1)} s`;
+  const s = Math.round(ms / 1000);
+  if (s < 3600) return `${Math.floor(s / 60)}m ${pad2(s % 60)}s`;
+  return `${Math.floor(s / 3600)}h ${pad2(Math.floor((s % 3600) / 60))}m`;
+}
+/** A running clock: `0:42`, `12:05`, `1:02:09`. */
+function fmtClock(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000)), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  return h ? `${h}:${pad2(m)}:${pad2(s % 60)}` : `${m}:${pad2(s % 60)}`;
+}
+const isAborted = (res) => !!res?.isError && /Tool \S+ was aborted/.test(String(res.text ?? ""));
+/** The call's entry in the transcript's current tool round (`running`), if any. */
+const runningOf = (t, callId) => (t?.running ?? []).find((x) => same(x.callId, callId));
+/**
+ * A running call's start in this browser's clock (rounded to the second, so the row's HTML stays stable across fetches):
+ * the server's `startedAt` corrected for skew with `now`, the server's clock when the transcript was read.
+ */
+function clientStart(t, startedAt) {
+  t._at ??= Date.now(); // when this transcript reached the browser (stamped on first use, right after the fetch)
+  return Math.round((startedAt + (t._at - (t.now ?? t._at))) / 1000) * 1000;
+}
+// Clock spans (`data-clock` = start in client ms) tick every second while any is on screen.
+let clockTimer = 0;
+function tickClocks() {
+  const els = document.querySelectorAll("[data-clock]");
+  if (!els.length) { clearInterval(clockTimer); clockTimer = 0; return; }
+  const now = Date.now();
+  els.forEach((el) => { const v = fmtClock(now - Number(el.dataset.clock)); if (el.textContent !== v) el.textContent = v; });
+}
+function ensureClocks() {
+  tickClocks();
+  if (!clockTimer && document.querySelector("[data-clock]")) clockTimer = setInterval(tickClocks, 1000);
+}
+const clockSpan = (start, text) => `<span class="s-clock" data-clock="${start}">${text ? fmtClock(Date.now() - start) : ""}</span>`;
+/** The live line while a call of `t` runs: "Builder is running bash · 0:42" (null when none runs). */
+function runningToolHtml(role, t) {
+  const x = (t?.running ?? []).filter((y) => y.status === "running").at(-1);
+  if (!x) return null;
+  const name = x.name ?? (t.items ?? []).flatMap((i) => i.toolCalls ?? []).find((c) => same(c.id, x.callId))?.name ?? "a tool";
+  return `<span class="shimmer">${esc(roleName(role))} is running ${esc(name)}</span>${x.startedAt != null ? ` · ${clockSpan(clientStart(t, x.startedAt), true)}` : ""}`;
+}
+// Your turn on the board: a pending ask, or an agent paused by an interrupt (waiting for your message).
+const yourTurn = (x) => !!(pending(x) || (x.interrupted && !TERMINAL.includes(x.state) && !BUNDLE_TERMINAL.includes(x.state)));
 const reduceMotion = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
 const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
 const same = (a, b) => a != null && b != null && String(a) === String(b);
@@ -241,14 +309,15 @@ function bundleCardHtml(b) {
   if (d?.pr) chips.push(`<span class="rchip" title="Pull request">PR #${esc(d.pr.number)}</span>`);
   if (b.reviews?.length) chips.push(`<span class="rchip${b.reviewRound >= b.caps.review ? " hot" : ""}" title="Review round ${b.reviewRound} of ${b.caps.review}">R${b.reviewRound}/${b.caps.review}</span>`);
   if (b.ciFixes > 0 || b.state === "AWAITING_CI") chips.push(`<span class="rchip" title="CI fix rounds used">CI ${b.ciFixes}/${b.caps.ciFix}</span>`);
-  const cls = ["card", "bundle-card", pa ? "turn" : "", b.state === "ESCALATED" || b.state === "FAILED" ? "esc" : ""].join(" ");
+  const paused = !pa && !BUNDLE_TERMINAL.includes(b.state) && !!b.interrupted;
+  const cls = ["card", "bundle-card", pa || paused ? "turn" : "", b.state === "ESCALATED" || b.state === "FAILED" ? "esc" : ""].join(" ");
   return `<button type="button" class="${cls}" data-id="${esc(b.id)}" data-bundle="${esc(b.id)}" title="${esc(bundleTitle(b))}">
     <div class="card-row"><span class="bchip" title="${esc(b.id)}">${esc(b.id)}</span><span class="meta">${plural(b.members.length, "ticket")}</span></div>
-    <div class="card-row card-state">${bundleStateLabel(b)}${pa ? `<span class="turn-badge">${esc(bundleTurnText(pa.question))}</span>` : ""}${b.mergeRequested && !pa ? `<span class="meta" title="Merge was clicked: it merges by itself when the update is green and needed no fix">merging when green</span>` : ""}</div>
+    <div class="card-row card-state">${bundleStateLabel(b)}${pa ? `<span class="turn-badge">${esc(bundleTurnText(pa.question))}</span>` : paused ? `<span class="turn-badge" title="${esc(roleName(b.interrupted.role))} is paused: send a message to continue">Your turn · paused</span>` : ""}${b.mergeRequested && !pa ? `<span class="meta" title="Merge was clicked: it merges by itself when the update is green and needed no fix">merging when green</span>` : ""}</div>
     <div class="bmembers">${b.members.map((m) => `<div class="bmember"><span class="key" title="${esc(memberKey(m))}">${esc(memberKey(m))}</span><span class="bm-title" title="${esc(m.title)}">${esc(m.title)}</span></div>`).join("")}</div>
     <div class="card-foot">
       <div class="card-row foot-l">${ui.filter.project ? "" : `<span class="pchip" title="${esc(b.project)}">${esc(b.project)}</span>`}${chips.length ? `<span class="rounds">${chips.join("")}</span>` : ""}</div>
-      <div class="foot-r"><span class="meta">${money(totalUsd(b))} · ${ago(b.createdAt)}</span>${role ? avatar(role, live) : ""}</div>
+      <div class="foot-r"><span class="meta"><span class="card-cost">${money(ownerUsd(b))}</span> · ${ago(b.createdAt)}</span>${role ? avatar(role, live) : ""}</div>
     </div>
   </button>`;
 }
@@ -257,7 +326,7 @@ function visibleBundles() {
   return [...ui.bundles.values()].filter((b) => {
     if (!bundleOnBoard(b)) return false; // merged members show in Done, cancelled ones are back in Ready
     if (f.project && b.project !== f.project) return false;
-    if (f.turn && !pending(b)) return false;
+    if (f.turn && !yourTurn(b)) return false;
     if (f.active && b.state === "FAILED") return false;
     if (q && !`${b.id} ${b.project} ${b.members.map((m) => `${m.title} ${memberKey(m)}`).join(" ")}`.toLowerCase().includes(q)) return false;
     return true;
@@ -357,7 +426,7 @@ function visibleRuns() {
   return [...ui.runs.values()].filter((r) => {
     if (r.cleared) return false; // cleared runs stay in ui.runs (for stable ticket keys) but never show on the board
     if (f.project && r.project !== f.project) return false;
-    if (f.turn && !pending(r)) return false;
+    if (f.turn && !yourTurn(r)) return false;
     if (f.active && TERMINAL.includes(r.state)) return false;
     if (!f.closed && (r.state === "FAILED" || r.state === "CANCELLED")) return false;
     if (q && !`${r.request.title} ${r.request.body} ${keyOf(r.id)} ${r.project}`.toLowerCase().includes(q)) return false;
@@ -371,14 +440,15 @@ function cardHtml(r) {
   if (r.qaStatus && r.qaStatus !== "off") chips.push(`<span class="rchip${r.qaStatus === "unavailable" ? " hot" : ""}" title="${esc(QA_LABEL[r.qaStatus] ?? r.qaStatus)}">QA ${r.qaStatus === "ran" ? "✓" : r.qaStatus === "skipped" ? "–" : "!"}</span>`);
   if (r.ciFixes > 0 || r.state === "AWAITING_CI") chips.push(`<span class="rchip" title="CI fix rounds used">CI ${r.ciFixes}/${r.caps.ciFix}</span>`);
   const flag = r.state === "ESCALATED" ? `<span class="flag">▲ ${r.escalation?.cap === "ciFix" ? "CI fix cap hit" : r.escalation?.cap === "review" ? "Review cap hit" : "Needs a decision"}</span>` : "";
-  const cls = ["card", pa ? "turn" : "", r.state === "ESCALATED" ? "esc" : "", r.state === "FAILED" || r.state === "CANCELLED" ? "closed" : ""].join(" ");
+  const paused = !pa && !TERMINAL.includes(r.state) && !!r.interrupted;
+  const cls = ["card", pa || paused ? "turn" : "", r.state === "ESCALATED" ? "esc" : "", r.state === "FAILED" || r.state === "CANCELLED" ? "closed" : ""].join(" ");
   const from = r.request.meta?.discussion;
   return `<button type="button" class="${cls}" data-id="${esc(r.id)}" title="${esc(r.request.title)}">
     <div class="card-title">${esc(r.request.title)}</div>
-    <div class="card-row card-state">${stateLabel(r)}${pa ? `<span class="turn-badge">${esc(turnText(pa.question))}</span>` : ""}${flag}</div>
+    <div class="card-row card-state">${stateLabel(r)}${pa ? `<span class="turn-badge">${esc(turnText(pa.question))}</span>` : paused ? `<span class="turn-badge" title="${esc(roleName(r.interrupted.role))} is paused: send a message to continue">Your turn · paused</span>` : ""}${flag}</div>
     <div class="card-foot">
       <div class="card-row foot-l"><span class="key" title="${esc(keyOf(r.id))}">${esc(keyOf(r.id))}</span>${from ? `<span class="disc-mark" title="From discussion: ${esc(from.title)}" aria-label="From discussion: ${esc(from.title)}">${ICON.chat}</span>` : ""}${ui.filter.project ? "" : `<span class="pchip" title="${esc(r.project)}">${esc(r.project)}</span>`}${r.bundle && r.state !== "READY" ? `<span class="bchip" title="${r.state === "DELIVERED" ? "Merged in" : "Shipped in"} ${esc(r.bundle)}">${esc(r.bundle)}</span>` : ""}${chips.length ? `<span class="rounds">${chips.join("")}</span>` : ""}</div>
-      <div class="foot-r"><span class="meta">${money(totalUsd(r))} · ${ago(r.createdAt)}</span>${role ? avatar(role, live) : ""}</div>
+      <div class="foot-r"><span class="meta"><span class="card-cost">${money(ownerUsd(r))}</span> · ${ago(r.createdAt)}</span>${role ? avatar(role, live) : ""}</div>
     </div>
   </button>`;
 }
@@ -410,10 +480,10 @@ function renderBoard() {
   const byCol = Object.fromEntries(COLUMNS.map((c) => [c.key, []]));
   runs.forEach((r) => { const col = boardColumn(r); if (col) byCol[col].push(r); });
   // "Your turn" first; then pipeline order of the exact stage, oldest first (Done: most recently updated first).
-  for (const k in byCol) byCol[k].sort((a, b) => (pending(b) ? 1 : 0) - (pending(a) ? 1 : 0) || (k === "done" ? b.updatedAt - a.updatedAt : phaseOf(a)[0] - phaseOf(b)[0] || a.createdAt - b.createdAt));
+  for (const k in byCol) byCol[k].sort((a, b) => (yourTurn(b) ? 1 : 0) - (yourTurn(a) ? 1 : 0) || (k === "done" ? b.updatedAt - a.updatedAt : phaseOf(a)[0] - phaseOf(b)[0] || a.createdAt - b.createdAt));
   // Ticks survive renders while their runs stay in the Ready column.
   ui.ship = ui.ship.filter((id) => byCol.ready.some((r) => r.id === id));
-  const bundles = visibleBundles().sort((a, b) => (pending(b) ? 1 : 0) - (pending(a) ? 1 : 0) || a.createdAt - b.createdAt);
+  const bundles = visibleBundles().sort((a, b) => (yourTurn(b) ? 1 : 0) - (yourTurn(a) ? 1 : 0) || a.createdAt - b.createdAt);
   // "Clear all" acts on exactly the Done cards shown; a pending confirmation resets when that set changes.
   const doneSig = byCol.done.map((r) => r.id).sort().join(",");
   if (ui.confirmClearAll && ui.confirmClearAll !== doneSig) ui.confirmClearAll = null;
@@ -454,13 +524,13 @@ function renderBoard() {
   ui.liveSig = liveSignature();
 
   const all = [...ui.runs.values()].filter((r) => !r.cleared && (!ui.filter.project || r.project === ui.filter.project));
-  const bTurns = [...ui.bundles.values()].filter((b) => (!ui.filter.project || b.project === ui.filter.project) && bundleOnBoard(b) && pending(b)).length;
-  $("#n-turn").textContent = all.filter((r) => pending(r)).length + bTurns;
+  const bTurns = [...ui.bundles.values()].filter((b) => (!ui.filter.project || b.project === ui.filter.project) && bundleOnBoard(b) && yourTurn(b)).length;
+  $("#n-turn").textContent = all.filter((r) => yourTurn(r)).length + bTurns;
   $("#n-active").textContent = all.filter((r) => !TERMINAL.includes(r.state)).length;
   $("#n-closed").textContent = all.filter((r) => r.state === "FAILED" || r.state === "CANCELLED").length;
   const p = ui.projects.find((x) => x.name === ui.filter.project);
   $("#board-title").textContent = p ? `${p.name} pipeline` : "Pipeline";
-  const turns = [...ui.runs.values()].filter((r) => !r.cleared && pending(r)).length + [...ui.bundles.values()].filter((b) => bundleOnBoard(b) && pending(b)).length;
+  const turns = [...ui.runs.values()].filter((r) => !r.cleared && yourTurn(r)).length + [...ui.bundles.values()].filter((b) => bundleOnBoard(b) && yourTurn(b)).length;
   document.title = turns ? `(${turns}) Factory Board` : "Factory Board";
 }
 // Cards leaving the board (cleared): the card animation in reverse, unless reduced motion is on.
@@ -606,8 +676,60 @@ function refreshConv(run, cid) {
     convTimers.delete(k);
   }, 120);
 }
+// cost.updated: the owner's total (recorded + live). The cached view's live part becomes total − recorded, so the card,
+// the header and the KPI show the event's total at once; the open owner's view is refetched for its cost-by-role table
+// (only the cost parts are drawn again, never the transcript).
+function setLive(x, e, recorded, recordedTokens) {
+  x.liveCost = { byRole: [], ...(x.liveCost ?? {}), usd: Math.max(0, (e.usd || 0) - recorded), totalTokens: Math.max(0, (e.totalTokens || 0) - recordedTokens) };
+}
+function setCardCost(id, usd) {
+  const c = cardEl(id)?.querySelector(".card-cost");
+  if (c) c.textContent = money(usd);
+}
+function setOpenCost(usd) {
+  $("#rv-cost").textContent = money(usd);
+  document.querySelectorAll("#rv-details-inner .kpi-cost").forEach((el) => (el.textContent = money(usd)));
+}
+const costTimers = new Map();
+function refetchCost(kind, id) {
+  const k = `${kind}:${id}`;
+  if (costTimers.has(k)) return;
+  costTimers.set(k, setTimeout(async () => {
+    costTimers.delete(k);
+    try {
+      if (kind === "run") {
+        const r = await core.getRun(id); if (!r) return;
+        ui.runs.set(id, r); setCardCost(id, ownerUsd(r));
+        if (ui.open === id && !ui.mode) { setOpenCost(ownerUsd(r)); renderDetails(r); }
+      } else {
+        const b = await core.getBundle(id); if (!b) return;
+        ui.bundles.set(id, b); setCardCost(id, ownerUsd(b));
+        if (ui.open === id && ui.mode === "bundle") { setOpenCost(ownerUsd(b)); renderBundleDetails(b); }
+      }
+    } catch {}
+  }, 150));
+}
+function onCostUpdated(e) {
+  if (e.run) {
+    const r = ui.runs.get(e.run); if (!r) return;
+    setLive(r, e, totalUsd(r), (r.cost ?? []).reduce((a, c) => a + (c.totalTokens || 0), 0));
+    setCardCost(r.id, ownerUsd(r));
+    if (ui.open === r.id && !ui.mode) { setOpenCost(ownerUsd(r)); refetchCost("run", r.id); }
+  } else if (e.bundle) {
+    const b = ui.bundles.get(e.bundle); if (!b) return;
+    setLive(b, e, totalUsd(b), (b.cost ?? []).reduce((a, c) => a + (c.totalTokens || 0), 0));
+    setCardCost(b.id, ownerUsd(b));
+    if (ui.open === b.id && ui.mode === "bundle") { setOpenCost(ownerUsd(b)); refetchCost("bundle", b.id); }
+  } else if (e.discussion) {
+    const d = ui.discs.get(e.discussion); if (!d) return;
+    setLive(d, e, d.cost?.usd || 0, d.cost?.totalTokens || 0);
+    if (ui.mode === "discussion" && ui.open === d.id) setOpenCost(discUsd(d));
+  }
+}
+const discUsd = (d) => (d.cost?.usd || 0) + (d.liveCost?.usd || 0);
 function onEvent(e) {
   if (e.type === "project.deleted") { projectDeleted(e); return; }
+  if (e.type === "cost.updated") { onCostUpdated(e); return; }
   if (e.type.startsWith("discussion.")) return withDiscussions(() => onDiscussionEvent(e));
   if (e.type.startsWith("bundle.")) return onBundleEvent(e);
   if (e.type === "conversation.updated") {
@@ -800,7 +922,7 @@ function renderRunView() {
   $("#rv-key").textContent = keyOf(r.id);
   $("#rv-title").textContent = r.request.title; $("#rv-title").title = r.request.title;
   $("#rv-state").innerHTML = stateLabel(r) + (r.cleared ? ` <span class="lozenge cleared" title="${esc(clearedText(r))}">Cleared</span>` : "");
-  $("#rv-cost").textContent = money(totalUsd(r));
+  $("#rv-cost").textContent = money(ownerUsd(r));
   const { idx, name, cls } = stageInfo(r), done = r.state === "DELIVERED";
   const label = done ? "Delivered" : r.state === "FAILED" ? `Failed in ${name}` : r.state === "CANCELLED" ? "Cancelled" : `${name}${r.round > 1 ? ` · round ${r.round}` : ""}`;
   $("#rv-progress").innerHTML = `<div class="rv-track">${PIPELINE.map(([, n], i) => `<span class="rv-seg${done || i < idx ? " done" : i === idx ? ` now ${cls}` : ""}" title="${n}"></span>`).join("")}</div><span class="rv-stage">${label}</span>`;
@@ -864,10 +986,26 @@ function argSummary(args) {
   const s = Object.values(args ?? {}).map((v) => (typeof v === "string" ? v : JSON.stringify(v))).join(" · ").replace(/\s+/g, " ");
   return s.length > 160 ? `${s.slice(0, 160)}…` : s;
 }
+// One tool row, the same for runs, bundles, discussions and helpers: its status and how long it took; a running call
+// counts up (client-side) and has Stop (stopToolCall), unless it is a bridge tool; a queued one reads "queued".
 function stepHtml(call, res, t, r) {
   let ico, more;
-  if (res) { ico = `<span class="s-ico ${res.isError ? "err" : "ok"}">${res.isError ? ICON.err : ICON.ok}</span>`; more = `<span class="s-more">${res.isError ? "failed" : "details"} <span class="chev">›</span></span>`; }
+  const live = res ? null : runningOf(t, call.id);
+  if (res && isAborted(res)) {
+    const d = fmtDur(res.durationMs);
+    ico = `<span class="s-ico idle">${ICON.stop}</span>`; more = `<span class="s-more stopped">${d ? `stopped after ${d}` : "stopped"} <span class="chev">›</span></span>`;
+  } else if (res) {
+    const d = fmtDur(res.durationMs);
+    ico = `<span class="s-ico ${res.isError ? "err" : "ok"}">${res.isError ? ICON.err : ICON.ok}</span>`; more = `<span class="s-more">${res.isError ? "failed" : "details"}${d ? ` · <span class="s-dur">${d}</span>` : ""} <span class="chev">›</span></span>`;
+  }
   else if (call.name === "ask_human" && pending(r)?.question.kind === "discussion") { ico = `<span class="s-ico wait">${ICON.wait}</span>`; more = `<span class="s-more wait">waiting for you</span>`; }
+  else if (live?.status === "pending") { ico = `<span class="s-ico idle">${ICON.idle}</span>`; more = `<span class="s-more queued">queued</span>`; }
+  else if (live?.status === "running") {
+    const stop = BRIDGE_TOOLS.has(call.name) || t.conversationId == null ? ""
+      : `<button type="button" class="s-stop" data-stop-call="${esc(call.id)}" data-conv="${esc(t.conversationId)}" title="Stop this ${esc(call.name)} call: the agent gets its result as aborted and carries on">${ICON.stop} Stop</button>`;
+    ico = `<span class="s-ico"><span class="spin"></span></span>`;
+    more = `<span class="s-more run">running${live.startedAt != null ? ` ${clockSpan(clientStart(t, live.startedAt), false)}` : ""}${stop}</span>`;
+  }
   else if (t.busy) { ico = `<span class="s-ico"><span class="spin"></span></span>`; more = `<span class="s-more run">running</span>`; }
   else { ico = `<span class="s-ico idle">${ICON.idle}</span>`; more = `<span class="s-more">pending</span>`; }
   const det = res?.details ? `<span class="mono">${esc(JSON.stringify(res.details))}</span>` : "";
@@ -909,10 +1047,13 @@ function blocksFor(r, t) {
   const target = chatTarget(r);
   if (target.role === role && (target.cid == null || same(target.cid, t.conversationId)))
     for (const m of r.messages ?? []) if (m.conversationId == null && m.to === role) waiting.push(m);
+  // A paused agent (interrupted) takes your message as its next input right away: not queued behind a step.
+  const paused = !!r.interrupted && r.interrupted.role === role;
   for (const m of waiting) {
     if (shown.has(m.id)) continue;
     shown.add(m.id);
-    out.push({ k: `msg:${m.id}`, cls: "you queued", html: youBubble(m.text, `${viaText(m.by)} · queued until the ${role} finishes its current step`) });
+    if (paused) out.push({ k: `msg:${m.id}`, cls: "you", html: youBubble(m.text, `${viaText(m.by)} · resuming the ${role}`) });
+    else out.push({ k: `msg:${m.id}`, cls: "you queued", html: youBubble(m.text, `${viaText(m.by)} · queued until the ${role} finishes its current step`) });
   }
   if (t.busy && !openCall) out.push({ k: "__working", html: `<div class="working"><span class="dots"><i></i><i></i><i></i></span><span class="shimmer">${roleName(role)} is working</span></div>` });
   if (!out.length) out.push({ k: "__empty", html: `<p class="hint">Nothing here yet.</p>` });
@@ -945,6 +1086,7 @@ function patch(container, blocks, live) {
     prev = el;
   }
   old.forEach((el) => el.remove());
+  ensureClocks(); // running tool rows: their clocks start (and tick) from here
   return added;
 }
 // Reveal newly arrived assistant text progressively (from `from` characters on), like a stream.
@@ -1016,6 +1158,20 @@ function renderTimeline(r, first) {
   if (first || ui.txConv !== "timeline") { tx.replaceChildren(); ui.txConv = "timeline"; first = true; }
   settleScroll(first, patch(tx, ev.map((x) => ({ k: x.k, cls: "tlb", html: `<div class="tl"><span class="tl-time">${stamp(x.at)}</span><span class="tl-dot ${x.dot}"></span><div>${x.html}</div></div>` })), !first));
 }
+// A tool row's Stop: stopToolCall on the open run's, bundle's or discussion's Conversation; then the transcript refreshes.
+async function stopToolCall(btn) {
+  if (btn.disabled || !ui.open) return;
+  const owner = ui.mode === "bundle" ? { bundle: ui.open } : ui.mode === "discussion" ? { discussion: ui.open } : { run: ui.open };
+  const callId = btn.dataset.stopCall, conversationId = btn.dataset.conv, mode = ui.mode, id = ui.open;
+  btn.disabled = true;
+  const ok = await act(() => core.stopToolCall({ ...owner, conversationId, callId }));
+  if (!ok) { btn.disabled = false; return; }
+  btn.textContent = "Stopping…";
+  if (ui.open !== id || ui.mode !== mode) return;
+  if (mode === "bundle") refreshBundleConv(id, conversationId);
+  else if (mode === "discussion") refreshDiscConv(id);
+  else refreshConv(id, conversationId);
+}
 function copyFrom(btn, text, selectEl) {
   (navigator.clipboard?.writeText(text) ?? Promise.reject()).then(() => { btn.textContent = "Copied"; setTimeout(() => (btn.textContent = "Copy"), 1400); })
     .catch(() => { if (!selectEl) return; const range = document.createRange(); range.selectNodeContents(selectEl); const s = getSelection(); s.removeAllRanges(); s.addRange(range); btn.textContent = "Selected"; });
@@ -1038,16 +1194,31 @@ function updateComposerLive(r) {
   const done = new Set((t?.items ?? []).filter((i) => i.toolResult).map((i) => i.toolResult.callId));
   const tool = (t?.items ?? []).flatMap((i) => i.toolCalls ?? []).filter((c) => !done.has(c.id)).at(-1)?.name;
   const pa = pending(r), gate = pa && pa.question.kind !== "discussion";
-  line.innerHTML = busy ? `<span class="shimmer">${roleName(role)} is ${tool ? `running ${esc(tool)}` : "working"}</span>`
+  const running = busy ? runningToolHtml(role, t) : null;
+  line.innerHTML = r.interrupted ? `<span style="color:var(--turn)">${esc(roleName(r.interrupted.role))} is paused</span>`
+    : running ? running
+    : busy ? `<span class="shimmer">${roleName(role)} is ${tool ? `running ${esc(tool)}` : "working"}</span>`
     : LIVE_STAGE[r.state] ? `<span class="shimmer">${LIVE_STAGE[r.state]}</span>`
     : gate ? `<span style="color:var(--turn)">Waiting for your decision on the card above</span>`
     : r.state === "READY" ? "Ready · tick it on the board, or Ship this ticket above" : `${cap1(role ?? "factory")} is between steps`;
   const tg = chatTarget(r), hint = $("#c-hint");
   if (hint) {
     const tBusy = tg.cid != null && convLive(tg.cid);
-    hint.textContent = tg.cid == null ? `Delivered when the ${tg.role} starts` : tBusy || ["DISCUSSING", "BUILDING", "REVIEWING"].includes(r.state) && !gate ? `Delivered when the ${tg.role} finishes its current step` : `The ${tg.role} replies right away`;
+    hint.textContent = r.interrupted ? `Your message resumes the ${r.interrupted.role} right away` : tg.cid == null ? `Delivered when the ${tg.role} starts` : tBusy || ["DISCUSSING", "BUILDING", "REVIEWING"].includes(r.state) && !gate ? `Delivered when the ${tg.role} finishes its current step` : `The ${tg.role} replies right away`;
   }
+  const int = $("#chat-int");
+  if (int) int.hidden = !canInterrupt(r, tg, TERMINAL.includes(r.state));
+  ensureClocks();
 }
+// Interrupt shows while the chat box's target is working and can be paused: not terminal, not paused already, and its
+// role takes messages (the view's `messageRoles`: a paused agent only continues through a message).
+function canInterrupt(x, tg, terminal) {
+  if (terminal || x.interrupted || tg.cid == null || !convLive(tg.cid)) return false;
+  const roles = x.messageRoles;
+  return !Array.isArray(roles) || roles.includes(tg.role);
+}
+const interruptBtnHtml = (id, role) => `<button type="button" class="btn small c-int" id="${id}" hidden title="Pause the ${esc(role)}: its generation and tools stop, and it waits for your next message">${ICON.stop} Interrupt</button>`;
+const pausedHtml = (role, id) => `<div class="c-paused"><span class="c-ico">${ICON.wait}</span><span class="c-paused-text"><b>${esc(roleName(role))}</b> is paused. Send a message to continue</span><button type="button" class="btn small" id="${id}" title="Send &quot;Continue.&quot; to the ${esc(role)}">Continue</button></div>`;
 function endComposer(r) {
   const d = r.artifacts.delivery;
   if (r.state === "DELIVERED") return `<div class="cbox ok"><div class="c-status"><span class="c-ico ok">${ICON.check}</span><div class="c-main"><span class="c-line">${r.bundle ? `Merged in ${esc(r.bundle)}` : "Delivered"}</span><span class="c-sub">${d?.kind === "pr" ? `PR #${d.pr?.number ?? ""}` : "Pushed to main"} · ${plural(r.advisory.length, "advisory note")}${r.acceptedBlocking.length ? ` · ${plural(r.acceptedBlocking.length, "accepted finding")}` : ""} · ${r.cleared ? esc(clearedText(r)) : "start a new ticket for follow-up work"}</span></div>${d?.url ? `<a class="btn lg" href="${esc(d.url)}" target="_blank" rel="noopener noreferrer">${d.kind === "pr" ? "Open PR" : "Open repo"} ${ICON.ext}</a>` : ""}</div></div>`;
@@ -1059,7 +1230,7 @@ function autosize(ta, send) { ta.style.height = "auto"; ta.style.height = `${Mat
 function renderComposer(r) {
   const pa = pending(r), disc = pa?.question.kind === "discussion", tg = chatTarget(r);
   const bundled = r.state === "READY" && inActiveBundle(r);
-  const key = TERMINAL.includes(r.state) ? `end:${r.state}:${r.cleared ? "cleared" : ""}` : disc ? `ask:${pa.id}` : bundled ? `bundle:${r.bundle}` : `chat:${tg.role}`;
+  const key = TERMINAL.includes(r.state) ? `end:${r.state}:${r.cleared ? "cleared" : ""}` : disc ? `ask:${pa.id}` : bundled ? `bundle:${r.bundle}` : `chat:${tg.role}:${r.interrupted ? `paused:${r.interrupted.role}` : ""}`;
   if (key === ui.composerKey) return updateComposerLive(r);
   const draft = $("#cmp-chat")?.value ?? "";
   ui.composerKey = key;
@@ -1071,23 +1242,32 @@ function renderComposer(r) {
     return;
   }
   if (disc) return discussionComposer(el, r, pa);
-  el.innerHTML = `<div class="cbox">
+  el.innerHTML = `<div class="cbox${r.interrupted ? " paused" : ""}">
     <div class="c-top"><span class="to-chip">To ${avatar(tg.role, false)}<b>${cap1(tg.role)}</b></span><span class="c-live-line" id="c-live"></span></div>
-    <form class="c-input" id="chat-form"><textarea id="cmp-chat" rows="1" placeholder="Message the ${tg.role}…" aria-label="Message the ${tg.role}"></textarea><button type="submit" class="send" id="chat-send" disabled aria-label="Send message">${ICON.send}</button></form>
+    ${r.interrupted ? pausedHtml(r.interrupted.role, "c-continue") : ""}
+    <form class="c-input" id="chat-form"><textarea id="cmp-chat" rows="1" placeholder="Message the ${tg.role}…" aria-label="Message the ${tg.role}"></textarea>${interruptBtnHtml("chat-int", tg.role)}<button type="submit" class="send" id="chat-send" disabled aria-label="Send message">${ICON.send}</button></form>
     <div class="c-foot"><span id="c-hint"></span><span><kbd>Enter</kbd> to send · <kbd>Shift</kbd> + <kbd>Enter</kbd> for a new line</span></div></div>`;
   const ta = $("#cmp-chat"), send = $("#chat-send");
   ta.value = draft; autosize(ta, send);
   ta.addEventListener("input", () => autosize(ta, send));
   ta.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); $("#chat-form").requestSubmit(); } });
-  $("#chat-form").addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const text = ta.value.trim(); if (!text || send.dataset.busy) return;
-    send.dataset.busy = "1"; send.disabled = true;
+  $("#chat-int").addEventListener("click", async (e) => {
+    const b = e.currentTarget; b.disabled = true;
+    if (await act(() => core.interruptAgent(r.id), `Interrupting the ${tg.role}`)) refreshRun(r.id);
+    b.disabled = false;
+  });
+  $("#c-continue")?.addEventListener("click", (e) => sendChat("Continue.", e.currentTarget));
+  $("#chat-form").addEventListener("submit", (e) => { e.preventDefault(); sendChat(ta.value.trim()); });
+  // Your text (or Continue's "Continue.") through the ordinary message op; a refused one stays in the box.
+  async function sendChat(text, btn) {
+    if (!text || send.dataset.busy) return;
+    send.dataset.busy = "1"; send.disabled = true; if (btn) btn.disabled = true;
     let out;
     const ok = await act(async () => { out = await core.message(r.id, text); });
-    delete send.dataset.busy;
+    delete send.dataset.busy; if (btn) btn.disabled = false;
     if (!ok) { autosize(ta, send); return; }
-    ta.value = ""; autosize(ta, send);
+    if (!btn) ta.value = "";
+    autosize(ta, send);
     const now = openRunData();
     const npa = now && pending(now);
     if (npa?.question.kind === "approval" && npa.question.gate !== "spec") ui.lastGateMsg = text;
@@ -1096,7 +1276,7 @@ function renderComposer(r) {
     else if (String(ui.thread) !== String(out.conversationId)) { ui.thread = out.conversationId; renderThreads(now); loadThread(true); }
     refreshRun(r.id);
     if (out.conversationId != null) refreshConv(r.id, out.conversationId);
-  });
+  }
   updateComposerLive(r);
 }
 function discussionComposer(el, r, pa) {
@@ -1255,11 +1435,14 @@ function renderDetails(r) {
   const byRole = {};
   r.cost.forEach((c) => { const k = `${c.role}:${c.round}:${c.trigger ?? ""}`; byRole[k] ??= { role: c.role, round: c.round, trigger: c.trigger, tokens: 0, usd: 0 }; byRole[k].tokens += c.totalTokens || 0; byRole[k].usd += c.usd || 0; });
   const ktok = (n) => (n >= 10000 ? `${(n / 1000).toFixed(0)}k` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
-  const costRows = Object.values(byRole).map((c) => `<tr><td>${roleName(c.role)}${c.trigger === "message" ? ` <span class="meta" title="Turns your messages started">· replies</span>` : ""}</td><td class="n">${c.round}</td><td class="n">${ktok(c.tokens)}</td><td class="n">${money(c.usd)}</td></tr>`).join("");
+  const liveRows = liveCostRows(r);
+  const costRows = Object.values(byRole).map((c) => `<tr><td>${roleName(c.role)}${c.trigger === "message" ? ` <span class="meta" title="Turns your messages started">· replies</span>` : ""}</td><td class="n">${c.round}</td><td class="n">${ktok(c.tokens)}</td><td class="n">${money(c.usd)}</td></tr>`).join("")
+    + liveRows.map((c) => `<tr class="live-cost"><td>${roleName(c.role)} <span class="meta" title="The turn in progress: not recorded yet">· in progress</span></td><td class="n">${r.round ?? ""}</td><td class="n">${ktok(c.totalTokens || 0)}</td><td class="n">${money(c.usd || 0)}</td></tr>`).join("");
+  const liveTok = liveRows.reduce((a, c) => a + (c.totalTokens || 0), 0);
   const from = r.request.meta?.discussion;
   $("#rv-details-inner").innerHTML = `
     ${from ? `<section class="d-sec from-disc">${ICON.chat}<span>From discussion: <button type="button" class="linkish" id="d-disc">${esc(from.title)}</button></span></section>` : ""}
-    <div class="kpis"><div class="kpi"><span class="k">Stage</span><span class="v">${allDone ? "Done" : name}</span></div><div class="kpi"><span class="k">Review</span><span class="v">${r.conversations.reviewers.length ? `${r.reviewRound}/${r.caps.review}` : "—"}</span></div>${r.qaStatus ? `<div class="kpi"><span class="k">AQ testing</span><span class="v" title="${esc(QA_LABEL[r.qaStatus] ?? r.qaStatus)}">${esc(cap1(r.qaStatus))}</span></div>` : ""}<div class="kpi"><span class="k">Cost</span><span class="v">${money(totalUsd(r))}</span></div></div>
+    <div class="kpis"><div class="kpi"><span class="k">Stage</span><span class="v">${allDone ? "Done" : name}</span></div><div class="kpi"><span class="k">Review</span><span class="v">${r.conversations.reviewers.length ? `${r.reviewRound}/${r.caps.review}` : "—"}</span></div>${r.qaStatus ? `<div class="kpi"><span class="k">AQ testing</span><span class="v" title="${esc(QA_LABEL[r.qaStatus] ?? r.qaStatus)}">${esc(cap1(r.qaStatus))}</span></div>` : ""}<div class="kpi"><span class="k">Cost</span><span class="v kpi-cost">${money(ownerUsd(r))}</span></div></div>
     <section class="d-sec"><h4>Progress</h4><div class="pipeline">${pipe}</div></section>
     ${r.request.body ? `<section class="d-sec"><h4>Request</h4><div class="f-body">${md(r.request.body)}</div></section>` : ""}
     <section class="d-sec"><h4>Artifacts</h4><div style="display:grid;gap:8px;font-size:13px">
@@ -1269,7 +1452,7 @@ function renderDetails(r) {
       ${d ? `<div>${d.kind === "pr" ? `PR #${d.pr?.number ?? ""}` : "Repo"} · <a href="${esc(d.url)}" target="_blank" rel="noopener noreferrer">${esc(String(d.url).replace(/^https?:\/\//, ""))}</a><div class="meta mono">${esc(String(d.sha ?? "").slice(0, 12))}</div></div>` : ""}
       ${ci ? `<div class="notice">${esc(ci.text)}</div>` : ""}</div></section>
     ${r.findingsLog.length ? `<section class="d-sec"><h4>Findings <span>${r.findingsLog.reduce((a, e) => a + e.findings.length, 0)}</span></h4>${findings}</section>` : ""}
-    ${r.cost.length ? `<section class="d-sec"><h4>Cost by role</h4><div class="scroll-x"><table class="cost"><thead><tr><th>Role</th><th class="n">Round</th><th class="n">Tokens</th><th class="n">USD</th></tr></thead><tbody>${costRows}<tr class="total"><td>Total</td><td></td><td class="n">${ktok(r.cost.reduce((a, c) => a + (c.totalTokens || 0), 0))}</td><td class="n">${money(totalUsd(r))}</td></tr></tbody></table></div></section>` : ""}
+    ${r.cost.length || liveRows.length ? `<section class="d-sec"><h4>Cost by role</h4><div class="scroll-x"><table class="cost"><thead><tr><th>Role</th><th class="n">Round</th><th class="n">Tokens</th><th class="n">USD</th></tr></thead><tbody>${costRows}<tr class="total"><td>Total</td><td></td><td class="n">${ktok(r.cost.reduce((a, c) => a + (c.totalTokens || 0), 0) + liveTok)}</td><td class="n">${money(ownerUsd(r))}</td></tr></tbody></table></div></section>` : ""}
     <section class="d-sec"><h4>Activity</h4><div style="display:grid;gap:6px">${r.notices.slice(-5).reverse().map((n) => `<div class="notice ${esc(n.level)}">${linkify(esc(n.text))}<span class="meta">${stamp(n.at)}</span></div>`).join("") || `<span class="meta">Nothing yet</span>`}</div></section>
     <section class="d-sec"><h4>Run</h4><dl class="dl">
       <dt>Project</dt><dd>${esc(r.project)}</dd><dt>Repo</dt><dd>${esc(r.repo)}${r.workspace?.newRepo ? ` <span class="meta">(created at delivery)</span>` : ""}</dd>
@@ -1535,6 +1718,8 @@ function wire() {
     if (ui.stick) showJump(false);
   });
   $("#tx").addEventListener("click", (e) => {
+    const st = e.target.closest("[data-stop-call]");
+    if (st) { e.preventDefault(); e.stopPropagation(); return stopToolCall(st); } // inside the row's <summary>: no toggle
     const cp = e.target.closest("[data-copy]");
     if (cp) { const pre = cp.closest(".s-sec").querySelector("pre"); return copyFrom(cp, pre.textContent, pre); }
     const mo = e.target.closest("[data-more]");
