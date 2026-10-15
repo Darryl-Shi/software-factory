@@ -118,6 +118,8 @@ export interface BundleView {
 	liveCost: LiveCost;
 	/** Set while the agent the bundle is with is paused by `interruptBundleAgent`, until the human's next message. */
 	interrupted?: Interrupted;
+	/** The roles that take messages (and so can be interrupted) in this bundle: the integrator, and the reviewer if `policy.messages` lists it. */
+	messageRoles: Role[];
 	failure?: { state: BundleState; reason: string };
 	workspace?: Workspace;
 	createdAt: number;
@@ -381,6 +383,8 @@ export interface RunView {
 	liveCost: LiveCost;
 	/** Set while the agent the run is with is paused by `interruptAgent`, until the human's next message. */
 	interrupted?: Interrupted;
+	/** The roles that take messages (and so can be interrupted) in this run: the pinned `policy.messages`. */
+	messageRoles: Role[];
 	configHash: string;
 	piVersion: string;
 	failure?: { state: RunState; gate?: Gate; reason: string };

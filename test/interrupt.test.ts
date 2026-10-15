@@ -289,8 +289,28 @@ describe("interruptAgent", () => {
 		const { builder, callId } = await slowBuilder(run);
 		await expect(web.interruptAgent(run)).rejects.toMatchObject({ code: "conflict", message: expect.stringContaining("policy.messages") });
 		expect((await t!.factory.getRun(run)).interrupted).toBeUndefined();
+		// the view says which roles take messages, so interfaces show Interrupt only for those
+		expect((await t!.factory.getRun(run)).messageRoles).toEqual(["architect"]);
 		await web.stopToolCall({ run, conversationId: builder, callId });
 		expect((await until(t!.factory, run, done)).state).toBe("READY");
+	});
+
+	test("a pause whose abort never reached the turn: the agent's bridge result is taken, and the message meant to resume it is still delivered", async () => {
+		await setup();
+		t!.control.builderSlow = "sleep 1; echo SLOW-DONE";
+		const run = await start();
+		const { builder } = await slowBuilder(run);
+		expect((await t!.factory.getRun(run)).messageRoles).toEqual(["architect", "builder", "reviewer"]);
+		// as if the interrupt's commit landed but its abort did not reach the turn (it ends on its own)
+		await t!.factory.patchRunForTests(run, (d) => {
+			d.interrupted = { role: "builder", conversationId: String(builder), key: d.driving!.key, at: Date.now(), by: "web" };
+		});
+		const sent = await t!.factory.as("web").message(run, "STRAY-HELLO");
+		expect(sent.conversationId).toBe(String(builder));
+		const v = await until(t!.factory, run, done);
+		expect(v.state).toBe("READY");
+		expect(v.interrupted).toBeUndefined();
+		await poll("the message in the builder's transcript", () => t!.factory.getConversation(run, builder), (x) => x.items.some((i) => i.author === "human" && i.text === "STRAY-HELLO"));
 	});
 });
 

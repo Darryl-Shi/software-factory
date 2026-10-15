@@ -3,6 +3,7 @@
 // so the run and bundle Tasks share their review, agent and CI code (task-kit.ts).
 import type { CleanedUp } from "./cleanup.ts";
 import { NO_LIVE_COST, type UsageSum } from "./usage.ts";
+import { DEFAULT_MESSAGE_ROLES } from "./messages.ts";
 import { defineDoc, defineDocFamily } from "@earendil-works/pi-durable";
 import { lastQaStatus, type ReviewRoundState } from "./run-doc.ts";
 import type {
@@ -186,6 +187,7 @@ export function toBundleView(d: BundleDocState, liveCost: LiveCost = NO_LIVE_COS
 		history: d.history,
 		cost: d.cost,
 		liveCost,
+		messageRoles: ["integrator", ...(((d.pinned.config.policy?.messages ?? DEFAULT_MESSAGE_ROLES) as Role[]).includes("reviewer") ? (["reviewer"] as Role[]) : [])],
 		...(d.interrupted ? { interrupted: { ...d.interrupted, conversationId: String(d.interrupted.conversationId) } } : {}),
 		...(d.failure ? { failure: { state: d.failure.state, reason: d.failure.reason } } : {}),
 		...(d.workspace ? { workspace: d.workspace } : {}),

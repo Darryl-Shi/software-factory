@@ -1576,6 +1576,8 @@ export class Factory implements FactoryCore {
 			if (doc.interrupted) throw new FactoryError("conflict", `${Role} is paused already; send a message to continue`);
 			// Core-driven: the Task is waiting for this agent's bridge tool in this state.
 			paused = driven.includes(doc.state) && doc.driving !== undefined && String(doc.driving.conversationId) === String(cid);
+			// The turn already ended with its bridge tool (the Task is about to move on): nothing will wait for a message.
+			if (paused && (await tx.doc(BridgeDoc, this.conversationId(cid) as never))?.results?.[doc.driving!.key] !== undefined) paused = false;
 			if (paused) doc.interrupted = { role: target.role, conversationId: String(cid), key: doc.driving!.key, at: this.now(), by };
 			doc.notices.push({ at: this.now(), level: "info", text: `${Role} interrupted by you; send a message to continue` });
 			doc.updatedAt = this.now();

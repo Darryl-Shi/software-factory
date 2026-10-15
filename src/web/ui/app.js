@@ -1211,11 +1211,11 @@ function updateComposerLive(r) {
   ensureClocks();
 }
 // Interrupt shows while the chat box's target is working and can be paused: not terminal, not paused already, and its
-// role is in the pinned policy.messages when the view carries it (otherwise the core's 409 says so in a toast).
+// role takes messages (the view's `messageRoles`: a paused agent only continues through a message).
 function canInterrupt(x, tg, terminal) {
   if (terminal || x.interrupted || tg.cid == null || !convLive(tg.cid)) return false;
-  const pm = x.policy?.messages;
-  return !Array.isArray(pm) || pm.includes(tg.role);
+  const roles = x.messageRoles;
+  return !Array.isArray(roles) || roles.includes(tg.role);
 }
 const interruptBtnHtml = (id, role) => `<button type="button" class="btn small c-int" id="${id}" hidden title="Pause the ${esc(role)}: its generation and tools stop, and it waits for your next message">${ICON.stop} Interrupt</button>`;
 const pausedHtml = (role, id) => `<div class="c-paused"><span class="c-ico">${ICON.wait}</span><span class="c-paused-text"><b>${esc(roleName(role))}</b> is paused. Send a message to continue</span><button type="button" class="btn small" id="${id}" title="Send &quot;Continue.&quot; to the ${esc(role)}">Continue</button></div>`;

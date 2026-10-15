@@ -317,6 +317,8 @@ The core's whole outside surface is `FactoryCore` (`src/core/types.ts`). Every o
     response and per tool result with usage, not per streamed token; zero for a terminal owner. Cost records and
     `turnCosts` are still written only at the end of a turn.
   - `interrupted: { role, conversationId, key, at, by }` is set while the agent is paused by an interrupt.
+  - `messageRoles` lists the roles that take messages, and so can be interrupted: a run's pinned `policy.messages`; a
+    bundle's integrator, plus the reviewer when `policy.messages` lists it.
   - `DiscussionView.cost` is the **recorded** total (the turns that ended); `DiscussionView.liveCost: { usd,
     totalTokens }` is the running turn's usage not yet in `turnCosts` (from the turn's starting usage, `turn.usage0`;
     zero between turns).
@@ -416,7 +418,10 @@ stops `serve` with an error naming the new paths.
   resume reattaches to it), with the usual header and situation note. The turn then goes on as before: the agent must
   still end with its bridge tool, and the nudges apply if it stops without one. An agent can be paused any number of
   times. If the agent called its bridge tool before the abort landed, the result is taken as usual and `interrupted`
-  is cleared. `cancelRun` / `cancelBundle` work while paused; a transition, a cancel and a retry clear `interrupted`.
+  is cleared, and a message already committed as its resume goes to the agent as an ordinary message (never lost). An
+  input that settled on its own just before the abort landed also waits for the resume while `interrupted` is set. An
+  interrupt that arrives after the turn's bridge result was recorded only aborts (it records no pause).
+  `cancelRun` / `cancelBundle` work while paused; a transition, a cancel and a retry clear `interrupted`.
 - A run records its pinned config hash and the Pi Durable version (pinned in `package.json`).
 - Storage is SQLite by default (`jsonl` alternative). What a finished run, bundle or discussion leaves on disk is
   deleted as soon as nothing uses it (§8.1).
@@ -573,7 +578,7 @@ rejected.
   bridge tools and pending rows have no Stop; a stopped or aborted row reads "stopped after <duration>". The live line
   at the top of the chat box reads e.g. "Builder is running bash · 0:42" (or "<Role> is paused").
 - **Interrupt** (run and bundle views): the chat box shows **Interrupt** next to Send while its target is working and
-  interruptible (not terminal, not paused, its role allowed by `policy.messages`); it calls `interruptAgent` /
+  interruptible (not terminal, not paused, its role in the view's `messageRoles`); it calls `interruptAgent` /
   `interruptBundleAgent`. While paused, the chat box shows a banner "<Role> is paused. Send a message to continue" with
   a **Continue** quick action that sends "Continue." through the ordinary `message` / `messageBundle`; the hint says
   "Your message resumes the <role> right away", and the message is shown as "resuming the <role>", not "queued until

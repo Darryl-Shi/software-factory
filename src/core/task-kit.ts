@@ -195,6 +195,7 @@ export function createTaskKit<D extends KitDoc>(svc: CoreServices, Doc: unknown,
 		}, c);
 		const handle = await rt.conversation(conversationId as never, c);
 		if (!handle) throw new Error(`conversation ${conversationId} is missing`);
+		const resumesOf = (doc: D) => (doc.messages ?? []).filter((m) => m.resume?.startsWith(`${key}:resume`));
 		const pausedHere = (doc: D) => !!doc.interrupted && String(doc.interrupted.conversationId) === String(conversationId) && doc.interrupted.key === key;
 		/**
 		 * After an aborted input: while the human has this agent paused (`interruptAgent`), wait durably for the message that
@@ -203,7 +204,7 @@ export function createTaskKit<D extends KitDoc>(svc: CoreServices, Doc: unknown,
 		const awaitResume = async (n: number): Promise<HumanMessage | undefined> => {
 			for (;;) {
 				const doc = await read(rt, d.id, c);
-				const resume = (doc.messages ?? []).filter((m) => m.resume?.startsWith(`${key}:resume`))[n];
+				const resume = resumesOf(doc)[n];
 				if (resume) return resume;
 				if (!pausedHere(doc)) return undefined;
 				if (rt.signal.aborted) throw new Cancelled();
@@ -223,8 +224,10 @@ export function createTaskKit<D extends KitDoc>(svc: CoreServices, Doc: unknown,
 			const settled = await sub.wait(c);
 			result = (await rt.snapshot(BridgeDoc, conversationId as never, c))?.results[key];
 			if (result !== undefined) break;
-			if (settled.status === "unanswered" && (settled as any).reason === "aborted") {
-				// Interrupted by the human: the turn neither fails nor uses a nudge; the next message continues it.
+			const now = await read(rt, d.id, c);
+			// Interrupted by the human: the turn neither fails nor uses a nudge; the next message continues it. (Also when
+			// the input had settled just before the abort landed: the pause is recorded, so a message is what continues.)
+			if ((settled.status === "unanswered" && (settled as any).reason === "aborted") || pausedHere(now) || resumesOf(now)[resumes]) {
 				const resume = await awaitResume(resumes);
 				if (resume) {
 					resumes += 1;
@@ -242,13 +245,20 @@ export function createTaskKit<D extends KitDoc>(svc: CoreServices, Doc: unknown,
 			requestId = `${key}:nudge${nudges}`;
 			text = `You stopped without calling ${tools.join(" or ")}. The factory only continues when you call ${tools.join(" or ")}. Continue your work if needed, then call it.`;
 		}
-		// The bridge tool won the race with an interrupt: the result is taken as usual and the pause is dropped.
-		if (result !== undefined && pausedHere(await read(rt, d.id, c)))
-			await rt.commit(async (tx) => {
-				const r = await docIn(tx, d.id);
-				if (pausedHere(r)) delete r.interrupted;
-				return undefined;
-			}, c);
+		if (result !== undefined) {
+			// The bridge tool won the race with an interrupt: the result is taken as usual and the pause is dropped. A
+			// message that was meant to resume the pause goes to the agent as an ordinary message (it is never lost).
+			const doc = await read(rt, d.id, c);
+			if (pausedHere(doc))
+				await rt.commit(async (tx) => {
+					const r = await docIn(tx, d.id);
+					if (pausedHere(r)) delete r.interrupted;
+					return undefined;
+				}, c);
+			const after = await read(rt, d.id, c);
+			for (const m of resumesOf(after).slice(resumes))
+				await handle.submit({ type: "input", content: hooks.messageContent(after, m), requestId: m.resume!, whenBusy: "steer" }, c);
+		}
 		if (result === undefined) throw new Error(`${role} conversation finished without calling ${tools.join("/")}${lastStatus ? `; last input ${lastStatus}` : ""}`);
 		return { ...result, usage: { before, after: await usageOf(), durationMs: svc.now() - startedAt } };
 	}

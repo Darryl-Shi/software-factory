@@ -291,3 +291,13 @@ Decisions:
 - Scripted models are priced (3/15 $ per M tokens): pi-ai's faux provider reports $0, so live cost could not be seen
   in the dev factory or tested in usd.
 - Dev factory / dry run: a ticket titled with `[slow-tool]` makes the scripted builder run two 60 s sleeps first.
+
+Round 2 (review findings):
+- F1: RunView/BundleView.messageRoles (pinned policy.messages; bundles: integrator + reviewer if listed); the UI's
+  Interrupt uses it; jsdom fixtures carry the real field; core + UI tests.
+- F2: runAgent waits for a resume whenever `interrupted` names its turn (not only after an aborted input) and consumes
+  a committed resume instead of nudging; after a bridge result, unconsumed resume messages are delivered as steers;
+  interrupt() records no pause once the turn's bridge result exists.
+- F3 (not fixed): a stopped subagent's helper spend never reaches the builder's tools bucket (pre-existing accounting
+  gap: no cost record has it either), so the live total drops back by it. Fixing it means counting helper
+  Conversations in cost records directly — a change to cost records the spec keeps as they are.

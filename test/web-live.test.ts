@@ -24,7 +24,7 @@ function run(state: string, extra: Record<string, unknown> = {}) {
 		conversations: { architect: "a1", builder: "b1", reviewers: [], qa: [], active: "b1" },
 		reviewRound: 0, caps: { review: 3, ciFix: 3 }, ciFixes: 0, cost: [], liveCost: { usd: 0, totalTokens: 0, byRole: [] },
 		history: [], notices: [], findingsLog: [], artifacts: {}, messages: [], advisory: [], acceptedBlocking: [],
-		configHash: "h", piVersion: "1.1.0", specPath: "docs/specs/x.md", createdAt: 1000 + seq, updatedAt: 1000 + seq,
+		messageRoles: ["architect", "builder", "reviewer"], configHash: "h", piVersion: "1.1.0", specPath: "docs/specs/x.md", createdAt: 1000 + seq, updatedAt: 1000 + seq,
 		...extra,
 	};
 }
@@ -33,7 +33,7 @@ function bundle(id: string, extra: Record<string, unknown> = {}) {
 		id, project: "todo", repo: "o/todo", state: "REVIEWING", round: 1, members: [{ run: "run-x", title: "Member" }],
 		conversations: { integrator: "i1", reviewers: [{ id: "rv1", seq: 1 }], qa: [], active: "rv1" },
 		reviews: [{ seq: 1, round: 1 }], reviewRound: 1, caps: { review: 3, ciFix: 3 }, ciFixes: 0, cost: [], liveCost: { usd: 0, totalTokens: 0, byRole: [] },
-		history: [], notices: [], messages: [], findingsLog: [], advisory: [], mergeMethod: "squash", createdAt: 5000, ...extra,
+		history: [], notices: [], messages: [], findingsLog: [], advisory: [], mergeMethod: "squash", messageRoles: ["integrator", "reviewer"], createdAt: 5000, ...extra,
 	};
 }
 /** A transcript: `calls` are tool calls of one assistant item; `results` their tool results; `running` the live round. */
@@ -268,8 +268,8 @@ describe("interrupt", () => {
 		expect(($(w, "#chat-int") as HTMLButtonElement).hidden).toBe(false);
 	});
 
-	test("no Interrupt while the target is idle, or when its role isn't in the pinned policy.messages", async () => {
-		const idle = run("BUILDING"), barred = run("BUILDING", { policy: { messages: ["architect"] } });
+	test("no Interrupt while the target is idle, or when its role isn't in the view's messageRoles (the pinned policy.messages)", async () => {
+		const idle = run("BUILDING"), barred = run("BUILDING", { messageRoles: ["architect"] });
 		const w = await load({ runs: [idle], handlers: { getRun: () => idle, getConversation: () => tx("b1", { busy: false }) } });
 		await openRun(w, idle.id);
 		expect(($(w, "#chat-int") as HTMLButtonElement).hidden).toBe(true);
@@ -300,6 +300,14 @@ describe("interrupt", () => {
 		($(w, "#bc-continue") as HTMLButtonElement).click();
 		await tick(50);
 		expect(calls(w, "messageBundle")[0]!.args).toEqual(["bundle-1", "Continue."]);
+	});
+
+	test("bundle: no Interrupt for a working reviewer the bundle's messageRoles leave out", async () => {
+		const b = bundle("bundle-2", { messageRoles: ["integrator"] });
+		const w = await load({ bundles: [b], handlers: { getBundle: () => b, getBundleConversation: () => tx("rv1", { busy: true }) } });
+		w.eval(`__t.openBundle("bundle-2", null)`);
+		await tick(80);
+		expect(($(w, "#bc-int") as HTMLButtonElement).hidden).toBe(true);
 	});
 });
 

@@ -3,6 +3,7 @@
 import type { CleanedUp } from "./cleanup.ts";
 import { defineDoc, defineDocFamily } from "@earendil-works/pi-durable";
 import { NO_LIVE_COST, type UsageSum } from "./usage.ts";
+import { DEFAULT_MESSAGE_ROLES } from "./messages.ts";
 import type {
 	ArtifactRef,
 	CiStatus,
@@ -174,6 +175,7 @@ export function toView(d: RunDocState, liveCost: LiveCost = NO_LIVE_COST): RunVi
 		...(lastQaStatus(d) ? { qaStatus: lastQaStatus(d) } : {}),
 		cost: d.cost,
 		liveCost,
+		messageRoles: [...((d.pinned.config.policy?.messages ?? DEFAULT_MESSAGE_ROLES) as Role[])],
 		...(d.interrupted ? { interrupted: { ...d.interrupted, conversationId: String(d.interrupted.conversationId) } } : {}),
 		configHash: d.pinned.configHash,
 		piVersion: d.pinned.piVersion,
