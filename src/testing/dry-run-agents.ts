@@ -87,12 +87,14 @@ ${title}. Documented in README.md and covered by a test.
 
 export const architect: Script = async (ctx) => {
 	const req = first(ctx);
+	// a slow-tool ticket's marker reaches the builder through the spec (its input), whatever the spec is
+	const marked = (markdown: string) => (req.includes(SLOW_MARK) && !markdown.includes(SLOW_MARK) ? `${markdown}\n(Scripted dry run: ${SLOW_MARK} ticket.)\n` : markdown);
 	const isNew = /does not exist yet/.test(req);
 	const rejected = /rejected the spec/.test(ctx.input) ? ctx.input : "";
 	const answers = ctx.inputs.slice(1).filter((i) => !/rejected the spec/.test(i));
 	if (ctx.turn > 0) {
 		const r = lastResult(ctx, "submit_spec");
-		if (r?.isError) return call("submit_spec", { markdown: MVP_SPEC("JSON file at $TODO_FILE, default ./todo.json") });
+		if (r?.isError) return call("submit_spec", { markdown: marked(MVP_SPEC("JSON file at $TODO_FILE, default ./todo.json")) });
 		if (ctx.results.at(-1)?.name === "read" || ctx.results.at(-1)?.name === "bash") {
 			// grounded in the repo: ask about the change after reading the current spec
 			return slow(call("ask_human", { question: "The current spec stores items as { id, title, done, createdAt }. Should due dates be plain calendar dates (YYYY-MM-DD) and should --overdue compare against today's local date?" }));
@@ -101,20 +103,20 @@ export const architect: Script = async (ctx) => {
 	}
 	if (isNew) {
 		if (rejected) {
-			return slow(call("submit_spec", { markdown: MVP_SPEC("JSON file at $TODO_FILE (default: ~/.todo.json); the file is written atomically (write to a temp file, then rename)", `- Feedback from the spec review: ${rejected.split("\n")[2] ?? ""}\n`) }));
+			return slow(call("submit_spec", { markdown: marked(MVP_SPEC("JSON file at $TODO_FILE (default: ~/.todo.json); the file is written atomically (write to a temp file, then rename)", `- Feedback from the spec review: ${rejected.split("\n")[2] ?? ""}\n`)) }));
 		}
 		if (answers.length === 0) return slow(call("ask_human", { question: "The repo is empty. Which language/runtime should the CLI use, and may it have third-party dependencies?" }));
 		if (answers.length === 1) return slow(call("ask_human", { question: "Where should the JSON file live: a fixed path (~/.todo.json), the current directory, or configurable via an environment variable?" }));
-		return slow(call("submit_spec", { markdown: MVP_SPEC("JSON file at $TODO_FILE (default: ./todo.json)") }));
+		return slow(call("submit_spec", { markdown: marked(MVP_SPEC("JSON file at $TODO_FILE (default: ./todo.json)")) }));
 	}
 	// incremental
 	const title = /Title: (.*)/.exec(req)?.[1] ?? "change";
 	if (/due date/i.test(req)) {
 		// each ticket's spec is committed at docs/specs/<run-id>.md (there is no product docs/spec.md in this repo)
 		if (answers.length === 0) return slow(call("bash", { command: "ls docs/specs && cat docs/specs/*.md" }));
-		return slow(call("submit_spec", { markdown: DUE_SPEC }));
+		return slow(call("submit_spec", { markdown: marked(DUE_SPEC) }));
 	}
-	return slow(call("submit_spec", { markdown: GENERIC_SPEC(title) }));
+	return slow(call("submit_spec", { markdown: marked(GENERIC_SPEC(title)) }));
 };
 
 // A message at the spec gate that asks for a change: revise the spec (it replaces the version waiting for approval).

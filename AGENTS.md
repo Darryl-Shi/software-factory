@@ -38,7 +38,9 @@ Test: `npm test`
 
 Run: `scripts/run.sh` starts a credential-free factory in the foreground (scripted agents, fake GitHub and boat.dev
 under `.factory-dev/`, sandbox off). The web UI listens on **http://127.0.0.1:7317** (`PORT=` to change); open the
-printed link (it carries the access token; also in `.factory-dev/web-url`).
+printed link (it carries the access token; also in `.factory-dev/web-url`). The scripted models are priced from their
+tokens, so costs move. A ticket whose title contains `[slow-tool]` makes the scripted builder first run two 60 s `sleep`
+commands (to try the running clock, a tool call's Stop, and Interrupt / Continue).
 
 Real use: `bin/factory setup` (credentials, models, service), then `bin/factory serve` (background) /
 `bin/factory web` (prints the link) / `bin/factory stop` / `bin/factory status` / `bin/factory doctor` /
