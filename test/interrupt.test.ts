@@ -20,8 +20,8 @@ afterEach(async () => {
 
 const SLOW = "sleep 30; echo SLOW-DONE";
 const done = inState("READY", "DELIVERED", "FAILED", "CANCELLED");
-// The scripted provider prices every response at $0 (pi-ai faux usage), so the live-cost tests compare tokens; usd
-// follows the same code path (UsageSum, unrecorded, ownerTotal).
+// The live-cost tests compare tokens (exact integers); usd follows the same code path and is checked to be > 0 (the
+// scripted provider prices responses from their token usage).
 const sum = (v: { cost: { totalTokens: number }[] }) => v.cost.reduce((s, c) => s + (c.totalTokens ?? 0), 0);
 
 async function setup(opts: { settings?: [string, unknown][]; storage?: "memory" | "sqlite"; seed?: boolean } = {}) {
@@ -341,7 +341,8 @@ describe("live cost", () => {
 		const entry = during.liveCost.byRole.find((r) => r.role === "builder");
 		expect(entry).toMatchObject({ conversationId: String(builder) });
 		expect(entry!.totalTokens).toBeGreaterThan(0);
-		expect(entry!.totalTokens).toBeGreaterThan(0);
+		expect(entry!.usd).toBeGreaterThan(0);
+		expect(during.liveCost.usd).toBeCloseTo(entry!.usd, 12);
 		expect(during.liveCost.totalTokens).toBeCloseTo(during.liveCost.byRole.reduce((s, r) => s + r.totalTokens, 0), 12);
 		const liveTotal = sum(during) + during.liveCost.totalTokens;
 		// the builder's turn is not recorded yet
@@ -356,6 +357,7 @@ describe("live cost", () => {
 		expect(ev).toMatchObject({ project: "p", run });
 		expect(ev.totalTokens).toBeCloseTo(liveTotal, 12);
 		expect(ev.totalTokens).toBeGreaterThan(0);
+		expect(ev.usd).toBeCloseTo(during.cost.reduce((s, c) => s + c.usd, 0) + during.liveCost.usd, 9);
 		// no event of another owner reaches this run filter
 		expect(events.filter((e) => e.type === "cost.updated").every((e: any) => e.run === run)).toBe(true);
 
@@ -450,6 +452,7 @@ describe("live cost", () => {
 		d = await poll("discussion live cost", () => t!.factory.getDiscussion(id), (x) => x.liveCost.totalTokens > 0);
 		expect(d.cost.totalTokens).toBeCloseTo(recorded, 12);
 		expect(d.liveCost.totalTokens).toBeGreaterThan(0);
+		expect(d.liveCost.usd).toBeGreaterThan(0);
 		const total = recorded + d.liveCost.totalTokens;
 		const ev = await poll(
 			"discussion cost.updated",
