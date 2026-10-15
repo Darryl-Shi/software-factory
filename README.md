@@ -215,11 +215,14 @@ The factory keeps its files next to the config file (`~/.factory/` by default):
     records); its record, conversations, screenshots and delivery stay, cleared runs stay off the board across
     restarts, and the other cards keep their ticket keys. There is no undo on the board, and a cleared run can't be
     retried. (A delivered run's files and branches are already deleted when its bundle merges.)
-  - **Select** in the board header turns on select mode: a checkbox on every run card (not on bundles or tickets in
-    a bundle, which keep the bundle's own Drop tickets and Cancel bundle) and a "select all" checkbox in each column
-    header (it follows the filters). An action bar shows "N selected" with **Cancel K** for the live tickets
-    selected and **Clear M** for the finished ones, each after a second click, and **Clear selection**. In select
-    mode the Ready column's **Ship** is hidden; turning Select off brings it back.
+  - **Select** in the board header turns on select mode: a checkbox on every run card and on every bundle card in
+    Shipping (failed ones too; ticking a bundle selects all of its tickets, which can't be ticked one by one), and a
+    "select all" checkbox in each column header (it follows the filters; in Shipping it includes the bundles). An
+    action bar shows "N selected" (a bundle counts as its tickets) with **Cancel K** for the live tickets selected
+    and **Clear M** for the finished ones, each after a second click, and **Clear selection**. When bundles are
+    selected the second click names the PRs it closes ("Click again to cancel 5 (closes the PR of bundle-3)"); the
+    bundle is cancelled and its tickets land in Done as Cancelled, ready to be cleared. In select mode the Ready
+    column's **Ship** is hidden; turning Select off brings it back.
 - **Version and updates:** the chip in the header shows the running commit (short SHA; hover for the date and
   version), or **Update available (N)** when the factory's upstream branch has N new commits (checked shortly after
   startup, every 6 hours and with **Check now**). Its dialog lists the incoming commits, anything that blocks the
@@ -232,7 +235,10 @@ The factory keeps its files next to the config file (`~/.factory/` by default):
   timeline on the left, the transcript and a chat box (to the integrator, or the reviewer while reviewing), and a
   header with the member tickets and the PR. The merge card has **Merge**, **Request changes** and **Drop tickets…**;
   an escalation has **More rounds**, **Drop tickets…** and **Abort**; a failed bundle has **Retry**; **Cancel bundle**
-  closes the PR and sends the tickets back to Ready. A run in a bundle shows "In bundle-N" and can't be messaged or
+  closes the PR and sends the tickets back to Ready. A PR merged or closed by hand on GitHub is noticed in any state
+  (escalated and failed included) within about a minute: merged makes the bundle Merged and its tickets Done, closed
+  cancels it and sends its tickets back to Ready. **Check PR now** asks GitHub at once ("PR #12 is still open", "…
+  was merged on GitHub — the bundle is Merged", "… was closed — the tickets are back in Ready"). A run in a bundle shows "In bundle-N" and can't be messaged or
   cancelled until the bundle is merged or cancelled.
 - **Run view:** click any card, at any stage, for a full-screen view. The left rail lists the run's conversations
   (architect, builder and its helpers, each reviewer and its round's QA agent) and a timeline; the centre is the transcript, with every tool

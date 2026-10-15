@@ -252,14 +252,16 @@ describe("clearing runs", () => {
 });
 
 describe("bulk cancel", () => {
-	test("cancelRuns over HTTP: status mapping, all or nothing (a bundle member names its bundle), then CANCELLED with run.state on the stream", async () => {
+	test("cancelRuns over HTTP: status mapping, all or nothing (part of a bundle names the bundle and the missing ticket), then CANCELLED with run.state on the stream", async () => {
 		const { port, token } = await serve();
 		await t!.host.seedRepo("me/p", { "README.md": "# p\n" });
 		await op(port, token, "createProject", ["p", "me/p"]);
 		const start = async () => JSON.parse((await op(port, token, "startRun", ["p", { source: "web", title: "hello", body: "make hello" }])).body).result as string;
 		const member = await start();
+		const other = await start();
 		await until(t!.factory, member, inState("READY"));
-		const bundle = JSON.parse((await op(port, token, "createBundle", ["p", [member]])).body).result as string;
+		await until(t!.factory, other, inState("READY"));
+		const bundle = JSON.parse((await op(port, token, "createBundle", ["p", [member, other]])).body).result as string;
 		await t!.factory.setSetting({ project: "p" }, "policy.approvals", ["spec"]);
 		const a = await start();
 		const b = await start();
@@ -276,7 +278,9 @@ describe("bulk cancel", () => {
 			[["x"], 400, "invalid", ""],
 			[[[a, "nope"]], 404, "not_found", "nope"],
 			[[[a, gone]], 409, "conflict", gone],
+			// one of a two-ticket bundle's runs: the bundle and the missing ticket are named
 			[[[a, b, member]], 409, "conflict", bundle],
+			[[[a, b, member]], 409, "conflict", other],
 		] as const) {
 			const r = await op(port, token, "cancelRuns", args as unknown as unknown[]);
 			expect(r.status).toBe(status);

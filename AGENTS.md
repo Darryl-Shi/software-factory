@@ -18,7 +18,8 @@ one project together as a **bundle**: one PR (or a push to `main` for a new repo
   project (purge): [`docs/specs/run-mv86f7vs-jif2.md`](docs/specs/run-mv86f7vs-jif2.md), product spec §5, §8.1; open
   discussions ended by the deletion: [`docs/specs/run-mv89bw5w-pykq.md`](docs/specs/run-mv89bw5w-pykq.md); interrupting
   agents, live cost and tool-call timing: [`docs/specs/run-mv8t6vsz-pmy8.md`](docs/specs/run-mv8t6vsz-pmy8.md), product
-  spec §4, §5, §8, §9).
+  spec §4, §5, §8, §9; the PR watcher, `checkBundlePr` and bulk cancel of bundles:
+  [`docs/specs/run-mv99uglw-4rys.md`](docs/specs/run-mv99uglw-4rys.md), product spec §3.4, §5, §8, §9).
 - **Design and deviations:** `docs/design-spec.md`, `docs/superpowers/specs/*`, `DEVIATIONS.md`.
 - **How it fits together:** `docs/architecture.md`; settings: `docs/configuration.md`.
 
@@ -30,7 +31,7 @@ through `tsx`).
 Test: `npm test`
 
 - Typecheck: `npm run typecheck`
-- One file: `npx vitest run test/bundle.test.ts` (the board's layout, columns and select mode: `test/web-board.test.ts`, jsdom; bulk cancel: `test/cancel-runs.test.ts`; deleting a project: `test/project-delete.test.ts`, its UI `test/web-delete-project.test.ts`; stop, interrupt and live cost: `test/interrupt.test.ts`, their UI `test/web-live.test.ts`)
+- One file: `npx vitest run test/bundle.test.ts` (the board's layout, columns and select mode: `test/web-board.test.ts`, jsdom; bulk cancel: `test/cancel-runs.test.ts`; PRs merged/closed on GitHub: `test/bundle-pr-watch.test.ts`, Check PR now `test/web-bundle-pr.test.ts`; deleting a project: `test/project-delete.test.ts`, its UI `test/web-delete-project.test.ts`; stop, interrupt and live cost: `test/interrupt.test.ts`, their UI `test/web-live.test.ts`)
 - `test/sandbox.test.ts` and `test/sandbox-write.test.ts` need a working bubblewrap + socat (they fail where user
   namespaces are not available, e.g. inside another sandbox).
 - Dry run (end to end through the HTTP API, scripted agents, fake GitHub): `DRYRUN_SANDBOX=0 npm run dry-run`

@@ -133,7 +133,7 @@ export function createBundleTask(svc: CoreServices) {
 			const r = await runIn(tx, m.run);
 			if (r && r.bundle === d.id) {
 				delete r.bundle;
-				r.notices.push({ at: svc.now(), level: "info", text: `Released from ${d.id} (${why}); back in Ready` });
+				if (!["DELIVERED", "FAILED", "CANCELLED"].includes(r.state)) r.notices.push({ at: svc.now(), level: "info", text: `Released from ${d.id} (${why}); back in Ready` });
 				r.updatedAt = svc.now();
 			}
 		}
@@ -680,13 +680,17 @@ export function createBundleTask(svc: CoreServices) {
 
 	/** The PR was merged or closed outside the factory. */
 	async function externalEnd(rt: RT, c: Context, d: BundleDocState, how: "merged" | "closed") {
-		await transition(rt, c, d.id, async (doc, tx) => {
-			if (how === "merged") {
-				notice(doc, { level: "info", text: `The PR was merged on GitHub` });
-				return toFinal(tx, doc, "MERGED");
-			}
-			return toFinal(tx, doc, "CANCELLED", "the PR was closed without merging");
-		});
+		await transition(rt, c, d.id, (doc, tx) => endExternally(tx, doc, how));
+	}
+
+	/** The final transition for a PR merged (MERGED, members DELIVERED) or closed (CANCELLED, members released) on GitHub. */
+	async function endExternally(tx: Tx, doc: BundleDocState, how: "merged" | "closed"): Promise<Phase> {
+		const from = doc.externalEnd?.from ?? doc.state;
+		if (how === "merged") {
+			notice(doc, { level: "info", text: `The PR was merged on GitHub (while ${from})` });
+			return toFinal(tx, doc, "MERGED");
+		}
+		return toFinal(tx, doc, "CANCELLED", "the PR was closed without merging");
 	}
 
 	/**
@@ -776,6 +780,9 @@ export function createBundleTask(svc: CoreServices) {
 				async (task: any, rt: RT, c: Context) => {
 					const d = await read(rt, task.input.bundleId, c);
 					try {
+						// The PR watcher recorded a PR merged or closed on GitHub but the abort did not happen (a crash): end by it.
+						if (d.externalEnd && !["MERGED", "FAILED", "CANCELLED", "FINAL"].includes(phase) && !["MERGED", "FAILED", "CANCELLED"].includes(d.state))
+							return await externalEnd(rt, c, d, d.externalEnd.how);
 						await handlers[phase](rt, c, d);
 					} catch (e) {
 						if (rt.signal.aborted || e instanceof Cancelled) throw e;
@@ -791,10 +798,12 @@ export function createBundleTask(svc: CoreServices) {
 			const id = task.input.bundleId;
 			let d = await read(rt, id, c);
 			if (!["MERGED", "FAILED", "CANCELLED"].includes(d.state)) {
-				if (d.delivery?.pr) await svc.github.closePr(d.delivery.pr, rc(d)).catch((e) => svc.log(`bundle ${id}: closing the PR failed: ${e}`));
+				// A PR merged or closed on GitHub (the watcher's marker) ends the bundle by it: the PR is never closed here.
+				if (d.delivery?.pr && !d.externalEnd) await svc.github.closePr(d.delivery.pr, rc(d)).catch((e) => svc.log(`bundle ${id}: closing the PR failed: ${e}`));
 				await rt.commit(async (tx) => {
 					const doc = await docIn(tx, id);
-					await toFinal(tx, doc, "CANCELLED", doc.cancelReason ?? "cancelled");
+					if (doc.externalEnd) await endExternally(tx, doc, doc.externalEnd.how);
+					else await toFinal(tx, doc, "CANCELLED", doc.cancelReason ?? "cancelled");
 					delete doc.driving;
 					delete doc.interrupted;
 					doc.updatedAt = svc.now();

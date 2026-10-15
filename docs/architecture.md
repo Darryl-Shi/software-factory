@@ -256,6 +256,18 @@ PR merged on GitHub → MERGED;  PR closed → CANCELLED;  cancel → CANCELLED;
   with a header (`bundleMessageTarget` and `bundleMessageContent` in `messages.ts`); QA takes none; a terminal bundle
   refuses them. A change the integrator makes after a passing review goes back through `REVIEWING` before delivery
   or merge.
+- **The PR watcher** (`Factory.watchPrs` in `core.ts`; spec `docs/specs/run-mv99uglw-4rys.md`): `AWAITING_CI` and
+  `AWAITING_MERGE` poll the PR in their own phase; every other bundle with a PR (`delivery.kind: "pr"`) that is not
+  `MERGED` / `CANCELLED`, `FAILED` included, is checked by the core with `GitHub.prState`, one bundle at a time, on
+  an interval (`CoreOptions.prWatchMs`; default `ciPollMs` when given, i.e. `--ci-poll-ms` in tests and the dry run,
+  else 60 s; ticks never overlap) and once at startup after resume (after `finishIntents`). A failed lookup is logged
+  and retried on the next tick. `actOnPr` acts on `merged` / `closed`: for a live Task it commits
+  `externalEnd: { how, at, from }` on the BundleDoc and aborts the Task; the abort path (`endExternally` in
+  `bundle-task.ts`) ends the bundle `MERGED` (members `DELIVERED` via `bundleMerged`, notice "The PR was merged on
+  GitHub (while <state>)") or `CANCELLED` ("the PR was closed without merging", members released) and never closes
+  the PR; the phase wrapper checks `externalEnd` first, so a Task resumed after a crash between commit and abort ends
+  the same way. A `FAILED` bundle is ended by `endFailedBundle` in one commit, then cleaned in the background.
+  Pending asks are dropped. `MERGED` is only recorded on GitHub's word. `checkBundlePr` runs the same check at once.
 - **The integrator** (`role-integrator` in `prompts.ts`) has the builder's write tools (`coding`, `test-runner`,
   `web-search`) but no `subagent`, in a write sandbox on the bundle worktree (`WRITE_ROLES` in `sandbox.ts`).
 
@@ -316,7 +328,10 @@ only during a `draft` turn. It can't be messaged through `message`: the human ta
   (a conflicted one goes back to the integrator, a resolved one is concluded). The integrator's inputs use request
   IDs such as `<bundle>:INTEGRATING:<integration>:<run>:<attempt>`, so a resumed resolution reattaches to the same
   turn of the same integrator Conversation. `test/durability.test.ts` kills the factory while the integrator
-  resolves a conflict.
+  resolves a conflict. Intents committed before an abort survive a crash: the PR watcher's `externalEnd` marker (the
+  resumed Task's phases see it and end the bundle by it) and `cancelRuns`' `cancelReason` on runs and bundles
+  (finished on startup by `finishIntents`); `test/bundle-pr-watch.test.ts` and `test/cancel-runs.test.ts` kill the
+  factory right after those commits.
 - **Upgrades.** `Factory.migrateRuns` runs at startup, once per run that predates bundles: it marks runs that had
   begun delivering as `legacy` (they finish the old way; `test/durability.test.ts` kills one while it waits for CI)
   and the rest as on the new flow.
@@ -386,10 +401,14 @@ server is its transport.
 - **Runs:** `startRun`, `getRun`, `listRuns`, `getConversation`, `cancelRun`, `cancelRuns`, `retryRun`, `clearRuns`.
   - `getRun` returns a `RunView`.
   - `cancelRuns(runs, reason?)` is the bulk `cancelRun` (the board's select mode uses it). It checks the whole call
-    first (`invalid` for an empty or malformed list, `not_found`, `conflict` for a terminal run or a member of an
-    active bundle, `FAILED` included), re-checks inside one commit that sets `cancelReason` on every run, and only
-    then aborts each run's task (`harness.abortTask`). Each run then reaches `CANCELLED` through the run task's own
-    cancellation path, exactly as with `cancelRun`. Returns `{ cancelled }`.
+    first (`invalid` for an empty or malformed list, `not_found`, `conflict` for a terminal run, and `conflict` naming
+    the bundle and its missing tickets (key and run id) when the call lists only some members of an active bundle,
+    `FAILED` included), re-checks inside one commit that sets `cancelReason` on every run and every affected bundle,
+    then cancels those bundles (`cancelMarkedBundles`: a live Task is aborted, closing the PR and releasing the
+    members, and waited for; a `FAILED` one goes through `endFailedBundle`, PR closed), and only then aborts each
+    run's task (`harness.abortTask`). Each run then reaches `CANCELLED` through the run task's own cancellation path,
+    exactly as with `cancelRun`. Returns `{ cancelled }`. On startup `finishIntents` finishes the bundles and runs
+    with a committed `cancelReason` (and bundles with an `externalEnd` marker) that a crash left unended.
   - `clearRuns(runs)` archives terminal runs (`DELIVERED`, `FAILED`, `CANCELLED`) so they leave the board: it sets
     `cleared: { at, by }` on each run's `RunDoc`, then starts a full cleanup of each cleared run in the background
     without waiting for it (worktree, manifest, branches, scratch, environment records; the record, conversations,
@@ -412,9 +431,12 @@ server is its transport.
     with `conflict`.
 - **Maintenance:** `gc()` runs the disk sweep now (see [Disk cleanup](#disk-cleanup)); `factory gc` calls it.
 - **Bundles:** `createBundle`, `getBundle` (a `BundleView`), `listBundles`, `getBundleConversation`, `mergeBundle`,
-  `requestBundleChanges`, `dropFromBundle`, `resolveBundleEscalation`, `cancelBundle`, `retryBundle`,
+  `requestBundleChanges`, `dropFromBundle`, `resolveBundleEscalation`, `cancelBundle`, `checkBundlePr`, `retryBundle`,
   `messageBundle`, `getBundleScreenshot`. `cancelBundle` works on any bundle not yet `MERGED` or `CANCELLED`,
-  including a `FAILED` one; `retryBundle` only on a `FAILED` one.
+  including a `FAILED` one; `retryBundle` only on a `FAILED` one. `checkBundlePr` (`POST /api/op/checkBundlePr`, the
+  bundle view's **Check PR now**) asks GitHub for the PR state now and acts as the PR watcher does; it returns
+  `{ pr, state }`, and is `not_found` for an unknown bundle, `conflict` for one with no PR or already `MERGED` /
+  `CANCELLED`.
 - **Discussions:** `startDiscussion`, `getDiscussion`, `listDiscussions`, `getDiscussionConversation`, `say`,
   `stopTurn`, `requestDrafts`, `updateDraft`, `deleteDraft`, `createTicket`, `closeDiscussion`, `reopenDiscussion`,
   `retryDiscussion`. An operation in the wrong state is refused with `conflict`, naming the state.
