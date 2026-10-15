@@ -87,12 +87,14 @@ ${title}. Documented in README.md and covered by a test.
 
 export const architect: Script = async (ctx) => {
 	const req = first(ctx);
+	// a slow-tool ticket's marker reaches the builder through the spec (its input), whatever the spec is
+	const marked = (markdown: string) => (req.includes(SLOW_MARK) && !markdown.includes(SLOW_MARK) ? `${markdown}\n(Scripted dry run: ${SLOW_MARK} ticket.)\n` : markdown);
 	const isNew = /does not exist yet/.test(req);
 	const rejected = /rejected the spec/.test(ctx.input) ? ctx.input : "";
 	const answers = ctx.inputs.slice(1).filter((i) => !/rejected the spec/.test(i));
 	if (ctx.turn > 0) {
 		const r = lastResult(ctx, "submit_spec");
-		if (r?.isError) return call("submit_spec", { markdown: MVP_SPEC("JSON file at $TODO_FILE, default ./todo.json") });
+		if (r?.isError) return call("submit_spec", { markdown: marked(MVP_SPEC("JSON file at $TODO_FILE, default ./todo.json")) });
 		if (ctx.results.at(-1)?.name === "read" || ctx.results.at(-1)?.name === "bash") {
 			// grounded in the repo: ask about the change after reading the current spec
 			return slow(call("ask_human", { question: "The current spec stores items as { id, title, done, createdAt }. Should due dates be plain calendar dates (YYYY-MM-DD) and should --overdue compare against today's local date?" }));
@@ -101,20 +103,20 @@ export const architect: Script = async (ctx) => {
 	}
 	if (isNew) {
 		if (rejected) {
-			return slow(call("submit_spec", { markdown: MVP_SPEC("JSON file at $TODO_FILE (default: ~/.todo.json); the file is written atomically (write to a temp file, then rename)", `- Feedback from the spec review: ${rejected.split("\n")[2] ?? ""}\n`) }));
+			return slow(call("submit_spec", { markdown: marked(MVP_SPEC("JSON file at $TODO_FILE (default: ~/.todo.json); the file is written atomically (write to a temp file, then rename)", `- Feedback from the spec review: ${rejected.split("\n")[2] ?? ""}\n`)) }));
 		}
 		if (answers.length === 0) return slow(call("ask_human", { question: "The repo is empty. Which language/runtime should the CLI use, and may it have third-party dependencies?" }));
 		if (answers.length === 1) return slow(call("ask_human", { question: "Where should the JSON file live: a fixed path (~/.todo.json), the current directory, or configurable via an environment variable?" }));
-		return slow(call("submit_spec", { markdown: MVP_SPEC("JSON file at $TODO_FILE (default: ./todo.json)") }));
+		return slow(call("submit_spec", { markdown: marked(MVP_SPEC("JSON file at $TODO_FILE (default: ./todo.json)")) }));
 	}
 	// incremental
 	const title = /Title: (.*)/.exec(req)?.[1] ?? "change";
 	if (/due date/i.test(req)) {
 		// each ticket's spec is committed at docs/specs/<run-id>.md (there is no product docs/spec.md in this repo)
 		if (answers.length === 0) return slow(call("bash", { command: "ls docs/specs && cat docs/specs/*.md" }));
-		return slow(call("submit_spec", { markdown: DUE_SPEC }));
+		return slow(call("submit_spec", { markdown: marked(DUE_SPEC) }));
 	}
-	return slow(call("submit_spec", { markdown: GENERIC_SPEC(title) }));
+	return slow(call("submit_spec", { markdown: marked(GENERIC_SPEC(title)) }));
 };
 
 // A message at the spec gate that asks for a change: revise the spec (it replaces the version waiting for approval).
@@ -401,6 +403,27 @@ const writes = (fs: Record<string, string>) => calls(...Object.entries(fs).map((
 const commit = (msg: string, progress?: string) =>
 	call("bash", { command: `${progress === undefined ? "" : `printf '%s\\n' ${JSON.stringify(progress)} >> PROGRESS.md && `}chmod +x scripts/setup.sh bin/todo.js 2>/dev/null; git add -A && git commit -qm ${JSON.stringify(msg)} && git log --oneline -1` });
 
+// A ticket whose title carries SLOW_MARK: before its normal work the builder runs two slow `bash` commands, one after
+// the other, so that the dry run can stop the first one (stopToolCall) and interrupt the builder while the second one
+// runs (interruptAgent, then a message resumes it). Tickets without the marker are unaffected.
+export const SLOW_MARK = "[slow-tool]";
+export const SLOW_COMMAND = (n: number) => `echo SLOW-START-${n}; sleep 60; echo SLOW-DONE-${n}`;
+const isSlowCall = (p: any) => p?.type === "toolCall" && p.name === "bash" && /SLOW-START-\d/.test(String(p.arguments?.command ?? ""));
+/** The slow calls made so far, and the builder's (non-empty, not aborted) responses after the last of them. */
+function slowSteps(messages: any[]): { n: number; after: number } {
+	let n = 0;
+	let after = 0;
+	for (const m of messages) {
+		if (m.role !== "assistant") continue;
+		const parts = Array.isArray(m.content) ? m.content : [];
+		if (parts.some(isSlowCall)) {
+			n += 1;
+			after = 0;
+		} else if (parts.length > 0 && m.stopReason !== "aborted" && m.stopReason !== "error") after += 1;
+	}
+	return { n, after };
+}
+
 const PUSH_ATTEMPT = 'git remote -v; out=$(git push origin HEAD:refs/heads/agent-push 2>&1); echo PUSH-EXIT=$?; echo "$out" | tail -2; out=$(curl -sS -m 10 https://api.github.com/ -o /dev/null 2>&1); echo GITHUB-API-EXIT=$?; echo "$out" | tail -1';
 
 export const builder: Script = async (ctx) => {
@@ -417,7 +440,13 @@ export const builder: Script = async (ctx) => {
 				responses: ids.map((findingId) => ({ findingId, status: "fixed" })),
 			}),
 		);
-	const t = ctx.turn;
+	let t = ctx.turn;
+
+	if (!findings && spec.includes(SLOW_MARK)) {
+		const s = slowSteps(ctx.messages as any[]);
+		if (s.n < 2) return slow(call("bash", { command: SLOW_COMMAND(s.n + 1) }));
+		t = s.after; // then the normal work, counted from the last slow call
+	}
 
 	if (!findings) {
 		// initial build of this run

@@ -1,8 +1,8 @@
 // A scripted "model" provider for tests and dry runs (no model credentials needed). Built on pi-ai's faux provider:
 // each model id runs a script that looks at the transcript and returns the next assistant message (text or tool
 // calls). Tools still really execute (CodingTools, sandboxed bash, the factory bridge), so the whole pipeline runs.
-import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
-import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
+import { type AssistantMessage, calculateCost, createAssistantMessageEventStream, createProvider, type Message } from "@earendil-works/pi-ai";
+import { createFauxCore, fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { parseMessage } from "../core/messages.ts";
 
 export interface ScriptContext {
@@ -49,10 +49,37 @@ const textOf = (m: any): string =>
 	typeof m.content === "string" ? m.content : (m.content ?? []).map((p: any) => (p.type === "text" ? p.text : "")).join("");
 
 export function scriptedProvider(scripts: Record<string, Script>, providerId = "scripted") {
-	const faux = fauxProvider({
+	// Priced like a mid-size hosted model ($ per million tokens), so costs move as agents work (live cost, the dry run).
+	const cost = { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 };
+	const core = createFauxCore({
 		provider: providerId,
-		models: Object.keys(scripts).map((id) => ({ id, reasoning: true, input: (id.endsWith("-textonly") ? ["text"] : ["text", "image"]) as ("text" | "image")[], contextWindow: 400_000, maxTokens: 32_000, cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 } })),
+		models: Object.keys(scripts).map((id) => ({ id, reasoning: true, input: (id.endsWith("-textonly") ? ["text"] : ["text", "image"]) as ("text" | "image")[], contextWindow: 400_000, maxTokens: 32_000, cost })),
 	});
+	// pi-ai's faux provider reports a cost of 0 whatever the model's prices: price each response from its token usage.
+	const priced =
+		(fn: typeof core.stream): typeof core.stream =>
+		(model, context, options) => {
+			const inner = fn(model, context, options);
+			const outer = createAssistantMessageEventStream();
+			void (async () => {
+				for await (const ev of inner) {
+					const m = (ev as any).message ?? (ev as any).error;
+					if (m?.usage?.cost && (ev.type === "done" || ev.type === "error")) calculateCost(model, m.usage);
+					outer.push(ev);
+				}
+				outer.end(await inner.result());
+			})();
+			return outer;
+		};
+	const faux = {
+		provider: createProvider({
+			id: core.provider,
+			auth: { apiKey: { name: "Faux", resolve: async () => ({ auth: {} }) } },
+			models: core.models,
+			api: { stream: priced(core.stream), streamSimple: priced(core.streamSimple), fetchDeferred: core.fetchDeferred, cancelDeferred: core.cancelDeferred },
+		} as any),
+		setResponses: (r: Parameters<typeof core.setResponses>[0]) => core.setResponses(r),
+	};
 	const step = async (context: any, _opts: unknown, _state: unknown, model: { id: string }) => {
 		const messages = (context.messages ?? []) as Message[];
 		const isHuman = (m: Message) => m.role === "user" && parseMessage(textOf(m)) !== undefined;

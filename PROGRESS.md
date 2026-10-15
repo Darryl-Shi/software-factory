@@ -262,3 +262,42 @@ Decisions:
 - Round 2: the Conversation aborts are fired, not awaited, inside the single 10 s deadline (an abort resolves only
   when the work is idle); test for a hang > 10 s → conflict (still finishing) at ~10 s. A discussions-only conflict
   says "try again in a moment". The delayed FAILED toast reads the title at toast time.
+
+## Interrupting agents, live cost and tool-call timing (run run-mv8t6vsz-pmy8; spec docs/specs/run-mv8t6vsz-pmy8.md)
+
+- [x] types: stopToolCall / interruptAgent / interruptBundleAgent (CORE_OPS), RunView/BundleView.liveCost + interrupted,
+      DiscussionView.liveCost, TranscriptView.running/now, toolResult.durationMs, HumanMessage.resume, `cost.updated`.
+- [x] task-kit runAgent: an input settled unanswered/aborted while `interrupted` names this Conversation and key waits
+      durably for the n-th resume message (`<key>:resume<n>`) and submits it as the turn's next input; no nudge used;
+      a bridge result that wins the race clears the pause; transitions/cancel/retry clear it.
+- [x] core: interrupt (commit pause + notice, then Conversation.abort, waited ≤ 10 s), resumeWith in message /
+      messageBundle, stopToolCall (abortTask; pending without task → in-memory, applied on the pi.live change),
+      liveCostOf (usage − max(recorded, usageBase), running helpers in full), discussionCost (turn.usage0), costTick
+      (2 s throttle per owner, emitted only when the total changed), transcript running/now/durationMs.
+- [x] prompts: STOPPED_CALL line in every role.
+- [x] UI (app.js, bundles.js, discussions.js, app.css), tests (interrupt.test.ts, web-live.test.ts), dry run
+      ([slow-tool] tickets), docs/spec.md §4/§5/§8/§9, AGENTS.md.
+
+Decisions:
+- Bundles: interruptBundleAgent refuses on policy.messages only for the reviewer (the integrator always takes messages,
+  as messageBundle does).
+- The run Task (not the message op) submits the resume input: a submission racing the abort could be withdrawn by it,
+  and the Task's submit is idempotent across kill -9. The op returns at once with the Conversation id.
+- The live cost baseline is `usageBase` (what runAgent's turn started from, committed with `driving`) together with
+  `usage`, matching addCost's base exactly, so recorded + live never drops or double counts. Conversations never
+  accounted (no record, no turn since this change) are left out.
+- DiscussionView.cost is now the recorded part only (usage minus the running turn's, from `turn.usage0`).
+- A stopped tool result has no durationMs of its own: the view gives result timestamp − calling response timestamp.
+- Scripted models are priced (3/15 $ per M tokens): pi-ai's faux provider reports $0, so live cost could not be seen
+  in the dev factory or tested in usd.
+- Dev factory / dry run: a ticket titled with `[slow-tool]` makes the scripted builder run two 60 s sleeps first.
+
+Round 2 (review findings):
+- F1: RunView/BundleView.messageRoles (pinned policy.messages; bundles: integrator + reviewer if listed); the UI's
+  Interrupt uses it; jsdom fixtures carry the real field; core + UI tests.
+- F2: runAgent waits for a resume whenever `interrupted` names its turn (not only after an aborted input) and consumes
+  a committed resume instead of nudging; after a bridge result, unconsumed resume messages are delivered as steers;
+  interrupt() records no pause once the turn's bridge result exists.
+- F3 (not fixed): a stopped subagent's helper spend never reaches the builder's tools bucket (pre-existing accounting
+  gap: no cost record has it either), so the live total drops back by it. Fixing it means counting helper
+  Conversations in cost records directly — a change to cost records the spec keeps as they are.

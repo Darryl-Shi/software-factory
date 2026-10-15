@@ -188,6 +188,9 @@ None of this is a setting. Each role's `role-<role>` prompt comes first.
 | integrator | write sandbox on the bundle worktree | `coding`, `test-runner`, `web_search` (the builder's write tools, **no `subagent`**) | `report_done` |
 
 - Agents reach humans, GitHub and delivery only through the bridge tools, which commit what the core waits for.
+- Every role's prompt (`prompts.ts`, `STOPPED_CALL`) says that a tool result `Tool <name> was aborted` means the human
+  stopped that call (§5 `stopToolCall`, or an interrupt): the agent does not rerun it unchanged, it adapts (a shorter
+  or different command, another approach) or explains in its next message why it needs it.
 - `submit_spec` rejects a spec without an "Acceptance behaviours" heading. Each bridge tool takes one valid submission
   per expected input.
 - Models: `roles.<role>.{model, thinking}`. `helper` and `integrator` default to the builder's effective values,
@@ -233,7 +236,32 @@ The core's whole outside surface is `FactoryCore` (`src/core/types.ts`). Every o
     history). `bundle-N` and `disc-N` never repeat: the indexes keep a monotonic counter (`seq`), seeded from the
     existing ids on first use.
 - **Runs:** `startRun`, `getRun`, `listRuns`, `getConversation`, `cancelRun`, `retryRun`, `answer`, `approve`,
-  `reject`, `submitHumanFindings`, `resolveEscalation`, `message`, `getScreenshot`, `clearRuns`, `cancelRuns`.
+  `reject`, `submitHumanFindings`, `resolveEscalation`, `message`, `interruptAgent`, `getScreenshot`, `clearRuns`,
+  `cancelRuns`.
+  - `interruptAgent(run)` (spec `docs/specs/run-mv8t6vsz-pmy8.md`) pauses the agent the run is with (its
+    `messageTarget`). `conflict` when: the run is terminal; it is in an active bundle (interrupt the bundle's agent
+    instead); the target's role is not in `policy.messages` (only a message continues a paused agent); the agent is
+    already paused; the target's Conversation is not working ("<role> is not working"); or the run moved on to another
+    agent meanwhile. QA agents and helpers are never targets (only their tool calls can be stopped). While the core
+    drives the target (`DISCUSSING`, `BUILDING`, `REVIEWING`, the target being the Conversation in `driving`) one
+    commit records `interrupted: { role, conversationId, key, at, by }` (`key`: the driving key) and the notice "<Role>
+    interrupted by you; send a message to continue"; then the core calls `Conversation.abort()` (running tools get
+    `aborted` results; a partial response stays in the transcript, marked aborted). The state does not move and
+    nothing fails (the pause, §8). Otherwise (e.g. a builder replying to a message in `READY`, the architect at the
+    spec gate) only the reply in progress is aborted, with the same notice and no pause. The call waits at most 10 s for
+    the Conversation to go idle.
+  - `message` to a paused agent is its resume: it goes in at once as the paused turn's next input (`HumanMessage.resume`
+    = `<key>:resume<n>`, §8), not queued until a step boundary; the same commit clears `interrupted`.
+- **Tool calls:** `stopToolCall({ run? | bundle? | discussion?, conversationId, callId })` stops one tool call of any
+  agent. Exactly one owner, a `conversationId` and a `callId`, else `invalid`. The Conversation must belong to that
+  owner (its roles, the builder's helpers, QA agents; the discussant), else `not_found`. The call must be in the
+  Conversation's current `pi.live.tools` round as `running` or `pending`, else `conflict` ("tool call <id> is not
+  running"); the bridge tools (`ask_human`, `submit_spec`, `report_done`, `submit_review`, `submit_qa`,
+  `submit_tickets`) are `conflict` too. The core aborts the call's tool task (`harness.abortTask`; tasks it owns, such
+  as a `subagent` call's helper Conversation, stop with it); a `pending` call with no task yet is remembered in memory
+  and aborted as soon as its task appears (or gets pi's `aborted` result when the round is aborted). The agent gets
+  `Tool <name> was aborted` and keeps working; the owner's state, rounds and pending asks do not change. Logged as
+  `<owner> <id>: <by> stopped <name> (<callId>) in conversation <id>`.
   - `cancelRuns(runs, reason?)` cancels several live runs at once (spec `docs/specs/run-mv545v95-rg77.md`), with the
     same effect per run as `cancelRun`. All or nothing, checked before anything changes: an empty list, a non-array or
     an id that is not a non-empty string is `invalid` (duplicates are collapsed), an unknown id `not_found`, a terminal
@@ -257,20 +285,50 @@ The core's whole outside surface is `FactoryCore` (`src/core/types.ts`). Every o
 - **Bundles:** `createBundle` (`invalid` if empty, another project's run or a run not `READY`; `conflict` if a run is
   already in an active bundle), `getBundle`, `listBundles`, `getBundleConversation`, `mergeBundle`,
   `requestBundleChanges`, `dropFromBundle`, `resolveBundleEscalation` (`{ moreRounds }` | `{ drop }` | `{ abort }`),
-  `cancelBundle`, `retryBundle`, `messageBundle`, `getBundleScreenshot`.
+  `cancelBundle`, `retryBundle`, `messageBundle`, `interruptBundleAgent`, `getBundleScreenshot`.
+  - `interruptBundleAgent(bundle)` is `interruptAgent` for the agent the bundle is with (the reviewer while
+    `REVIEWING`, else the integrator); `INTEGRATING` (conflict resolution), `FIXING` and `REVIEWING` are core-driven.
+    As with `messageBundle`, the integrator always takes messages, so only the reviewer is refused for
+    `policy.messages` (when it leaves the reviewer out). Same other refusals; a `messageBundle` to the paused agent
+    resumes it.
 - **Maintenance:** `gc()` runs the disk sweep now (§8.1) and returns `{ removed, failures, summary }`; while a sweep
   is running it waits for it and returns its result. No web UI button; `factory gc` calls it.
 - **Events** (`subscribe` over `GET /api/events`, server-sent): `run.state`, `run.cleared`, `run.ask`, `run.askResolved`,
   `run.notice`, `run.message`, `conversation.updated`, `settings.changed`, `discussion.state`, `discussion.updated`,
   `discussion.conversation.updated`, `bundle.state`, `bundle.ask`, `bundle.askResolved`, `bundle.notice`,
-  `bundle.conversation.updated`, `project.deleted { project, runs, bundles, discussions }` (to unfiltered subscribers
-  and those filtering on that project). Filters: `project` (matches run, discussion and bundle events), `run`, `discussion`,
-  `bundle`. Member runs emit their own `run.state` as they change.
+  `bundle.conversation.updated`, `cost.updated`, `project.deleted { project, runs, bundles, discussions }` (to
+  unfiltered subscribers and those filtering on that project). Filters: `project` (matches run, discussion and bundle
+  events), `run`, `discussion`, `bundle`. Member runs emit their own `run.state` as they change.
+  - `cost.updated { project, run? | bundle? | discussion?, usd, totalTokens }` (exactly one owner) carries the owner's
+    **total**, recorded plus live. It is checked on the same hook as `conversation.updated` (an owner's Conversation
+    changed) and sent only when the total changed, at most once per 2 s per owner (a change during the window is sent
+    when it ends). It follows the usual filters. A first look at an owner with a zero total sends nothing.
 - **Views:** `RunView` (state, gate, rounds and caps, pending ask, spec and delivery artifacts, conversations, reviews
-  with QA status and VM, findings log, advisory and accepted findings, notices, messages, history, cost, `specPath`,
-  `bundle`, `cleared`) and `BundleView` (members with key, spec path and branch, dropped runs, merge method, delivery, CI, pending
-  ask, escalation, `mergeRequested`, the latest integration, rounds, conversations, reviews, findings, notices,
-  messages, history, cost, failure).
+  with QA status and VM, findings log, advisory and accepted findings, notices, messages, history, cost, `liveCost`,
+  `interrupted`, `specPath`, `bundle`, `cleared`) and `BundleView` (members with key, spec path and branch, dropped
+  runs, merge method, delivery, CI, pending ask, escalation, `mergeRequested`, the latest integration, rounds,
+  conversations, reviews, findings, notices, messages, history, cost, `liveCost`, `interrupted`, failure).
+  - **Live cost:** `liveCost: { usd, totalTokens, byRole: { role, conversationId, usd, totalTokens }[] }` is the usage
+    of the owner's Conversations that no cost record contains yet: per Conversation, its `pi.usage` now minus the larger
+    of what the Document recorded (`usage`) and what the core's current turn on it started from (`usageBase`, set when
+    `runAgent` submits); a builder's running helpers count in full under the builder until their `subagent` result
+    lands in its `tools` bucket. When the turn's cost record is written the recorded total rises by exactly the live
+    part and the live part drops to zero, so recorded plus live never counts tokens twice. It moves per completed model
+    response and per tool result with usage, not per streamed token; zero for a terminal owner. Cost records and
+    `turnCosts` are still written only at the end of a turn.
+  - `interrupted: { role, conversationId, key, at, by }` is set while the agent is paused by an interrupt.
+  - `messageRoles` lists the roles that take messages, and so can be interrupted: a run's pinned `policy.messages`; a
+    bundle's integrator, plus the reviewer when `policy.messages` lists it.
+  - `DiscussionView.cost` is the **recorded** total (the turns that ended); `DiscussionView.liveCost: { usd,
+    totalTokens }` is the running turn's usage not yet in `turnCosts` (from the turn's starting usage, `turn.usage0`;
+    zero between turns).
+  - `HumanMessage.resume`: on a message that resumed a paused agent, the request id it went in with.
+  - **Transcripts** (`TranscriptView`, from `getConversation`, `getBundleConversation`, `getDiscussionConversation`):
+    `toolResult.durationMs` is the execution time of the call's last attempt from the result message; a result
+    without one (a stopped or aborted call) gets the time from the calling response to the result. `running: {
+    callId, name, status: "pending" | "running", startedAt? }[]` lists the current round's unfinished calls
+    (`pi.live.tools`; `startedAt`, wall-clock ms, from the tool task once it runs), and `now` is the server's clock
+    when the view was read, so interfaces correct for clock skew.
 - **Pending asks are core state,** stored in the Document and published as events. The first valid answer resolves an
   ask; later ones are rejected.
 
@@ -350,6 +408,20 @@ stops `serve` with an error naming the new paths.
   reattaches to the same turn. Backend calls are idempotent (workspace records, existing PR found before creating one,
   merge state of the bundle worktree inspected on resume).
 - Helpers keep no core state; an in-flight tool call returns `interrupted`, and the working tree is the record.
+- **The interrupt pause** (spec `docs/specs/run-mv8t6vsz-pmy8.md`) is durable. `interruptAgent` /
+  `interruptBundleAgent` commit `interrupted` on the RunDoc or BundleDoc **before** aborting the Conversation. When
+  `runAgent` (`task-kit.ts`) sees its input settle `unanswered` / `aborted` while `interrupted` names that
+  Conversation and turn key, it neither fails the owner nor uses a nudge: it waits durably for the human, watching the
+  Document (as `awaitResponseOr` does). The owner stays in its state (e.g. `BUILDING`), and a `kill -9` while paused
+  resumes paused. The next `message` / `messageBundle` to that agent commits `resume: <key>:resume<n>` on the message
+  and clears `interrupted` in the same commit; the Task submits it as the turn's next input with that request id (so a
+  resume reattaches to it), with the usual header and situation note. The turn then goes on as before: the agent must
+  still end with its bridge tool, and the nudges apply if it stops without one. An agent can be paused any number of
+  times. If the agent called its bridge tool before the abort landed, the result is taken as usual and `interrupted`
+  is cleared, and a message already committed as its resume goes to the agent as an ordinary message (never lost). An
+  input that settled on its own just before the abort landed also waits for the resume while `interrupted` is set. An
+  interrupt that arrives after the turn's bridge result was recorded only aborts (it records no pause).
+  `cancelRun` / `cancelBundle` work while paused; a transition, a cancel and a retry clear `interrupted`.
 - A run records its pinned config hash and the Pi Durable version (pinned in `package.json`).
 - Storage is SQLite by default (`jsonl` alternative). What a finished run, bundle or discussion leaves on disk is
   deleted as soon as nothing uses it (§8.1).
@@ -499,6 +571,23 @@ rejected.
   chat box to the agent the run is with; approval and escalation cards floating over it with the final round's
   findings, screenshots and QA status; ticket details, findings by round and source, cost by role. A member run shows
   "In bundle-N" (a link) and, once merged, the PR.
+- **Tool rows and their timing** (spec `docs/specs/run-mv8t6vsz-pmy8.md`; runs, bundles, discussions and helpers alike):
+  a finished row shows its duration next to its status (`850 ms`, `12.4 s`, `3m 05s`, `1h 02m`); a running row shows
+  a clock counting up every second on the client (`0:42`, from `running[].startedAt` corrected with `now`) and a
+  **Stop** button (`stopToolCall`; the agent gets the call as aborted and carries on); a pending row reads "queued";
+  bridge tools and pending rows have no Stop; a stopped or aborted row reads "stopped after <duration>". The live line
+  at the top of the chat box reads e.g. "Builder is running bash · 0:42" (or "<Role> is paused").
+- **Interrupt** (run and bundle views): the chat box shows **Interrupt** next to Send while its target is working and
+  interruptible (not terminal, not paused, its role in the view's `messageRoles`); it calls `interruptAgent` /
+  `interruptBundleAgent`. While paused, the chat box shows a banner "<Role> is paused. Send a message to continue" with
+  a **Continue** quick action that sends "Continue." through the ordinary `message` / `messageBundle`; the hint says
+  "Your message resumes the <role> right away", and the message is shown as "resuming the <role>", not "queued until
+  the current step". A paused run or bundle counts as "Your turn" on the board (badge "Your turn · paused", first in its
+  column, in the counts). A refused call shows the error toast and changes nothing.
+- **Live cost:** run and bundle cards, the run, bundle and Chat headers (`#rv-cost`) and the details KPI show recorded
+  plus live; the cost-by-role table adds an "in progress" row per working role from `liveCost.byRole`, and its total
+  includes them. All of these update from `cost.updated` without reloading the view (an open run or bundle refetches
+  its view to refresh the table).
 - **Bundle view:** the same layout: integrator, reviewers and QA conversations and a timeline, a chat box to
   `messageBundle`, a header with the member tickets (each links to its run) and the PR link. Until a conversation
   starts, the rail hints "A clean one-ticket merge needs neither; a bundle of two or more tickets always gets a
@@ -514,7 +603,8 @@ rejected.
   session or a blank new chat (`#chat`; a discussion is `#disc=<id>`). Project (or **New project…**), model
   (`listModels`, the project's `discussion.model` marked "(default)") and thinking dropdowns at the top, locked to the
   pinned values after the first message; a collapsible history rail of the project's discussions with **New chat**;
-  the transcript and composer (**Stop**); a drafts panel (**Draft tickets**, edit drafts, **Create ticket**); a ⋯ menu
+  the transcript and composer (**Stop**, which ends the turn as before; tool rows get the per-call **Stop** and timing
+  above, and the header cost includes the running turn's `liveCost`); a drafts panel (**Draft tickets**, edit drafts, **Create ticket**); a ⋯ menu
   with **Close discussion**, **Reopen**, **Retry**. The chat is continuous (spec `docs/specs/run-mv4rfo5d-i74d.md`):
   the composer is always visible, pinned to the bottom of the sheet, whatever the transcript's length, at every
   breakpoint, with the rail collapsed or expanded and the drafts panel open or closed, in every composer state

@@ -114,6 +114,12 @@ export interface BundleView {
 	messages: HumanMessage[];
 	history: { from: BundleState | null; to: BundleState; at: number; round: number }[];
 	cost: CostRecord[];
+	/** Usage of the bundle's Conversations that no cost record contains yet (the turns in progress). */
+	liveCost: LiveCost;
+	/** Set while the agent the bundle is with is paused by `interruptBundleAgent`, until the human's next message. */
+	interrupted?: Interrupted;
+	/** The roles that take messages (and so can be interrupted) in this bundle: the integrator, and the reviewer if `policy.messages` lists it. */
+	messageRoles: Role[];
 	failure?: { state: BundleState; reason: string };
 	workspace?: Workspace;
 	createdAt: number;
@@ -160,7 +166,10 @@ export interface DiscussionView {
 	summary?: string;
 	drafts: Draft[];
 	notices: DiscussionNotice[];
+	/** The recorded total (the turns that ended); the running turn's usage is `liveCost`. */
 	cost: { usd: number; totalTokens: number };
+	/** The running turn's usage that no `turnCosts` entry contains yet (zero between turns). */
+	liveCost: { usd: number; totalTokens: number };
 	turnCosts: TurnCost[];
 	runs: { id: RunId; state: RunState }[];
 	workspace?: Workspace;
@@ -346,6 +355,8 @@ export interface HumanMessage {
 	to: Role;
 	/** Set once the message is handed to a conversation; unset while the role hasn't started yet. */
 	conversationId?: string;
+	/** A message that resumed an interrupted agent: the request id it went in with (`<key>:resume<n>`). */
+	resume?: string;
 	at: number;
 }
 
@@ -368,6 +379,12 @@ export interface RunView {
 	/** QA status of the latest review round (undefined before the first review). */
 	qaStatus?: QaStatus;
 	cost: CostRecord[];
+	/** Usage of the run's Conversations that no cost record contains yet (the turns in progress, running helpers). */
+	liveCost: LiveCost;
+	/** Set while the agent the run is with is paused by `interruptAgent`, until the human's next message. */
+	interrupted?: Interrupted;
+	/** The roles that take messages (and so can be interrupted) in this run: the pinned `policy.messages`. */
+	messageRoles: Role[];
 	configHash: string;
 	piVersion: string;
 	failure?: { state: RunState; gate?: Gate; reason: string };
@@ -388,6 +405,22 @@ export interface RunView {
 	cleared?: { at: number; by: string };
 	createdAt: number;
 	updatedAt: number;
+}
+
+/** An owner's unrecorded usage: per role Conversation (helpers count under their builder's Conversation). */
+export interface LiveCost {
+	usd: number;
+	totalTokens: number;
+	byRole: { role: Role; conversationId: string; usd: number; totalTokens: number }[];
+}
+
+/** An agent paused by an interrupt: the role, its Conversation, the driving key of its turn, when and by whom. */
+export interface Interrupted {
+	role: Role;
+	conversationId: string;
+	key: string;
+	at: number;
+	by: string;
 }
 
 export interface ReviewRoundView {
@@ -432,7 +465,11 @@ export interface TranscriptItem {
 	msgId?: string;
 	text?: string;
 	toolCalls?: { id: string; name: string; args: unknown }[];
-	toolResult?: { callId: string; name: string; isError: boolean; text: string; details?: unknown };
+	/**
+	 * `durationMs`: the execution time of the call's last attempt (from the result message); for a result without one
+	 * (a stopped or aborted call), the time from the calling response to the result.
+	 */
+	toolResult?: { callId: string; name: string; isError: boolean; text: string; details?: unknown; durationMs?: number };
 }
 
 export interface TranscriptView {
@@ -444,6 +481,10 @@ export interface TranscriptView {
 	busy: boolean;
 	/** Human messages waiting in the conversation's inbox for the agent's next step boundary. */
 	queued: { msgId: string; by: string; text: string }[];
+	/** The current tool round's calls not finished yet (`pi.live.tools`); `startedAt` (wall-clock ms) once running. */
+	running: { callId: string; name: string; status: "pending" | "running"; startedAt?: number }[];
+	/** The server's clock when the view was read (interfaces correct `startedAt` for clock skew with it). */
+	now: number;
 }
 
 export type FactoryEvent =
@@ -465,6 +506,11 @@ export type FactoryEvent =
 	| { type: "bundle.askResolved"; bundle: BundleId; ask: AskId; by: string }
 	| { type: "bundle.notice"; bundle: BundleId; notice: Notice }
 	| { type: "bundle.conversation.updated"; bundle: BundleId; conversationId: string; role: Role }
+	/**
+	 * An owner's total cost (recorded plus live) changed while its agents work: at most once per 2 s per owner. Exactly
+	 * one of `run`, `bundle`, `discussion` is set.
+	 */
+	| { type: "cost.updated"; project: string; run?: RunId; bundle?: BundleId; discussion?: DiscussionId; usd: number; totalTokens: number }
 	/** A project was deleted (`deleteProject`): its runs, bundles and discussions were purged. */
 	| { type: "project.deleted"; project: string; runs: RunId[]; bundles: BundleId[]; discussions: DiscussionId[] };
 
@@ -514,6 +560,15 @@ export interface FactoryCore {
 	resolveEscalation(run: RunId, ask: AskId, choice: { accept: true } | { moreRounds: number } | { abort: true }): Promise<void>;
 	/** Send a message to the agent the run is with. It never moves the run; see `messageTarget` for who receives it. */
 	message(run: RunId, text: string): Promise<{ message: string; to: Role; conversationId?: string }>;
+	/**
+	 * Pause the agent the run is with (its `messageTarget`): its generation and tools are aborted. While the core drives
+	 * it (DISCUSSING, BUILDING, REVIEWING) the run records `interrupted` and waits for the human's next message, which
+	 * resumes the same turn; otherwise only the reply in progress is aborted. `conflict`: terminal, role not in
+	 * `policy.messages`, or the agent is not working.
+	 */
+	interruptAgent(run: RunId): Promise<void>;
+	/** Stop one running (or queued) tool call of a run's, bundle's or discussion's Conversation (helpers and QA included). */
+	stopToolCall(target: { run?: RunId; bundle?: BundleId; discussion?: DiscussionId; conversationId: string; callId: string }): Promise<void>;
 	/** A QA screenshot (§3.7), kept by the core as a run artifact. Over HTTP: GET /api/runs/<run>/screenshots/<id>. */
 	getScreenshot(run: RunId, id: string): Promise<{ mime: string; bytes: Uint8Array }>;
 	settingsSchema(): Record<string, SettingField>;
@@ -556,6 +611,8 @@ export interface FactoryCore {
 	retryBundle(id: BundleId): Promise<void>;
 	/** A message to the agent the bundle is with (the reviewer while REVIEWING, else the integrator). */
 	messageBundle(id: BundleId, text: string): Promise<{ message: string; to: Role; conversationId?: string }>;
+	/** As `interruptAgent`, for the agent the bundle is with (INTEGRATING, FIXING and REVIEWING are core-driven). */
+	interruptBundleAgent(id: BundleId): Promise<void>;
 	/** A QA screenshot of a bundle review. Over HTTP: GET /api/bundles/<id>/screenshots/<sid>. */
 	getBundleScreenshot(id: BundleId, screenshotId: string): Promise<{ mime: string; bytes: Uint8Array }>;
 	/** A `project` filter matches run, discussion and bundle events; `run`, `discussion` and `bundle` match only that one's. */
@@ -584,6 +641,8 @@ export const CORE_OPS = [
 	"submitHumanFindings",
 	"resolveEscalation",
 	"message",
+	"interruptAgent",
+	"stopToolCall",
 	"getScreenshot",
 	"settingsSchema",
 	"getSettings",
@@ -613,6 +672,7 @@ export const CORE_OPS = [
 	"cancelBundle",
 	"retryBundle",
 	"messageBundle",
+	"interruptBundleAgent",
 	"getBundleScreenshot",
 ] as const satisfies readonly (keyof FactoryCore)[];
 
