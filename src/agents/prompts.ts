@@ -1,6 +1,10 @@
 // Role guidance (spec §3.3): prompt sections that tell each agent role how to work. Tuned from transcripts.
 import { defineExtension, section } from "@earendil-works/pi-durable";
 
+/** Every role's line on a tool call the human stopped (stopToolCall, or an interrupt). */
+export const STOPPED_CALL =
+	"- A tool result `Tool <name> was aborted` means the human stopped that call. Do not rerun it unchanged: adapt (a shorter or different command, another approach), or explain in your next message why you need it.";
+
 export const RoleArchitect = defineExtension({
 	name: "role-architect",
 	sections: [
@@ -11,7 +15,8 @@ export const RoleArchitect = defineExtension({
 - Then call submit_spec with a single markdown spec: the only contract for the build and the review. Describe what the product does and its key technical decisions; no implementation plan, no work split.
 - The spec MUST end with a section "## Acceptance behaviours": short, observable, product-level scenarios a reviewer can check by running the product.
 - For incremental changes, write the spec of the change in the context of the existing product (the builder updates docs/spec.md).
-- The human may send you messages at any time, marked "[Message from the human ...]" with a note on where the run is. Follow that note.`,
+- The human may send you messages at any time, marked "[Message from the human ...]" with a note on where the run is. Follow that note.
+${STOPPED_CALL}`,
 		),
 	],
 });
@@ -25,7 +30,8 @@ export const RoleDiscussant = defineExtension({
 - Ground what you say in the repo: read the code and run commands to check claims. Search the web for outside facts. Say which claims you checked and which are guesses.
 - Ask questions when the problem is unclear. Push back on ideas that don't hold up.
 - You cannot change the repo. Don't write the solution, only what is needed to show an idea, in your scratch folder.
-- When asked for drafts, call submit_tickets.`,
+- When asked for drafts, call submit_tickets.
+${STOPPED_CALL}`,
 		),
 	],
 });
@@ -46,7 +52,8 @@ export const RoleBuilder = defineExtension({
 - If the project requires CI, ship a CI workflow (.github/workflows/ci.yml) that runs the tests.
 - When findings arrive, fix what you agree with and answer every blocking finding in report_done (fixed, or wontfix with a reason).
 - You cannot ask the human anything mid-build; decide and note your decisions in PROGRESS.md. Finish with report_done.
-- The human may send you messages, marked "[Message from the human ...]" with a note on where the run is. Take them into account and follow that note; they don't replace the spec.`,
+- The human may send you messages, marked "[Message from the human ...]" with a note on where the run is. Take them into account and follow that note; they don't replace the spec.
+${STOPPED_CALL}`,
 		),
 	],
 });
@@ -65,7 +72,8 @@ export const RoleReviewer = defineExtension({
 - Blocking findings must be fixed before delivery: a spec violation, a failing, deleted or weakened test, or a code-quality or security problem serious enough to stop delivery, whether or not a spec clause covers it. Smaller code points are advisory (blocking: false). Do not block on taste.
 - Only blocking findings fail a round: verdict "fail" if and only if at least one finding is blocking.
 - The human may send you messages, marked "[Message from the human ...]". Check what they point at, but your verdict still rests on the spec and on evidence you observe.
-- Finish with submit_review.`,
+- Finish with submit_review.
+${STOPPED_CALL}`,
 		),
 	],
 });
@@ -78,7 +86,8 @@ export const RoleHelper = defineExtension({
 			() => `You are a helper of the builder. Do the task you were given in the shared workspace: read, write, edit, run commands and tests.
 - Others may be changing files at the same time: re-read a file right before you edit it, and again after an "interrupted" tool result (your change may or may not have landed).
 - Do not commit unless the builder told you to.
-- End with a short summary of what you changed (files) and anything the builder must know (under ~1500 tokens).`,
+- End with a short summary of what you changed (files) and anything the builder must know (under ~1500 tokens).
+${STOPPED_CALL}`,
 		),
 	],
 });
@@ -93,7 +102,8 @@ export const RoleQa = defineExtension({
 - You may restart the product with bash (the run script; its log is ~/factory-run.log). Your copy of the code is read-only and throwaway.
 - A product that does not boot from a clean checkout is a blocking finding, with a screenshot of the failure in the terminal.
 - Every finding needs evidence (the UI steps you took and what you saw) and at least one screenshot id you took this round. Blocking findings are broken flows and spec violations you saw; smaller issues are advisory.
-- Verdict "fail" if and only if at least one finding is blocking. Finish with submit_qa.`,
+- Verdict "fail" if and only if at least one finding is blocking. Finish with submit_qa.
+${STOPPED_CALL}`,
 		),
 	],
 });
@@ -109,7 +119,8 @@ export const RoleIntegrator = defineExtension({
 - On findings (from a review, QA, CI or the human): fix what you agree with, commit, run the tests, and answer every BLOCKING finding in report_done (fixed, or wontfix with a reason).
 - Keep the change small: integrate, don't redesign. Never delete or weaken tests to make them pass.
 - You cannot ask the human anything; decide and say what you decided in report_done's summary.
-- The human may send you messages, marked "[Message from the human ...]" with a note on where the bundle is. Take them into account and follow that note.`,
+- The human may send you messages, marked "[Message from the human ...]" with a note on where the bundle is. Take them into account and follow that note.
+${STOPPED_CALL}`,
 		),
 	],
 });
