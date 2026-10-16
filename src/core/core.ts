@@ -113,6 +113,11 @@ export interface CoreOptions {
 	storage?: "memory" | { sqlite: string } | { jsonl: string };
 	now?: () => number;
 	ciPollMs?: number;
+	/**
+	 * How often the PR watcher asks GitHub for the state of each bundle's PR outside AWAITING_CI / AWAITING_MERGE.
+	 * Default: `ciPollMs` when given (tests, the dry run), else once a minute.
+	 */
+	prWatchMs?: number;
 	log?: (msg: string) => void;
 }
 
@@ -154,6 +159,14 @@ export class Factory implements FactoryCore {
 	private projectLocks = new Map<string, Promise<unknown>>();
 	/** Test hook: deleteProject stops right after its purge commit (as if the process were killed there). */
 	haltDeletionAfterCommitForTests = false;
+	/** Test hook: cancelRuns stops right after its intent commit (as if the process were killed there). */
+	haltCancelRunsAfterCommitForTests = false;
+	/** Test hook: the PR watcher (and checkBundlePr) stops right after its externalEnd marker commit. */
+	haltPrWatchAfterMarkerForTests = false;
+	/** The PR watcher's interval timer, and the tick in flight (ticks never overlap). */
+	private prWatchTimer?: NodeJS.Timeout;
+	private prWatchTick?: Promise<void>;
+	private closing = false;
 
 	constructor(private opts: CoreOptions) {
 		this.now = opts.now ?? Date.now;
@@ -286,6 +299,14 @@ export class Factory implements FactoryCore {
 			}
 		});
 		this.harness.resume();
+		// Bulk cancels and PR-watcher markers a crash interrupted are finished first; then the PRs are checked once and on
+		// the interval.
+		void this.finishIntents()
+			.catch((e) => this.log(`finishing interrupted cancels failed: ${e instanceof Error ? e.message : e}`))
+			.then(() => this.watchPrs());
+		const every = this.opts.prWatchMs ?? this.opts.ciPollMs ?? 60_000;
+		this.prWatchTimer = setInterval(() => void this.watchPrs(), every);
+		this.prWatchTimer.unref?.();
 		void this.sweepQaVms();
 		void this.sweepDisk().catch((e) => this.log(`disk sweep failed: ${e instanceof Error ? e.message : e}`));
 		for (const run of this.cache.values())
@@ -431,6 +452,9 @@ export class Factory implements FactoryCore {
 	}
 
 	async close(): Promise<void> {
+		this.closing = true;
+		if (this.prWatchTimer) clearInterval(this.prWatchTimer);
+		await this.prWatchTick?.catch(() => undefined);
 		for (const t of this.convThrottle.values()) clearTimeout(t);
 		for (const t of this.costThrottle.values()) if (t.timer) clearTimeout(t.timer);
 		this.costThrottle.clear();
@@ -1281,39 +1305,111 @@ export class Factory implements FactoryCore {
 		if (!runs.every((r) => typeof r === "string" && r.length > 0)) throw new FactoryError("invalid", "run ids must be non-empty strings");
 		if (reason !== undefined && reason !== null && typeof reason !== "string") throw new FactoryError("invalid", "reason must be a string");
 		const ids = [...new Set(runs)];
-		// Check the whole call first, then set every cancelReason in one commit, then abort the tasks.
-		const refuse = (d: RunDocState): FactoryError | undefined => {
-			if (TERMINAL_STATES.includes(d.state)) return new FactoryError("conflict", `run ${d.id} is already ${d.state}`);
-			const held = this.activeBundleOf(d);
-			if (held) return new FactoryError("conflict", `run ${d.id} is in ${held}; drop it from the bundle or cancel the bundle first`);
-			return undefined;
-		};
-		for (const id of ids) {
-			const d = await this.doc(id); // not_found
-			const e = refuse(d);
-			if (e) throw e;
-		}
-		const taskIds: { id: RunId; taskId: string }[] = [];
-		await this.root.commit(async (tx) => {
+		const why = reason ?? `cancelled by ${by}`;
+		// Check the whole call first: a terminal run is refused; a member of an active bundle (FAILED included) only comes
+		// with every other member of that bundle (the bundle is cancelled whole). Returns the bundles to cancel.
+		const check = async (runOf: (id: RunId) => Promise<RunDocState | undefined>, bundleOf: (id: BundleId) => Promise<BundleDocState | undefined>): Promise<{ runs: RunDocState[]; bundles: BundleDocState[] }> => {
 			const docs: RunDocState[] = [];
+			const bundles = new Map<string, BundleDocState>();
 			for (const id of ids) {
-				const d = (await tx.doc(RunDoc, id, null as never)) as unknown as RunDocState | undefined;
+				const d = await runOf(id);
 				if (!d?.id) throw new FactoryError("not_found", `run ${id} does not exist`);
-				const e = refuse(d);
-				if (e) throw e;
+				if (TERMINAL_STATES.includes(d.state)) throw new FactoryError("conflict", `run ${d.id} is already ${d.state}`);
 				docs.push(d);
+				if (d.bundle && !d.bundleMerged && !bundles.has(d.bundle)) {
+					const b = await bundleOf(d.bundle);
+					if (b?.id && !BUNDLE_RELEASED_STATES.includes(b.state)) bundles.set(b.id, b);
+				}
 			}
-			for (const d of docs) {
-				d.cancelReason = reason ?? `cancelled by ${by}`;
+			for (const b of bundles.values()) {
+				const missing = b.members.filter((m) => !ids.includes(m.run));
+				if (missing.length)
+					throw new FactoryError(
+						"conflict",
+						`${b.id} is cancelled whole: the call has ${b.members.length - missing.length} of its ${b.members.length} tickets; missing ${missing.map((m) => `${m.key} (${m.run})`).join(", ")}. Include every ticket of ${b.id}, or drop tickets from the bundle first`,
+					);
+			}
+			return { runs: docs, bundles: [...bundles.values()] };
+		};
+		await check(
+			async (id) => (await this.harness.snapshot(RunDoc, id, this.ctx)) as RunDocState | undefined,
+			async (id) => (await this.harness.snapshot(BundleDoc, id, this.ctx)) as BundleDocState | undefined,
+		);
+		// One commit records the intent on every run and every affected bundle; then the bundles are cancelled (their
+		// members released), then the runs' tasks are aborted. A crash after this commit is finished on startup.
+		const taskIds: { id: RunId; taskId: string }[] = [];
+		const bundleIds: BundleId[] = [];
+		await this.root.commit(async (tx) => {
+			const got = await check(
+				async (id) => (await tx.doc(RunDoc, id, null as never)) as unknown as RunDocState | undefined,
+				async (id) => (await tx.doc(BundleDoc, id, null as never)) as unknown as BundleDocState | undefined,
+			);
+			for (const d of got.runs) {
+				d.cancelReason = why;
 				taskIds.push({ id: d.id, taskId: d.taskId as string });
 			}
+			for (const b of got.bundles) {
+				b.cancelReason = why;
+				bundleIds.push(b.id);
+			}
 		}, this.ctx);
+		if (this.haltCancelRunsAfterCommitForTests) return { cancelled: [] };
+		await this.cancelMarkedBundles(bundleIds);
 		const cancelled: RunId[] = [];
 		for (const { id, taskId } of taskIds) {
 			await this.harness.abortTask(taskId as never, this.ctx);
 			cancelled.push(id);
 		}
 		return { cancelled };
+	}
+
+	/**
+	 * Cancel bundles whose `cancelReason` is committed: a live task is aborted (its abort path closes the PR and releases
+	 * the members) and waited for; a FAILED one (or one that failed before the abort landed) is cancelled here.
+	 */
+	private async cancelMarkedBundles(ids: BundleId[]): Promise<void> {
+		const live: { id: BundleId; taskId: string }[] = [];
+		for (const id of ids) {
+			const d = (await this.harness.snapshot(BundleDoc, id, this.ctx)) as BundleDocState | undefined;
+			if (!d || BUNDLE_RELEASED_STATES.includes(d.state)) continue;
+			const task = d.taskId !== undefined ? await this.harness.getTask(d.taskId as never, this.ctx) : undefined;
+			if (task && task.state.status !== "terminal") {
+				await this.harness.abortTask(d.taskId as never, this.ctx);
+				live.push({ id, taskId: d.taskId as string });
+			} else if (d.state === "FAILED") await this.endFailedBundle(id, "cancel", d.cancelReason ?? "cancelled");
+		}
+		for (const { id, taskId } of live) {
+			await this.harness.waitForTask(taskId as never, withAbortSignal(AbortSignal.timeout(60_000), this.ctx)).catch(() => undefined);
+			const d = (await this.harness.snapshot(BundleDoc, id, this.ctx)) as BundleDocState | undefined;
+			// It failed before the abort reached it: cancel it as a FAILED bundle.
+			if (d?.state === "FAILED") await this.endFailedBundle(id, "cancel", d.cancelReason ?? "cancelled");
+		}
+	}
+
+	/**
+	 * On startup: finish what a crash interrupted after its intent was committed. Bundles with a `cancelReason` or an
+	 * `externalEnd` marker that are not MERGED or CANCELLED end first; then runs with a `cancelReason` that are still live
+	 * are aborted.
+	 */
+	private async finishIntents(): Promise<void> {
+		const marked = [...this.bundles.values()].filter((b) => !BUNDLE_RELEASED_STATES.includes(b.state) && (b.cancelReason !== undefined || (b.externalEnd && b.state !== "FAILED")));
+		const toCancel: BundleId[] = [];
+		for (const b of marked) {
+			if (b.externalEnd && b.state !== "FAILED") {
+				// the task's own phase sees the marker; aborting it is the same end, sooner
+				const task = b.taskId !== undefined ? await this.harness.getTask(b.taskId as never, this.ctx) : undefined;
+				if (task && task.state.status !== "terminal") await this.harness.abortTask(b.taskId as never, this.ctx);
+			} else toCancel.push(b.id);
+		}
+		if (toCancel.length) this.log(`finishing the cancel of ${toCancel.join(", ")}`);
+		await this.cancelMarkedBundles(toCancel);
+		for (const r of [...this.cache.values()]) {
+			if (r.cancelReason === undefined || TERMINAL_STATES.includes(r.state) || this.closing) continue;
+			const task = r.taskId !== undefined ? await this.harness.getTask(r.taskId as never, this.ctx) : undefined;
+			if (!task || task.state.status === "terminal") continue;
+			this.log(`finishing the cancel of run ${r.id}`);
+			await this.harness.abortTask(r.taskId as never, this.ctx);
+		}
 	}
 
 	async retryRun(run: RunId): Promise<void> {
@@ -1849,27 +1945,122 @@ export class Factory implements FactoryCore {
 			return;
 		}
 		// A FAILED bundle (its Task has ended): close its PR and release its members here.
-		if (d.delivery?.pr) await this.opts.github.closePr(d.delivery.pr, { runId: id, config: d.pinned.config }).catch((e) => this.log(`bundle ${id}: closing the PR failed: ${e}`));
+		await this.endFailedBundle(id, "cancel", why);
+	}
+
+	/**
+	 * End a bundle whose Task has ended (FAILED) in one commit, then clean its own things in the background (members'
+	 * branches are theirs). `cancel`: its PR is closed and its members released (cancelBundle, cancelRuns); `merged`: its PR
+	 * was merged on GitHub, members are DELIVERED by it; `closed`: its PR was closed on GitHub, members released.
+	 */
+	private async endFailedBundle(id: BundleId, how: "cancel" | "merged" | "closed", why: string): Promise<void> {
+		const d = await this.bundleDoc(id);
+		if (how === "cancel" && d.delivery?.pr) await this.opts.github.closePr(d.delivery.pr, { runId: id, config: d.pinned.config }).catch((e) => this.log(`bundle ${id}: closing the PR failed: ${e}`));
 		await this.root.commit(async (tx) => {
 			const doc = (await tx.doc(BundleDoc, id, null as never)) as unknown as BundleDocState;
 			if (doc.state === "MERGED" || doc.state === "CANCELLED") throw new FactoryError("conflict", `bundle ${id} is already ${doc.state}`);
 			const now = this.now();
+			const to: BundleState = how === "merged" ? "MERGED" : "CANCELLED";
 			for (const m of doc.members) {
 				const r = (await tx.doc(RunDoc, m.run, null as never)) as unknown as RunDocState;
-				if (r?.id && r.bundle === id) {
+				if (!r?.id || r.bundle !== id) continue;
+				if (how === "merged") {
+					// the run Task (READY) delivers the run by it, as when the bundle Task merges
+					if (!TERMINAL_STATES.includes(r.state)) r.bundleMerged = { bundle: id, delivery: JSON.parse(JSON.stringify(doc.delivery!)) };
+				} else {
 					delete r.bundle;
-					r.notices.push({ at: now, level: "info", text: `Released from ${id} (${why}); back in Ready` });
-					r.updatedAt = now;
+					if (!TERMINAL_STATES.includes(r.state)) r.notices.push({ at: now, level: "info", text: `Released from ${id} (${why}); back in Ready` });
 				}
+				r.updatedAt = now;
 			}
 			delete doc.pendingAsk;
-			doc.notices.push({ at: now, level: "warn", text: `Cancelled in ${doc.state}: ${why}`, final: true });
-			doc.history.push({ from: doc.state, to: "CANCELLED", at: now, round: doc.counters.reviewRound });
-			doc.state = "CANCELLED";
+			delete doc.mergeRequested;
+			const url = doc.delivery?.url;
+			if (how === "merged") {
+				delete doc.failure;
+				doc.notices.push({ at: now, level: "info", text: `The PR was merged on GitHub (while ${doc.state})` });
+				doc.notices.push({ at: now, level: "info", text: `Merged${url ? `: ${url}` : ""}`, ...(url ? { url } : {}), final: true });
+			} else {
+				if (how === "closed") doc.failure = { state: doc.state, reason: why };
+				doc.notices.push({ at: now, level: "warn", text: `Cancelled in ${doc.state}: ${why}`, final: true });
+			}
+			doc.history.push({ from: doc.state, to, at: now, round: doc.counters.reviewRound });
+			doc.state = to;
 			doc.updatedAt = now;
 		}, this.ctx);
-		// No Task cleans it: delete the bundle's own things in the background (members' branches are theirs).
 		this.cleanInBackground("bundle", id);
+	}
+
+	// ------------------------------------------------------------------ the PR watcher (PRs merged or closed outside the factory)
+	/** Bundles with a PR that are not MERGED or CANCELLED. */
+	private static watchable(d: BundleDocState): boolean {
+		return d.delivery?.kind === "pr" && !!d.delivery.pr && !BUNDLE_RELEASED_STATES.includes(d.state);
+	}
+
+	/**
+	 * One tick of the PR watcher: every watched bundle outside AWAITING_CI / AWAITING_MERGE (they poll in their own task),
+	 * one at a time. A failed lookup is logged and tried again on the next tick.
+	 */
+	private watchPrs(): Promise<void> {
+		if (this.prWatchTick || this.closing) return this.prWatchTick ?? Promise.resolve();
+		const tick: Promise<void> = (async () => {
+			await Promise.resolve(); // the tick is recorded before it can end
+			try {
+				for (const d of [...this.bundles.values()]) {
+					if (this.closing) return;
+					if (!Factory.watchable(d) || d.state === "AWAITING_CI" || d.state === "AWAITING_MERGE") continue;
+					if (d.externalEnd && d.state !== "FAILED") continue; // its end is under way
+					try {
+						const pr = await this.opts.github.prState(d.delivery!.pr!, { runId: d.id, config: d.pinned.config });
+						if (pr !== "open" && !this.closing) await this.actOnPr(d.id, pr);
+					} catch (e) {
+						this.log(`bundle ${d.id}: checking the PR failed (tried again on the next tick): ${e instanceof Error ? e.message : e}`);
+					}
+				}
+			} finally {
+				this.prWatchTick = undefined;
+			}
+		})();
+		this.prWatchTick = tick;
+		return tick;
+	}
+
+	/** A bundle's PR was merged or closed on GitHub: a live task gets the marker and is aborted; a FAILED one ends here. */
+	private async actOnPr(id: BundleId, how: "merged" | "closed"): Promise<void> {
+		const d = await this.bundleDoc(id);
+		if (BUNDLE_RELEASED_STATES.includes(d.state)) return;
+		const task = d.taskId !== undefined ? await this.harness.getTask(d.taskId as never, this.ctx) : undefined;
+		if (task && task.state.status !== "terminal") {
+			let marked = false;
+			await this.root.commit(async (tx) => {
+				const doc = (await tx.doc(BundleDoc, id, null as never)) as unknown as BundleDocState;
+				if (BUNDLE_TERMINAL_STATES.includes(doc.state)) return;
+				if (!doc.externalEnd) doc.externalEnd = { how, at: this.now(), from: doc.state };
+				marked = true;
+			}, this.ctx);
+			if (this.haltPrWatchAfterMarkerForTests) return;
+			if (marked) {
+				this.log(`bundle ${id}: the PR was ${how} on GitHub while ${d.state}; ending the bundle`);
+				await this.harness.abortTask(d.taskId as never, this.ctx);
+				return;
+			}
+		}
+		const now = await this.bundleDoc(id);
+		if (now.state === "FAILED") {
+			this.log(`bundle ${id}: the PR was ${how} on GitHub while FAILED; ending the bundle`);
+			await this.endFailedBundle(id, how, "the PR was closed without merging").catch((e) => {
+				if (!(e instanceof FactoryError && e.code === "conflict")) throw e;
+			});
+		}
+	}
+
+	async checkBundlePr(id: BundleId): Promise<{ pr: "open" | "merged" | "closed"; state: BundleState }> {
+		const d = await this.bundleDoc(id); // not_found
+		if (d.delivery?.kind !== "pr" || !d.delivery.pr) throw new FactoryError("conflict", `bundle ${id} has no PR`);
+		if (BUNDLE_RELEASED_STATES.includes(d.state)) throw new FactoryError("conflict", `bundle ${id} is already ${d.state}`);
+		const pr = await this.opts.github.prState(d.delivery.pr, { runId: id, config: d.pinned.config });
+		if (pr !== "open") await this.actOnPr(id, pr);
+		return { pr, state: (await this.bundleDoc(id)).state };
 	}
 
 	async retryBundle(id: BundleId): Promise<void> {
@@ -1890,6 +2081,8 @@ export class Factory implements FactoryCore {
 			delete doc.failure;
 			delete doc.driving;
 			delete doc.interrupted;
+			delete doc.cancelReason;
+			delete doc.externalEnd;
 			doc.counters.attempt = (doc.counters.attempt ?? 0) + 1;
 			doc.notices.push({ at: this.now(), level: "info", text: `Retried by ${by}; resuming at ${to}` });
 			doc.taskId = (await tx.createTask(this.bundleTask, { bundleId: id, start: to }, { ownership: { kind: "conversation" }, background: true })) as unknown as string;

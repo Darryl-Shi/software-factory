@@ -339,41 +339,55 @@ function readyCardHtml(r) {
   const why = other ? `A bundle holds tickets of one project: ${proj} is ticked. Untick those to pick ${r.project}.` : `Pick ${keyOf(r.id)} to ship it`;
   return `<div class="ship-wrap${ticked ? " ticked" : ""}"><label class="ship-tick${other ? " off" : ""}" title="${esc(why)}"><input type="checkbox" data-ship="${esc(r.id)}" aria-label="${esc(why)}"${ticked ? " checked" : ""}${other ? " disabled" : ""}></label>${cardHtml(r)}</div>`;
 }
-// Select mode: a checkbox on every run card the board shows except runs held by an active bundle; bulk Cancel / Clear.
+// Select mode: a checkbox on every run card the board shows except runs held by an active bundle, and on every bundle
+// card in Shipping (ticking it selects the bundle: all of its member tickets, which cannot be ticked one by one, so
+// cancelRuns always gets whole bundles); bulk Cancel / Clear. ui.sel holds run ids and bundle ids.
 const selectable = (r) => !!r && !r.cleared && !inActiveBundle(r) && boardColumn(r) != null;
 function selCardHtml(r) {
   if (!selectable(r)) return cardHtml(r);
   const on = ui.sel.has(r.id), label = `Select ${keyOf(r.id)}`;
   return `<div class="ship-wrap sel-wrap${on ? " ticked" : ""}"><label class="ship-tick sel-tick" title="${esc(label)}"><input type="checkbox" data-sel="${esc(r.id)}" aria-label="${esc(label)}"${on ? " checked" : ""}></label>${cardHtml(r)}</div>`;
 }
-// The selected runs the bar's two actions act on: live ones (Cancel K) and terminal ones not yet cleared (Clear M).
+function selBundleCardHtml(b) {
+  const on = ui.sel.has(b.id), label = `Select ${b.id} (${plural(b.members.length, "ticket")})`;
+  return `<div class="ship-wrap sel-wrap sel-bundle${on ? " ticked" : ""}"><label class="ship-tick sel-tick" title="${esc(label)}"><input type="checkbox" data-sel="${esc(b.id)}" data-sel-bundle aria-label="${esc(label)}"${on ? " checked" : ""}></label>${bundleCardHtml(b)}</div>`;
+}
+// The selection the bar's two actions act on: live runs plus every member of the selected bundles (Cancel K), and
+// terminal runs not yet cleared (Clear M). `bundles`: the selected bundles; `n`: the tickets selected.
 function selSplit() {
-  const live = [], done = [];
+  const live = new Set(), done = new Set(), bundles = [];
   for (const id of ui.sel) {
+    const b = ui.bundles.get(id);
+    if (b && !ui.runs.has(id)) { if (bundleOnBoard(b)) { bundles.push(b); b.members.forEach((m) => live.add(m.run)); } continue; }
     const r = ui.runs.get(id);
     if (!r || r.cleared) continue;
-    (TERMINAL.includes(r.state) ? done : live).push(id);
+    (TERMINAL.includes(r.state) ? done : live).add(id);
   }
-  return { live, done };
+  return { live: [...live], done: [...done], bundles, n: live.size + done.size };
+}
+// What cancelling the selected bundles does, for the confirming text: "closes the PR of bundle-3; cancels bundle-4".
+function bundleCancelNote(bundles) {
+  const pr = bundles.filter((b) => b.delivery?.kind === "pr").map((b) => b.id), other = bundles.filter((b) => b.delivery?.kind !== "pr").map((b) => b.id);
+  return [pr.length ? `closes the PR${pr.length > 1 ? "s" : ""} of ${pr.join(", ")}` : "", other.length ? `cancels ${other.join(", ")}` : ""].filter(Boolean).join("; ");
 }
 function renderSelBar() {
   const bar = $("#sel-bar");
   if (!bar) return;
   if (!ui.selecting || !ui.sel.size) { bar.hidden = true; bar.innerHTML = ""; ui.confirmBulk = null; return; }
-  const { live, done } = selSplit();
+  const { live, done, bundles, n } = selSplit(), note = bundleCancelNote(bundles);
   const sigs = { cancel: `cancel:${[...live].sort().join(",")}`, clear: `clear:${[...done].sort().join(",")}` };
   if (ui.confirmBulk && ui.confirmBulk !== sigs.cancel && ui.confirmBulk !== sigs.clear) ui.confirmBulk = null; // the set changed
   const confirm = (k) => ui.confirmBulk === sigs[k];
   bar.hidden = false;
-  bar.innerHTML = `<span class="sel-n">${ui.sel.size} selected</span>` +
-    (live.length ? `<button type="button" class="btn small danger" data-bulk="cancel" title="Cancel the selected tickets that are still running">${confirm("cancel") ? `Click again to cancel ${live.length}` : `Cancel ${live.length}`}</button>` : "") +
+  bar.innerHTML = `<span class="sel-n">${n} selected</span>` +
+    (live.length ? `<button type="button" class="btn small danger" data-bulk="cancel" title="${esc(`Cancel the selected tickets that are still running${note ? ` (${note})` : ""}`)}">${confirm("cancel") ? `Click again to cancel ${live.length}${note ? ` (${esc(note)})` : ""}` : `Cancel ${live.length}`}</button>` : "") +
     (done.length ? `<button type="button" class="btn small${confirm("clear") ? " danger" : ""}" data-bulk="clear" title="Clear the selected finished tickets from the board (their files and branches are deleted; records and conversations stay)">${confirm("clear") ? `Click again to clear ${done.length}` : `Clear ${done.length}`}</button>` : "") +
     `<button type="button" class="btn small ghost sel-none" data-bulk="none">Clear selection</button>`;
 }
 let bulkTimer = 0;
 async function bulkAct(kind, btn) {
   if (kind === "none") { ui.sel.clear(); ui.confirmBulk = null; renderBoard(); return; }
-  const { live, done } = selSplit(), ids = kind === "cancel" ? live : done;
+  const { live, done, bundles } = selSplit(), ids = kind === "cancel" ? live : done;
   if (!ids.length) return;
   const sig = `${kind}:${[...ids].sort().join(",")}`;
   if (ui.confirmBulk !== sig) {
@@ -387,10 +401,12 @@ async function bulkAct(kind, btn) {
   const ok = await act(() => (kind === "cancel" ? core.cancelRuns(ids, "cancelled from the web UI") : core.clearRuns(ids)));
   if (!ok) { renderSelBar(); return; }
   ids.forEach((id) => ui.sel.delete(id));
-  toast(kind === "cancel" ? `Cancelled ${plural(ids.length, "ticket")}` : `Cleared ${plural(ids.length, "ticket")} from the board`);
+  if (kind === "cancel") bundles.forEach((b) => ui.sel.delete(b.id));
+  toast(kind === "cancel" ? `Cancelled ${plural(ids.length, "ticket")}${bundles.length ? ` (${bundles.map((b) => b.id).join(", ")} cancelled)` : ""}` : `Cleared ${plural(ids.length, "ticket")} from the board`);
   renderSelBar();
   if (kind === "clear") await animateOut(ids);
   ids.forEach(refreshRun);
+  if (kind === "cancel") bundles.forEach((b) => refreshBundle(b.id));
 }
 function setSelecting(on) {
   ui.selecting = on;
@@ -490,13 +506,13 @@ function renderBoard() {
   ui.doneIds = byCol.done.map((r) => r.id);
   // The selection holds only cards the board shows and that can be selected: one that leaves (cleared, filtered out)
   // or becomes unselectable (joined a bundle) drops out.
-  ui.selCols = Object.fromEntries(COLUMNS.map((c) => [c.key, ui.selecting ? byCol[c.key].filter(selectable).map((r) => r.id) : []]));
+  ui.selCols = Object.fromEntries(COLUMNS.map((c) => [c.key, !ui.selecting ? [] : [...(c.key === "shipping" ? bundles.map((b) => b.id) : []), ...byCol[c.key].filter(selectable).map((r) => r.id)]]));
   const shownSel = new Set(Object.values(ui.selCols).flat());
   for (const id of [...ui.sel]) if (!shownSel.has(id)) ui.sel.delete(id);
   const runCard = ui.selecting ? selCardHtml : cardHtml;
   const first = ui.runs.size === 0;
   board.innerHTML = COLUMNS.map((c) => {
-    const cards = c.key === "ready" ? byCol.ready.map(ui.selecting ? selCardHtml : readyCardHtml) : c.key === "shipping" ? [...bundles.map(bundleCardHtml), ...byCol.shipping.map(runCard)] : byCol[c.key].map(runCard);
+    const cards = c.key === "ready" ? byCol.ready.map(ui.selecting ? selCardHtml : readyCardHtml) : c.key === "shipping" ? [...bundles.map(ui.selecting ? selBundleCardHtml : bundleCardHtml), ...byCol.shipping.map(runCard)] : byCol[c.key].map(runCard);
     const phases = [...(c.key === "shipping" ? bundles.map(() => [0, "bundle"]) : []), ...byCol[c.key].map(phaseOf)];
     const sub = breakdown(phases);
     return `<section class="col${c.key === "done" ? " done-col" : ""}" data-col="${c.key}" aria-label="${esc(c.name)}">

@@ -36,7 +36,9 @@ projects, automatic shipping, stacked PRs.
   `READY` with a reviewed branch `factory/<run-id>` and later becomes `DELIVERED` when its bundle merges.
 - **Discussion:** a pre-ticket chat with one model about one project (id `disc-<n>`). It ends in draft tickets that
   the human edits and turns into runs.
-- **Bundle:** an ordered set of Ready runs of one project, shipped as one PR (id `bundle-<n>`).
+- **Bundle:** an ordered set of Ready runs of one project, shipped as one PR (id `bundle-<n>`). The core watches the
+  PR of every bundle not `MERGED` or `CANCELLED` (`FAILED` included): a PR merged on GitHub ends the bundle `MERGED`,
+  one closed without merging ends it `CANCELLED` (spec `docs/specs/run-mv99uglw-4rys.md`, §3.4, §8).
 - **Spec of a run:** a markdown document written by the architect, committed at `docs/specs/<run-id>.md`. It is the
   only contract between the stages and ends with acceptance behaviours. Runs that were past `SPEC_READY` before
   bundles keep `docs/spec.md`.
@@ -149,7 +151,19 @@ role models, `reviewRoundCap`, `bundle.mergeMethod`), works in `<workdir>/bundle
 - **Drop tickets** (`dropFromBundle`, at `AWAITING_MERGE` or `ESCALATED`): dropped runs return to plain `READY`; the
   bundle re-integrates the rest from the latest default branch; an open PR is reused and its description rewritten.
   Dropping every member is the same as cancelling.
-- **Outside GitHub:** a PR merged by a human is detected → `MERGED`; a PR closed without merging → `CANCELLED`.
+- **Outside the factory** (spec `docs/specs/run-mv99uglw-4rys.md`): a PR merged by a human on GitHub is detected →
+  `MERGED`; a PR closed without merging → `CANCELLED` (reason "the PR was closed without merging", members back in
+  plain `READY`). `AWAITING_CI` and `AWAITING_MERGE` poll the PR in their own task. Every other bundle with a PR
+  (`delivery.kind: "pr"`) that is not `MERGED` or `CANCELLED`, `FAILED` included, is checked by the core's **PR
+  watcher**: one bundle at a time, every minute (`CoreOptions.prWatchMs`; default `ciPollMs` when given, i.e.
+  `--ci-poll-ms` in tests and the dry run, else 60 s), and once at startup after resume (after interrupted cancels
+  are finished). A failed `prState` call is logged and tried again on the next tick; it never fails the bundle. A
+  merged PR goes through the same final transition as a Merge (members `DELIVERED` with the PR, Done with the PR link
+  and bundle chip, full cleanup), with the notice "The PR was merged on GitHub (while <state>)"; any pending ask
+  (escalation, merge card) is dropped. A live bundle gets the durable `externalEnd` marker and its Task is aborted
+  (§8), stopping any integrator, reviewer or QA agent; the factory never closes that PR. A `FAILED` bundle is ended by
+  the core in one commit, then cleaned in the background. `MERGED` is only recorded on GitHub's word; there is no way
+  to mark a bundle merged by hand. **Check PR now** (`checkBundlePr`, §5) runs the same check at once.
 - **PR content:** title is the ticket's title for one member, else "<N> tickets: <title 1>, …"; one section per
   ticket (title, run id, spec path, advisory and accepted findings, QA status) and an integration section (conflicts
   resolved or a clean merge, review rounds, advisory findings, QA status, the "no CI" note). A clean bundle of 2+
@@ -265,11 +279,16 @@ The core's whole outside surface is `FactoryCore` (`src/core/types.ts`). Every o
   - `cancelRuns(runs, reason?)` cancels several live runs at once (spec `docs/specs/run-mv545v95-rg77.md`), with the
     same effect per run as `cancelRun`. All or nothing, checked before anything changes: an empty list, a non-array or
     an id that is not a non-empty string is `invalid` (duplicates are collapsed), an unknown id `not_found`, a terminal
-    run or a run in an active bundle (a `FAILED` bundle included) `conflict`, naming the run and its state or bundle.
-    One commit sets `cancelReason` on every run (`reason`, or `cancelled by <interface>`, the interface captured
-    before the first await); then each run's task is aborted, and each run reaches `CANCELLED` through the run task's
-    own cancellation path (final notice, environments and QA VM disposed, `run.state`). Returns `{ cancelled }`, the
-    runs whose tasks were aborted.
+    run `conflict`, naming the run and its state. **Members of an active bundle** (`FAILED` included; spec
+    `docs/specs/run-mv99uglw-4rys.md`) are accepted only when the call lists **every** member of that bundle; else
+    `conflict` naming the bundle and the missing tickets (key and run id), and nothing changes. One commit sets
+    `cancelReason` on every run and every affected bundle (`reason`, or `cancelled by <interface>`, the interface
+    captured before the first await). Then the bundles are cancelled first, as by `cancelBundle` (a live one is
+    aborted and waited for, its PR closed and members released; a `FAILED` one is ended directly, PR closed), and
+    then each run's task is aborted, each run reaching `CANCELLED` through the run task's own cancellation path
+    (final notice, environments and QA VM disposed, `run.state`). Returns `{ cancelled }`, the runs whose tasks were
+    aborted. On startup the core finishes the bundles and runs whose `cancelReason` is committed but that are not yet
+    ended (`kill -9` safe, §8). The single-run `cancelRun` still refuses a bundled run.
   - `clearRuns(runs)` soft-archives terminal runs (spec `docs/specs/run-mv46ek2u-7omz.md`): it sets
     `cleared: { at, by }` on each run's Document in one commit, then starts a full cleanup of each cleared run in the
     background (§8.1; it returns without waiting for the deletion). All or nothing: an empty list is
@@ -285,7 +304,13 @@ The core's whole outside surface is `FactoryCore` (`src/core/types.ts`). Every o
 - **Bundles:** `createBundle` (`invalid` if empty, another project's run or a run not `READY`; `conflict` if a run is
   already in an active bundle), `getBundle`, `listBundles`, `getBundleConversation`, `mergeBundle`,
   `requestBundleChanges`, `dropFromBundle`, `resolveBundleEscalation` (`{ moreRounds }` | `{ drop }` | `{ abort }`),
-  `cancelBundle`, `retryBundle`, `messageBundle`, `interruptBundleAgent`, `getBundleScreenshot`.
+  `cancelBundle`, `checkBundlePr`, `retryBundle`, `messageBundle`, `interruptBundleAgent`, `getBundleScreenshot`.
+  - `checkBundlePr(bundle)` (spec `docs/specs/run-mv99uglw-4rys.md`, `POST /api/op/checkBundlePr`) asks GitHub now
+    for the bundle's PR state and acts on it as the PR watcher would (§3.4): `merged` → `MERGED`, `closed` →
+    `CANCELLED` with its members back in `READY`, `open` changes nothing. Returns `{ pr: "open" | "merged" |
+    "closed", state }`, `state` being the bundle's state after the call (for a live task possibly still the old one
+    for a moment while the abort completes). `not_found` for an unknown bundle; `conflict` for a bundle with no PR or
+    one already `MERGED` or `CANCELLED`.
   - `interruptBundleAgent(bundle)` is `interruptAgent` for the agent the bundle is with (the reviewer while
     `REVIEWING`, else the integrator); `INTEGRATING` (conflict resolution), `FIXING` and `REVIEWING` are core-driven.
     As with `messageBundle`, the integrator always takes messages, so only the reviewer is refused for
@@ -422,6 +447,17 @@ stops `serve` with an error naming the new paths.
   input that settled on its own just before the abort landed also waits for the resume while `interrupted` is set. An
   interrupt that arrives after the turn's bridge result was recorded only aborts (it records no pause).
   `cancelRun` / `cancelBundle` work while paused; a transition, a cancel and a retry clear `interrupted`.
+- **A PR merged or closed outside the factory** (spec `docs/specs/run-mv99uglw-4rys.md`): for a live bundle Task the
+  PR watcher (or `checkBundlePr`) first commits `externalEnd: { how: "merged" | "closed", at, from }` on the
+  BundleDoc (`from`: the state it was in), then aborts the Task. The abort path ends the bundle by the marker
+  (`MERGED`, or `CANCELLED` with "the PR was closed without merging") and never closes the PR. A `kill -9` between the
+  commit and the abort is safe: every phase of a resumed Task checks the marker first and ends the same way (startup
+  also aborts such a Task, the same end sooner). A `FAILED` bundle (its Task has ended) is ended by the core in one
+  commit. `retryBundle` clears the marker.
+- **Bulk cancel intents:** `cancelRuns` commits `cancelReason` on every listed run and affected bundle before
+  aborting anything; on startup, after resume, the core cancels the bundles (live: abort and wait; `FAILED`: direct,
+  PR closed) and aborts the runs whose `cancelReason` is committed and that have not ended, before the PR watcher's
+  first check.
 - A run records its pinned config hash and the Pi Durable version (pinned in `package.json`).
 - Storage is SQLite by default (`jsonl` alternative). What a finished run, bundle or discussion leaves on disk is
   deleted as soon as nothing uses it (§8.1).
@@ -555,17 +591,22 @@ rejected.
   still loads them (`includeCleared`) so ticket keys don't shift. A cleared run opened by link is read-only, marked
   cleared, with no Retry.
 - **Select mode (bulk cancel and clear):** **Select** in the board header turns it on and off. Every run card in every
-  column gets a checkbox (Planning, Build & Review, Ready, the legacy run cards in Shipping, Done); bundle cards and
-  runs in an active bundle get none. Each column header gets a "select all" checkbox acting on exactly the cards the
-  column shows (project filter, search and "Show closed" apply; indeterminate when some are selected). The selection
-  may span projects and columns, and holds only cards the board shows: a selected card that leaves the board (cleared,
-  hidden by a filter) or becomes unselectable (joined a bundle) drops out, live. In select mode the Ready column's
-  ship checkboxes become selection checkboxes and **Ship N tickets** is hidden; leaving select mode clears the
-  selection and brings the ship ticks back as they were. While anything is selected, an action bar shows "N
-  selected", **Cancel K** (the K live selected runs; two clicks, "Click again to cancel K"; one `cancelRuns` call),
-  **Clear M** (the M terminal, not yet cleared selected runs; two clicks; one `clearRuns` call) and **Clear
-  selection**; each button shows only when its count is at least 1. Runs acted on leave the selection; cancelled runs
-  move to Done (visible with "Show closed"). A refused call shows the error toast and changes nothing.
+  column gets a checkbox (Planning, Build & Review, Ready, the legacy run cards in Shipping, Done), and so does every
+  **bundle card** in Shipping, in any state on the board, `FAILED` included (spec `docs/specs/run-mv99uglw-4rys.md`).
+  Ticking a bundle selects the bundle, i.e. all of its member tickets; members can't be ticked one by one, so the UI
+  only makes whole-bundle `cancelRuns` calls. Each column header gets a "select all" checkbox acting on exactly the
+  cards the column shows (project filter, search and "Show closed" apply; indeterminate when some are selected; in
+  Shipping it covers the bundle cards too). The selection may span projects and columns, and holds only cards the
+  board shows: a selected card that leaves the board (cleared, hidden by a filter) or becomes unselectable (joined a
+  bundle) drops out, live. In select mode the Ready column's ship checkboxes become selection checkboxes and **Ship N
+  tickets** is hidden; leaving select mode clears the selection and brings the ship ticks back as they were. While
+  anything is selected, an action bar shows "N selected" (tickets: a selected bundle counts as its members),
+  **Cancel K** (the K live selected runs plus every member of the selected bundles; two clicks, "Click again to
+  cancel K", which names the PRs it closes when bundles are selected, e.g. "Click again to cancel 5 (closes the PR of
+  bundle-3)"; one `cancelRuns` call), **Clear M** (the M terminal, not yet cleared selected runs; two clicks; one
+  `clearRuns` call) and **Clear selection**; each button shows only when its count is at least 1. Runs and bundles
+  acted on leave the selection; cancelled runs move to Done as Cancelled (visible with "Show closed"), where they can
+  be selected and cleared. A refused call shows the error toast and changes nothing.
 - **Run view:** full screen for any run: a left rail with the conversations (architect, builder and its helpers,
   reviewers, QA agents) and a timeline; the transcript with every tool call as a plain row (QA screenshots inline); a
   chat box to the agent the run is with; approval and escalation cards floating over it with the final round's
@@ -597,7 +638,10 @@ rejected.
   shows "Not reviewed yet: the combination is reviewed before the PR"; **Merge**, **Request changes**,
   **Drop tickets…**), the escalation card (reason, findings, **More rounds**, **Drop tickets…**, **Abort**), and a
   failed bundle's **Retry**. **Cancel bundle** is available on every bundle that is not merged or cancelled,
-  including a failed one.
+  including a failed one. **Check PR now** (spec `docs/specs/run-mv99uglw-4rys.md`) shows next to it while the
+  bundle has a PR and is not merged or cancelled (failed and escalated included); it calls `checkBundlePr` and
+  toasts "PR #12 is still open", "PR #12 was merged on GitHub — the bundle is Merged" or "PR #12 was closed — the
+  tickets are back in Ready". The view updates live through `bundle.state`.
 - **Chat** (spec `docs/specs/run-mv46hn3a-f4fa.md`; the Discussions tab is gone): a **Chat** button next to
   **Create** opens discussions as a full-screen chat in the run view's sheet: the last discussion of the browser
   session or a blank new chat (`#chat`; a discussion is `#disc=<id>`). Project (or **New project…**), model
@@ -747,8 +791,10 @@ downgrades from the UI, and no automatic updates.
    again (2+ tickets), reruns CI and merges
    without a second click when the update needed no fix (its combined review passed at once); after a fix it asks
    for a fresh click.
-10. Merging or closing the bundle PR directly on GitHub is picked up: the bundle becomes Merged, or Cancelled with its
-    runs back in Ready.
+10. Merging or closing the bundle PR directly on GitHub is picked up in any state the bundle is in (escalated, fixing,
+    reviewing, failed, …) within about a minute, with no click, or at once with **Check PR now**: the bundle becomes
+    Merged (its tickets in Done with the PR link and bundle chip; the factory never closes that PR), or Cancelled with
+    its runs back in Ready. A `kill -9` right after the watcher's marker commit ends the same way on restart.
 11. **Ship this ticket** on one Ready run gives one PR for that ticket.
 12. For a project whose repo does not exist, shipping creates the private repo and pushes the combined result to
     `main` with `docs/delivery-notes.md`; there is no Merge step, and the runs show Done once CI passes or is skipped.
@@ -768,8 +814,11 @@ downgrades from the UI, and no automatic updates.
     is unchanged; a valid change affects only new runs and bundles.
 21. With **Select** on, ticking Planning and Build & Review cards and clicking **Cancel N** twice stops them all in one
     `cancelRuns` call; they move to Done as Cancelled. A selection mixing live and finished runs shows both **Cancel
-    K** and **Clear M**, each acting only on its own subset; a run inside a bundle cannot be selected, and
-    `cancelRuns` with it is refused (409, naming the bundle) without cancelling anything.
+    K** and **Clear M**, each acting only on its own subset. A bundle card in Shipping can be ticked (its tickets
+    count in "N selected" and **Cancel K**, and the confirmation names the PR it closes); cancelling closes its PR and
+    its tickets land in Done as Cancelled. A run inside a bundle cannot be ticked on its own, and `cancelRuns` with
+    only some of a bundle's runs is refused (409, naming the bundle and the missing tickets) without cancelling
+    anything.
 22. A project with a `READY` run, a `FAILED` bundle or an `OPEN` discussion can't be deleted: `deleteProject` answers
     409 naming each live item and its state, nothing changes, and the Settings dialog lists them as links. After
     cancelling and closing everything, deleting it (typing its name) purges it: its cards, bundles and Chat history

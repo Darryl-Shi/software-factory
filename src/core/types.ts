@@ -540,7 +540,11 @@ export interface FactoryCore {
 	listRuns(filter?: { project?: string; states?: RunState[]; includeCleared?: boolean }): Promise<RunView[]>;
 	getConversation(run: RunId, conversationId: string): Promise<TranscriptView>;
 	cancelRun(run: RunId, reason?: string): Promise<void>;
-	/** Cancel several live runs at once (all or nothing); same effect per run as cancelRun. */
+	/**
+	 * Cancel several live runs at once (all or nothing); same effect per run as cancelRun. A member of an active bundle
+	 * (FAILED included) is accepted when the call lists every member of that bundle: the bundle is cancelled first (PR
+	 * closed, members released), then its members are cancelled; a partial bundle is `conflict`.
+	 */
 	cancelRuns(runs: RunId[], reason?: string): Promise<{ cancelled: RunId[] }>;
 	retryRun(run: RunId): Promise<void>;
 	/**
@@ -608,6 +612,13 @@ export interface FactoryCore {
 	dropFromBundle(id: BundleId, runs: RunId[]): Promise<void>;
 	resolveBundleEscalation(id: BundleId, ask: AskId, choice: { moreRounds: number } | { drop: RunId[] } | { abort: true }): Promise<void>;
 	cancelBundle(id: BundleId, reason?: string): Promise<void>;
+	/**
+	 * Ask GitHub now for the bundle's PR state and act on it as the PR watcher would: merged → MERGED, closed →
+	 * CANCELLED (members back in Ready), open → nothing. `conflict` for a bundle with no PR or one already MERGED or
+	 * CANCELLED. `state` is the bundle's state after the call (for a live task, possibly still the old one while the
+	 * abort completes).
+	 */
+	checkBundlePr(id: BundleId): Promise<{ pr: "open" | "merged" | "closed"; state: BundleState }>;
 	retryBundle(id: BundleId): Promise<void>;
 	/** A message to the agent the bundle is with (the reviewer while REVIEWING, else the integrator). */
 	messageBundle(id: BundleId, text: string): Promise<{ message: string; to: Role; conversationId?: string }>;
@@ -670,6 +681,7 @@ export const CORE_OPS = [
 	"dropFromBundle",
 	"resolveBundleEscalation",
 	"cancelBundle",
+	"checkBundlePr",
 	"retryBundle",
 	"messageBundle",
 	"interruptBundleAgent",
